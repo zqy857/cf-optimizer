@@ -1,0 +1,23 @@
+# 数据文件(运行时生成)
+*.db
+*.db-shm
+*.db-wal
+
+# 日志
+*.log
+
+# PID
+*.pid
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 环境配置
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store

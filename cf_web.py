@@ -377,15 +377,18 @@ def api_copy(db, q):
 
 def api_optimize(db, q):
     """手动优选: 从本地库抽候选 -> 现场重测(探测+识别+测速) -> 取最优 N 条。
+    prio=bw 优先带宽(bw↓,lat↑) / prio=lat 优先延迟(lat↑,bw↓)。
     重测结果会写入 ips (正常测试记录), 但"优选清单"本身不保存, 仅返回展示。"""
     try:
         n = max(1, min(int(q.get("count", [""])[0] or 10), 200))
     except ValueError:
         n = 10
+    prio = ((q.get("prio", [""])[0] or "bw").strip().lower() or "bw")
     where, params = build_where(q)
+    cand_order = "latency_ms ASC, (CASE WHEN bw_last_mbps IS NULL THEN -1 ELSE bw_last_mbps END) DESC" if prio == "lat" else build_order(q)
     m = min(max(n * 5, 20), 150)
     cand_rows = q_rows(db, f"SELECT ip, port FROM ips WHERE {where} "
-                           f"ORDER BY {build_order(q)} LIMIT ?", params + [m])
+                           f"ORDER BY {cand_order} LIMIT ?", params + [m])
     if not cand_rows:
         return {"rows": [], "live": 0, "cands": 0}
     flat = load_settings()
@@ -403,6 +406,8 @@ def api_optimize(db, q):
         live = loop.run_until_complete(_optimize_live(args, cand_rows, db))
     finally:
         loop.close()
+    if prio == "lat":
+        live.sort(key=lambda x: (x["latency"], -(x["bandwidth"] or 0)))
     top = live[:n]
     out = []
     for r in top:
@@ -995,17 +1000,21 @@ font-family:ui-monospace,Consolas,monospace;font-size:12.5px;padding:10px;margin
   <div class="h">🎯 手动优选 <span class="sub">从本地库已优选 IP 中抽候选现场重测(连通+识别+测速), 取最优 N 条展示, 不写入本地库</span></div>
   <div class="toolbar">
     <div class="f"><label>数量</label><input id="opt_count" type="number" min="1" max="200" value="10"></div>
+    <div class="f"><label>优先</label><select id="opt_prio">
+      <option value="bw">优先带宽</option><option value="lat">优先延迟</option></select></div>
     <div class="f"><label>地区过滤</label><input id="opt_region" placeholder="如 HKG,NRT"></div>
     <div class="chk"><input type="checkbox" id="opt_premium"><label for="opt_premium">仅精品</label></div>
     <div class="chk"><input type="checkbox" id="opt_hasbw" checked><label for="opt_hasbw">仅有带宽</label></div>
     <div class="chk"><input type="checkbox" id="opt_v6"><label for="opt_v6">仅IPv6</label></div>
     <button class="ghost" id="optBtn" onclick="runOpt()">优选</button>
-    <button class="ghost" onclick="copyOpt()">复制结果</button>
+    <button class="ghost mini" onclick="copyOptSel()">复制选中(<span id="optSelCount">0</span>)</button>
+    <button class="ghost mini" onclick="copyOpt()">复制全部</button>
     <span class="pin" id="optPin"></span>
   </div>
   <div id="optWrap">
     <table>
       <thead><tr>
+        <th style="width:26px"><input type="checkbox" id="optCkAll" title="全选" onclick="toggleOptAll(this)"></th>
         <th>#</th><th>带宽Mbps</th><th>延迟ms</th><th>IP</th><th>端口</th>
         <th>机房</th><th>国家/地区</th><th>线路</th><th>测速时间</th>
       </tr></thead>
@@ -1127,29 +1136,47 @@ function jumpPage(){
   OFFSET=(pg-1)*LIMIT;
   loadTable();
 }
-let OPT=[];
-let OPT_TS=0;
+let OPT_ROWS=[], OSEL=new Set(), OPT_TS=0;
 function optParams(){
   const p=new URLSearchParams();
   p.set("count",$("opt_count").value||10);
+  p.set("prio",$("opt_prio").value||"bw");
   if($("opt_region").value.trim())p.set("region",$("opt_region").value.trim());
   if($("opt_premium").checked)p.set("route","premium");
   if($("opt_hasbw").checked)p.set("hasbw","1");
   if($("opt_v6").checked)p.set("v6","1");
   return p;
 }
+function optLine(r){return r.ip+":"+r.port+"#"+r.country+(r.route_class==="premium"?"精品":"");}
+function optSelUI(){
+  const c=$("optSelCount");if(c)c.textContent=OSEL.size;
+  const all=$("optCkAll");
+  if(all){const cs=[...document.querySelectorAll("#optBody .optck")];all.checked=cs.length>0&&cs.every(c=>c.checked);}
+}
+function toggleOptSel(el){
+  const k=el.dataset.key;
+  if(el.checked)OSEL.add(k);else OSEL.delete(k);
+  optSelUI();
+}
+function toggleOptAll(el){
+  document.querySelectorAll("#optBody .optck").forEach(c=>{c.checked=el.checked;const k=c.dataset.key;if(el.checked)OSEL.add(k);else OSEL.delete(k);});
+  optSelUI();
+}
 function renderOpt(d){
   const rows=d.rows||[];
   const tb=$("optBody"), empty=$("optEmpty");
   tb.innerHTML="";
-  if(!rows.length){OPT=[];empty.style.display="block";$("optPin").textContent="";return}
+  OPT_ROWS=rows;
+  OSEL=new Set([...OSEL].filter(k=>rows.some(r=>r.ip+":"+r.port===k)));
+  if(!rows.length){empty.style.display="block";$("optPin").textContent="";optSelUI();return}
   empty.style.display="none";
-  OPT=rows.map(r=>r.ip+":"+r.port+"#"+r.country+(r.route_class==="premium"?"精品":""));
   const now=OPT_TS?new Date(OPT_TS*1000).toLocaleString("zh-CN",{hour12:false}):"";
   tb.innerHTML=rows.map((r,i)=>{
+    const key=r.ip+":"+r.port;
     const rcl=r.route_class;
     const rtxt=RCL[rcl]?("<span title=\"仅作筛选标签, 不参与排序\">"+RCL[rcl]+"</span>"):"<span class=\"muted\">待测</span>";
     return "<tr>"+
+      '<td><input type="checkbox" class="optck" data-key="'+key+'" '+(OSEL.has(key)?"checked":"")+' onchange="toggleOptSel(this)"></td>'+
       "<td>"+(i+1)+"</td>"+
       "<td>"+(r.bandwidth!=null?r.bandwidth:"<span class=\"muted\">—</span>")+"</td>"+
       "<td>"+(r.latency!=null?r.latency:"—")+"</td>"+
@@ -1158,7 +1185,8 @@ function renderOpt(d){
       "<td>"+rtxt+"</td>"+"<td>"+now+"</td>"+
       "</tr>";
   }).join("");
-  $("optPin").textContent="🔝 最优 "+OPT.length+" 条已展示, 复制按钮可直接复制整批";
+  $("optPin").textContent="🔝 最优 "+rows.length+" 条, 勾选后「复制选中」";
+  optSelUI();
 }
 function runOpt(){
   const btn=document.querySelector("#optBtn");
@@ -1168,7 +1196,7 @@ function runOpt(){
   $("optBody").innerHTML="";
   fetch("/api/optimize?"+optParams()).then(r=>r.json()).then(d=>{
     OPT_TS=Math.floor(Date.now()/1000);
-    if(!d.rows||!d.rows.length){OPT=[];$("optEmpty").textContent="无符合条件的结果, 请调整筛选条件";$("optEmpty").style.display="block";$("optPin").textContent="";toast("无符合条件的结果","err");return}
+    if(!d.rows||!d.rows.length){OPT_ROWS=[];OSEL.clear();$("optEmpty").textContent="无符合条件的结果, 请调整筛选条件";$("optEmpty").style.display="block";$("optPin").textContent="";optSelUI();toast("无符合条件的结果","err");return}
     renderOpt(d);
     toast("优选完成: 候选"+d.cands+"条/存活"+d.live+"条","ok");
   }).catch(e=>{
@@ -1179,9 +1207,19 @@ function runOpt(){
   });
 }
 function copyOpt(){
-  if(!OPT.length){toast("请先点「优选」","err");return}
-  copyText(OPT.join("\n")).then(ok=>{
-    if(ok)toast("已复制 "+OPT.length+" 条","ok");
+  if(!OPT_ROWS.length){toast("请先点「优选」","err");return}
+  const txt=OPT_ROWS.map(optLine).join("\n");
+  copyText(txt).then(ok=>{
+    if(ok)toast("已复制全部 "+OPT_ROWS.length+" 条","ok");
+    else toast("复制失败, 请手动复制","err");
+  });
+}
+function copyOptSel(){
+  if(!OSEL.size){toast("未选中任何优选结果","err");return}
+  const map=Object.fromEntries(OPT_ROWS.map(r=>[r.ip+":"+r.port,optLine(r)]));
+  const txt=[...OSEL].map(k=>map[k]).filter(Boolean).join("\n");
+  copyText(txt).then(ok=>{
+    if(ok)toast("已复制选中 "+OSEL.size+" 条","ok");
     else toast("复制失败, 请手动复制","err");
   });
 }

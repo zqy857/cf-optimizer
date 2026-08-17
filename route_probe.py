@@ -6,7 +6,7 @@
 
 功能:
   * TTL 递增的轻量 ICMP traceroute (无需 root, 兼容 Linux / Windows)
-  * 离线 IP->ASN 查询 (pyasn 离线数据库), 首次运行自动下载并构建本地 dat 文件
+  * 离线 IP->ASN 查询 (纯标准库二分查找, 首次运行自动下载 ip2asn 数据)
   * 按固定 AS 基准表分类: premium / common / mixed / undetected
 
 =====================================================================
@@ -53,6 +53,8 @@ import subprocess
 import sys
 import threading
 import urllib.request
+import bisect
+from array import array
 from concurrent.futures import ThreadPoolExecutor
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -189,16 +191,9 @@ def probe_hops(ip, max_hops=18, timeout=1.5):
 # --------------------------- 离线 IP->ASN 查询 --------------------------
 _ASN_DB = None
 _ASN_LOCK = threading.Lock()
-
-
-def _range_to_cidr(start, end):
-    """ip2asn 起止地址段 -> 最小 CIDR"""
-    s = int(ipaddress.IPv4Address(start))
-    e = int(ipaddress.IPv4Address(end))
-    bits = (s ^ e).bit_length()
-    mask = ((1 << bits) - 1) if bits else 0
-    net = ipaddress.IPv4Address(s & ~mask)
-    return "{}/{}".format(net, 32 - bits)
+_ASN_STARTS = array("I")
+_ASN_ENDS = array("I")
+_ASN_VALS = array("I")
 
 
 def _download(url, dest):
@@ -212,54 +207,62 @@ def _download(url, dest):
                 fh.write(chunk)
 
 
-def _build_dat(tsv_gz, dat_file):
-    """把 ip2asn-v4.tsv.gz (start end asn country holder) 转成 pyasn 文本 dat"""
-    tmp = dat_file + ".tmp"
-    n = 0
-    with gzip.open(tsv_gz, "rt", encoding="utf-8") as fin, open(tmp, "w", encoding="ascii") as fout:
-        fout.write("; IP-ASN32-DAT file\n; Source: %s\n" % IPASN_URL)
+def _load_ranges():
+    """从 ip2asn tsv.gz 加载 IPv4 段->ASN (纯标准库二分查找, 无第三方依赖)。
+    数据行数约 43 万, 用 array('I') 压缩存储, 内存约几 MB。"""
+    global _ASN_DB
+    if not os.path.exists(TSV_GZ):
+        _download(IPASN_URL, TSV_GZ)
+    starts = []
+    ends = []
+    vals = []
+    with gzip.open(TSV_GZ, "rt", encoding="utf-8") as fin:
         for line in fin:
             parts = line.rstrip("\n").split("\t")
             if len(parts) < 3:
                 continue
-            start, end, asn = parts[0], parts[1], parts[2]
-            if not asn.isdigit() or int(asn) == 0:
-                continue
             try:
-                cidr = _range_to_cidr(start, end)
+                s = int(ipaddress.IPv4Address(parts[0]))
+                e = int(ipaddress.IPv4Address(parts[1]))
             except Exception:
                 continue
-            fout.write("%s\t%s\n" % (cidr, asn))
-            n += 1
-    os.replace(tmp, dat_file)
-    return n
+            asn = parts[2]
+            if not asn.isdigit():
+                continue
+            av = int(asn)
+            if av <= 0 or av > 0xFFFFFFFF:
+                continue
+            starts.append(s)
+            ends.append(e)
+            vals.append(av)
+    order = sorted(range(len(starts)), key=lambda i: starts[i])
+    _ASN_STARTS[:] = array("I", (starts[i] for i in order))
+    _ASN_ENDS[:] = array("I", (ends[i] for i in order))
+    _ASN_VALS[:] = array("I", (vals[i] for i in order))
+    _ASN_DB = True
 
 
 def ensure_db(force=False):
-    """确保本地 pyasn 离线数据库就绪 (缺失则下载并构建), 返回 pyasn 实例"""
+    """确保离线 ASN 数据库就绪 (缺失则下载 ip2asn tsv.gz 并加载到内存)"""
     global _ASN_DB
     if _ASN_DB is not None and not force:
         return _ASN_DB
     with _ASN_LOCK:
         if _ASN_DB is not None and not force:
             return _ASN_DB
-        if not os.path.exists(DAT_FILE) or force:
-            if not os.path.exists(TSV_GZ) or force:
-                _download(IPASN_URL, TSV_GZ)
-            _build_dat(TSV_GZ, DAT_FILE)
-        import pyasn
-        _ASN_DB = pyasn.pyasn(DAT_FILE)
+        _load_ranges()
         return _ASN_DB
 
 
 def lookup_asn(ip, db=None):
-    """IP -> ASN (离线), 查不到返回 None"""
+    """IP -> ASN (离线二分查找), 查不到返回 None"""
     try:
         if db is None:
-            db = ensure_db()
-        res = db.lookup(ip)
-        if res:
-            return res[0]
+            ensure_db()
+        ip_int = int(ipaddress.IPv4Address(ip))
+        n = bisect.bisect_right(_ASN_STARTS, ip_int) - 1
+        if n >= 0 and _ASN_ENDS[n] >= ip_int:
+            return int(_ASN_VALS[n])
     except Exception:
         pass
     return None
@@ -303,13 +306,24 @@ def classify_route(ip, max_hops=18, timeout=1.5):
                 h["name"] = "未知"
         return {"route_class": "undetected", "as_list": [], "hops": log}
     try:
-        db = ensure_db()
-    except Exception:
-        return {"route_class": "undetected", "as_list": [], "hops": []}
-    try:
         log, _timeouts, _reached = probe_hops(ip, max_hops=max_hops, timeout=timeout)
     except PingProbeError as e:
         return {"route_class": "undetected", "as_list": [], "hops": [], "error": str(e)}
+    try:
+        db = ensure_db()
+    except Exception:
+        for h in log:
+            if h["ip"] is None:
+                h["asn"] = None
+                h["name"] = "超时(*)"
+            elif _is_private(h["ip"]):
+                h["asn"] = None
+                h["name"] = "内网"
+            else:
+                h["asn"] = None
+                h["name"] = "未知"
+        return {"route_class": "undetected", "as_list": [], "hops": log,
+                "error": "无法加载 ASN 离线数据(首次使用需联网下载 ip2asn 数据), 仅记录逐跳, 无法判定线路"}
 
     asns = []
     for h in log:

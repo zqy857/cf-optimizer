@@ -735,6 +735,7 @@ class Handler(BaseHTTPRequestHandler):
                 st = get_state()
                 st["db"] = os.path.abspath(db)
                 st["version"] = VERSION
+                st["route_diag"] = route_probe.check_route_capability()
                 self._send(200, json.dumps(st).encode("utf-8"))
             elif path == "/api/stats":
                 self._send(200, json.dumps(api_stats(db)).encode("utf-8"))
@@ -921,6 +922,9 @@ tbody .ck,#ckAll{accent-color:var(--acc);cursor:pointer}
 td.ck{width:26px;text-align:center}
 footer{margin-top:14px;color:var(--dim);font-size:12px;text-align:center}
 #msg{color:var(--warn);font-size:13px;min-height:18px;margin:8px 0}
+#routeDiag{background:rgba(220,38,38,.12);border:1px solid rgba(220,38,38,.5);color:#fda4af;font-size:12.5px;padding:8px 12px;border-radius:8px;margin:6px 0;line-height:1.6}
+#routeDiag b{color:#fecaca}
+#routeDiag code{background:rgba(0,0,0,.35);padding:1px 6px;border-radius:4px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
 #toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%) translateY(16px);background:rgba(18,26,38,.94);color:#fff;padding:10px 20px;border-radius:8px;font-size:13px;opacity:0;pointer-events:none;transition:opacity .25s ease,transform .25s ease;z-index:999}
 #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 #toast.ok{background:linear-gradient(135deg,#0b3d2e,#14532d);border:1px solid #22c55e}
@@ -976,6 +980,7 @@ font-family:ui-monospace,Consolas,monospace;font-size:12.5px;padding:10px;margin
     <button class="ghost" onclick="saveSet()">保存设置</button>
   </div>
   <div id="msg"></div>
+  <div id="routeDiag" class="route-diag" style="display:none"></div>
   <div class="prog">
     <div class="bar"><div class="fill" id="progFill"></div></div>
     <div class="plabel" id="progLabel">—</div>
@@ -1598,6 +1603,7 @@ async function poll(){
   try{
     const st=await (await fetch("/api/status")).json();
     $("dbpath").textContent=st.db||""; $("ver").textContent=st.version||"?";
+    showRouteDiag(st.route_diag);
     const pill=$("pill");
     if(st.running){pill.className="pill run";pill.textContent="扫描中 · 第"+st.round+"轮 · 本轮达标 "+st.last_ok;
       $("startBtn").disabled=true;$("stopBtn").disabled=false;}
@@ -1631,8 +1637,15 @@ async function poll(){
   }catch(e){}
   setTimeout(poll,2000);
 }
-const CNT={};
-function countTo(id,val,fmtK,sfx){
+function showRouteDiag(d){
+  const el=$("routeDiag"); if(!el)return;
+  if(!d||d.ok){el.style.display="none";return;}
+  const esc=s=>String(s||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+  el.innerHTML='<b>⚠ 线路分类检测不可用</b> · '+esc(d.reason)+
+    '<br>修复: <code>'+esc(d.fix)+'</code>';
+  el.style.display="block";
+}
+const CNT={};function countTo(id,val,fmtK,sfx){
   const el=$(id); if(!el||val==null)return;
   const from=CNT[id]!=null?CNT[id]:val;
   CNT[id]=val;

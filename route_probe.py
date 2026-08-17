@@ -188,6 +188,50 @@ def probe_hops(ip, max_hops=18, timeout=1.5):
     return log, timeouts, reached
 
 
+_PERM_ERR_RE = re.compile(
+    r"Operation not permitted|cap_net_raw|setuid|permission denied|"
+    r"权限不够|权限不足|需要 root|requires root|requires root privileges")
+
+_ROUTE_DIAG = None
+
+
+def check_route_capability():
+    """自诊断线路探测能力: ping 是否可用/是否有权限/是否支持参数。
+
+    返回 {"ok": bool, "reason": str, "fix": str}, 供日志与 Web 提示。
+    """
+    global _ROUTE_DIAG
+    if _ROUTE_DIAG is not None:
+        return _ROUTE_DIAG
+    try:
+        r = subprocess.run(_ping_cmd("1.1.1.1", 1, 1),
+                           capture_output=True, text=True, timeout=4)
+        out = r.stdout + r.stderr
+    except FileNotFoundError:
+        _ROUTE_DIAG = {"ok": False,
+                       "reason": "系统缺少 ping 命令",
+                       "fix": "安装 iputils-ping/iputils(BusyBox ping 需支持 -t 参数)"}
+        return _ROUTE_DIAG
+    except Exception:
+        _ROUTE_DIAG = {"ok": False,
+                       "reason": "无法执行 ping 命令",
+                       "fix": "请检查系统 ping 是否正常"}
+        return _ROUTE_DIAG
+    if _PERM_ERR_RE.search(out):
+        _ROUTE_DIAG = {"ok": False,
+                       "reason": "ping 无原始套接字权限(cap_net_raw)",
+                       "fix": "sudo setcap cap_net_raw+ep $(which ping)  或  sysctl -w net.ipv4.ping_group_range=\"0 2147483647\""}
+        return _ROUTE_DIAG
+    if _ERR_RE.search(out):
+        msg = re.sub(r"\s+", " ", out.strip())[:160]
+        _ROUTE_DIAG = {"ok": False,
+                       "reason": "ping 不支持所需参数: %s" % msg,
+                       "fix": "请更换为完整版 ping(iputils), 或检查 -t(TTL) 参数支持"}
+        return _ROUTE_DIAG
+    _ROUTE_DIAG = {"ok": True, "reason": "", "fix": ""}
+    return _ROUTE_DIAG
+
+
 # --------------------------- 离线 IP->ASN 查询 --------------------------
 _ASN_DB = None
 _ASN_LOCK = threading.Lock()

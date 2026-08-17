@@ -151,6 +151,13 @@ python3 cf_db.py --seed myadd.txt     # 把现有优选名单导入数据库作�
 - **IPv4 精品线路**:去程 ASN 判定(CN2-GIA/9929/CMIN2 为精品)。但**精品在 CF 边缘 IP 中占比极低(通常不足 1%)**,需要测大量 IP 才有机会命中,`--route-budget` 越大命中率越高(默认 100)。
 - **IPv6**:用公开「优选 v6 IP 列表」(运营商匹配 + 通用源)优先采样,命中率高;同时把 **CF 官方 v6 大段**纳入随机发现,覆盖更广。但 **IPv6 线路分类暂不支持 ASN 判定(离线库仅 v4 数据),一律显示"未识别",不参与精品识别**。需要本机有 IPv6 网络。
 - **线路检测前提**:依赖系统 `ping`(ICMP TTL 递增探测)与出网 ICMP 回包。若代理/防火墙拦截 ICMP、或 NAS 的 ping 不支持 `-t` 参数,会显示"无法判定";此时悬停线路列或点「测线路」会显示具体原因(`route_error`)。首次使用需联网下载一次 ip2asn ASN 数据。
+- **ping 权限不足(cap_net_raw)**:部分 NAS/精简 Linux 上非 root 用户 ping 会报 `Operation not permitted / missing cap_net_raw`。Web 界面顶部会显示红色横幅和修复命令,任选其一即可:
+  ```bash
+  sudo setcap cap_net_raw+ep $(which ping)      # 给 ping 加原始套接字能力(最通用)
+  # 或
+  sysctl -w net.ipv4.ping_group_range="0 2147483647"   # 放开无特权 ICMP 组范围
+  ```
+- **BusyBox ping 不支持 `-t`**:精简系统的 ping 可能没有 TTL 参数,此时会提示 `invalid option -- t`,请换装完整版 `iputils-ping`。
 
 ## 🛠 技术栈
 

@@ -850,6 +850,15 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .optbox{white-space:pre;font-family:ui-monospace,Consolas,monospace;font-size:12px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:8px;max-height:220px;overflow:auto;line-height:1.6;color:var(--txt);user-select:text}
 .pin{color:var(--acc2);font-size:13px;font-weight:700;cursor:pointer;user-select:none}
 .pin:hover{text-decoration:underline}
+footer .link{color:var(--acc2);cursor:pointer;text-decoration:underline}
+.modal-mask{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:99}
+.modal-mask.open{display:flex}
+.modal{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px 20px;max-width:600px;width:92%;max-height:82vh;overflow:auto;font-size:13px;line-height:1.75}
+.modal h2{margin:0 0 6px;font-size:16px}
+.modal h3{margin:14px 0 4px;font-size:14px;color:var(--acc2)}
+.modal ul{margin:4px 0 0;padding-left:20px}
+.modal a{color:var(--acc2)}
+.modal .mclose{cursor:pointer;color:var(--dim);font-weight:700}
 .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
 .chart h3{font-size:14px;color:var(--dim);margin-bottom:8px;font-weight:600}
 canvas{width:100%;height:250px}
@@ -1063,9 +1072,32 @@ font-family:ui-monospace,Consolas,monospace;font-size:12.5px;padding:10px;margin
   </div>
 </div>
 
-<footer>数据来源: <span id="srcHost">speed.cloudflare.com</span> 实测带宽 &amp; /cdn-cgi/trace 地区识别 &nbsp;|&nbsp; 服务端 v<span id="ver">?</span></footer>
+<footer>数据来源: <span id="srcHost">speed.cloudflare.com</span> 实测带宽 &amp; /cdn-cgi/trace 地区识别 &nbsp;|&nbsp; 服务端 v<span id="ver">?</span> &nbsp;|&nbsp; <span class="link" onclick="openAbout()">关于</span></footer>
 
 <div id="chartTip"><div class="t-title"></div><div class="t-body"></div></div>
+
+<div class="modal-mask" id="aboutMask" onclick="if(event.target===this)closeAbout()">
+  <div class="modal">
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <h2>🚀 CF 优选IP 扫描管理台</h2>
+      <span class="mclose" onclick="closeAbout()">✕ 关闭</span>
+    </div>
+    <p>基于 Cloudflare 官方地址池的<b>持续优选扫描器</b>, 带 Web 图形管理台。纯 Python 标准库实现, 零第三方依赖, 数据存 SQLite 断点续扫。</p>
+    <h3>功能一览</h3>
+    <ul>
+      <li>多端口并发探测 + TLS 二次确认, 自动发现可用 CF 边缘 IP</li>
+      <li>邻域加权采样(优质 C 段优先), 达标命中率远高于纯随机</li>
+      <li>带宽实测(可配自建 Worker 测速域名规避公共限流) + 机房/国家地区识别</li>
+      <li>去程线路分类: 精品(CN2-GIA/9929/CMIN2) / 普通(163/169/9808) / 混合 / 未识别, 悬停线路列看逐跳 Traceroute</li>
+      <li>手动优选: 从本地库抽候选现场重测, 取最优 N 条, 可优先带宽/延迟, 勾选复制</li>
+      <li>本地IP列表: 列排序 / 多条件筛选 / 勾选批量操作 / 翻页跳转, 导出 ADD.txt/CSV</li>
+    </ul>
+    <h3>版本</h3>
+    <p>服务端 v<span id="ver2">?</span> &nbsp;|&nbsp; 后端地址: 官方 / 电信 / 联通 / 移动优选段</p>
+    <h3>开源</h3>
+    <p>GitHub: <a href="https://github.com/zqy857/cf-optimizer" target="_blank" rel="noopener">zqy857/cf-optimizer</a> (MIT 许可)</p>
+  </div>
+</div>
 
 <script>
 const $=id=>document.getElementById(id);
@@ -1074,6 +1106,8 @@ let OFFSET=0;
 const LIMIT=100;
 let PAGE_TOTAL=0;
 const SEL=new Set();
+function openAbout(){const v=$("ver2");if(v)v.textContent=$("ver").textContent||"?";$("aboutMask").classList.add("open");}
+function closeAbout(){$("aboutMask").classList.remove("open");}
 function updateSelUI(){const el=$("selCount");if(el)el.textContent=SEL.size;}
 function togglePageSel(ck){
   document.querySelectorAll("#tbody .ck").forEach(c=>{c.checked=ck.checked;

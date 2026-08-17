@@ -414,7 +414,7 @@ def api_optimize(db, q):
             name = loc
         else:
             name = "未知"
-        out.append({"ip": ip, "port": port, "country": name,
+        out.append({"ip": ip, "port": port, "colo": colo or "UNK", "country": name,
                     "latency": round(lat, 1) if lat is not None else None,
                     "bandwidth": bw})
     if out:
@@ -787,6 +787,8 @@ PAGE = r"""<!DOCTYPE html>
 body{background:var(--bg);color:var(--txt);font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;padding:22px;font-size:14px}
 h1{font-size:21px;display:inline-block}
 .sub{color:var(--dim);font-size:13px;margin:4px 0 16px}
+.h{font-size:15px;font-weight:700;margin-bottom:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.h .sub{font-weight:400;margin:0}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:14px;
   transition:transform .25s ease,box-shadow .25s ease,border-color .25s ease}
 .card:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,.28);border-color:#333}
@@ -990,6 +992,30 @@ font-family:ui-monospace,Consolas,monospace;font-size:12.5px;padding:10px;margin
 </div>
 
 <div class="card">
+  <div class="h">🎯 手动优选 <span class="sub">从本地库已优选 IP 中抽候选现场重测(连通+识别+测速), 取最优 N 条展示, 不写入本地库</span></div>
+  <div class="toolbar">
+    <div class="f"><label>数量</label><input id="opt_count" type="number" min="1" max="200" value="10"></div>
+    <div class="f"><label>地区过滤</label><input id="opt_region" placeholder="如 HKG,NRT"></div>
+    <div class="chk"><input type="checkbox" id="opt_premium"><label for="opt_premium">仅精品</label></div>
+    <div class="chk"><input type="checkbox" id="opt_hasbw" checked><label for="opt_hasbw">仅有带宽</label></div>
+    <div class="chk"><input type="checkbox" id="opt_v6"><label for="opt_v6">仅IPv6</label></div>
+    <button class="ghost" id="optBtn" onclick="runOpt()">优选</button>
+    <button class="ghost" onclick="copyOpt()">复制结果</button>
+    <span class="pin" id="optPin"></span>
+  </div>
+  <div id="optWrap">
+    <table>
+      <thead><tr>
+        <th>#</th><th>带宽Mbps</th><th>延迟ms</th><th>IP</th><th>端口</th>
+        <th>机房</th><th>国家/地区</th><th>线路</th><th>测速时间</th>
+      </tr></thead>
+      <tbody id="optBody"></tbody>
+    </table>
+    <div class="dead" id="optEmpty">点击「优选」: 从本地库已优选 IP 中抽候选, 现场重测后取最优 N 条, 展示在此处, 不写入本地库</div>
+  </div>
+</div>
+
+<div class="card">
   <div class="toolbar">
     <div class="f"><label>机房过滤</label><input id="f_region" placeholder="如 HKG,NRT"></div>
     <div class="f"><label>最小带宽Mbps</label><input id="f_minbw" type="number" value="0"></div>
@@ -1019,7 +1045,6 @@ font-family:ui-monospace,Consolas,monospace;font-size:12.5px;padding:10px;margin
     <button class="ghost mini" onclick="copySel()">复制选中IP(<span id="selCount">0</span>)</button>
     <button class="ghost mini" onclick="exportSel()">导出选中</button>
     <button class="ghost mini" onclick="clearSel()">清空选中</button>
-    <span class="pin" id="pinInfo"></span>
     <span style="flex:1"></span>
     <button class="ghost mini" onclick="page(-1)">上一页</button>
     <span id="pageInfo">共 0 条</span>
@@ -1027,20 +1052,6 @@ font-family:ui-monospace,Consolas,monospace;font-size:12.5px;padding:10px;margin
     <button class="ghost mini" onclick="jumpPage()">跳转</button>
     <button class="ghost mini" onclick="page(1)">下一页</button>
   </div>
-</div>
-
-<div class="card">
-  <div class="h">🎯 手动优选 <span class="sub">从本地库已优选 IP 中即时抽取, 结果不保存</span></div>
-  <div class="row">
-    <div class="f"><label>数量</label><input id="opt_count" type="number" min="1" max="500" value="10"></div>
-    <div class="f"><label>地区过滤</label><input id="opt_region" placeholder="如 HKG,NRT,留空全部" style="width:170px"></div>
-    <div class="chk"><input type="checkbox" id="opt_premium"><label for="opt_premium">仅精品</label></div>
-    <div class="chk"><input type="checkbox" id="opt_hasbw" checked><label for="opt_hasbw">仅有带宽</label></div>
-    <div class="chk"><input type="checkbox" id="opt_v6"><label for="opt_v6">仅IPv6</label></div>
-    <button class="ghost" id="optBtn" onclick="runOpt()">优选</button>
-    <button class="ghost" onclick="copyOpt()">复制结果</button>
-  </div>
-  <div class="optbox" id="optBox">点击「优选」: 从本地库已优选 IP 中抽候选, 现场重测(连通+识别+测速)后取最优 N 条, 并置顶显示在下方 IP 列表顶部</div>
 </div>
 
 <footer>数据来源: <span id="srcHost">speed.cloudflare.com</span> 实测带宽 &amp; /cdn-cgi/trace 地区识别 &nbsp;|&nbsp; 服务端 v<span id="ver">?</span></footer>
@@ -1117,7 +1128,7 @@ function jumpPage(){
   loadTable();
 }
 let OPT=[];
-let TOP=[];
+let OPT_TS=0;
 function optParams(){
   const p=new URLSearchParams();
   p.set("count",$("opt_count").value||10);
@@ -1127,26 +1138,45 @@ function optParams(){
   if($("opt_v6").checked)p.set("v6","1");
   return p;
 }
+function renderOpt(d){
+  const rows=d.rows||[];
+  const tb=$("optBody"), empty=$("optEmpty");
+  tb.innerHTML="";
+  if(!rows.length){OPT=[];empty.style.display="block";$("optPin").textContent="";return}
+  empty.style.display="none";
+  OPT=rows.map(r=>r.ip+":"+r.port+"#"+r.country+(r.route_class==="premium"?"精品":""));
+  const now=OPT_TS?new Date(OPT_TS*1000).toLocaleString("zh-CN",{hour12:false}):"";
+  tb.innerHTML=rows.map((r,i)=>{
+    const rcl=r.route_class;
+    const rtxt=RCL[rcl]?("<span title=\"仅作筛选标签, 不参与排序\">"+RCL[rcl]+"</span>"):"<span class=\"muted\">待测</span>";
+    return "<tr>"+
+      "<td>"+(i+1)+"</td>"+
+      "<td>"+(r.bandwidth!=null?r.bandwidth:"<span class=\"muted\">—</span>")+"</td>"+
+      "<td>"+(r.latency!=null?r.latency:"—")+"</td>"+
+      "<td>"+r.ip+"</td>"+"<td>"+r.port+"</td>"+
+      "<td>"+(r.colo||"UNK")+"</td>"+"<td>"+r.country+"</td>"+
+      "<td>"+rtxt+"</td>"+"<td>"+now+"</td>"+
+      "</tr>";
+  }).join("");
+  $("optPin").textContent="🔝 最优 "+OPT.length+" 条已展示, 复制按钮可直接复制整批";
+}
 function runOpt(){
   const btn=document.querySelector("#optBtn");
   if(btn){btn.disabled=true;btn.textContent="优选中...";}
-  $("optBox").textContent="正在从本地库抽候选并现场重测(探测+测速)...";
+  $("optEmpty").textContent="正在从本地库抽候选并现场重测(探测+识别+测速), 请稍候...";
+  $("optEmpty").style.display="block";
+  $("optBody").innerHTML="";
   fetch("/api/optimize?"+optParams()).then(r=>r.json()).then(d=>{
-    if(!d.rows||!d.rows.length){OPT=[];TOP=[];$("optBox").textContent="无符合条件的结果";toast("无符合条件的结果","err");return}
-    OPT=d.rows.map(r=>r.ip+":"+r.port+"#"+r.country+(r.route_class==="premium"?"精品":""));
-    TOP=d.rows.map(r=>r.ip);
-    $("optBox").textContent=OPT.join("\n");
-    toast("优选完成: 候选"+d.cands+"条/存活"+d.live+"条, 置顶"+TOP.length+"条","ok");
-    loadTable();
-  }).catch(e=>toast("优选请求失败: "+e,"err")).finally(()=>{
+    OPT_TS=Math.floor(Date.now()/1000);
+    if(!d.rows||!d.rows.length){OPT=[];$("optEmpty").textContent="无符合条件的结果, 请调整筛选条件";$("optEmpty").style.display="block";$("optPin").textContent="";toast("无符合条件的结果","err");return}
+    renderOpt(d);
+    toast("优选完成: 候选"+d.cands+"条/存活"+d.live+"条","ok");
+  }).catch(e=>{
+    $("optEmpty").textContent="优选请求失败: "+e;
+    toast("优选请求失败: "+e,"err");
+  }).finally(()=>{
     if(btn){btn.disabled=false;btn.textContent="优选";}
   });
-}
-function clearTop(){
-  TOP=[];OFFSET=0;
-  $("pinInfo").textContent="";
-  loadTable();
-  toast("已取消置顶","ok");
 }
 function copyOpt(){
   if(!OPT.length){toast("请先点「优选」","err");return}
@@ -1335,7 +1365,6 @@ function tableParams(){
   if($("f_v6").checked)p.set("v6","1");
   p.set("sort",SORT);
   p.set("offset",OFFSET);
-  if(TOP.length)p.set("top",TOP.join(","));
   return p;
 }
 
@@ -1353,8 +1382,6 @@ function bwCellHtml(r){
 function renderTable(data){
   const rows=data.rows, tb=$("tbody"); tb.innerHTML="";
   PAGE_TOTAL=data.total;
-  const pinEl=$("pinInfo");
-  if(pinEl)pinEl.innerHTML=TOP.length?("🔝 优选结果已置顶 "+TOP.length+" 条 · <span onclick=\"clearTop()\">取消置顶</span>"):"";
   $("pageInfo").textContent="共 "+data.total+" 条 · 显示 "+(data.offset+1)+"~"+(data.offset+rows.length)+" · 每页 "+data.limit;
   $("pageTotal").textContent=Math.max(1,Math.ceil(data.total/LIMIT));
   $("pageJump").value=Math.floor(data.offset/LIMIT)+1;

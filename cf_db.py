@@ -291,9 +291,9 @@ def fetch_networks(operator, port):
 def fetch_networks_v6(operator=""):
     """IPv6 地址池。
 
-    优先用公开「优选 v6 IP 列表」(运营商匹配 + 通用源合并, 均为已优选好的具体IP,
-    命中率高), 全部失败才回退 CF 官方 /32 大段随机采样(命中率极低)。
-    返回 ip_network 列表: 优选列表条目是 /128 主机, 回退是大段。
+    公开「优选 v6 IP 列表」(运营商匹配 + 通用源合并, 均为已优选好的具体IP,
+    命中率高) + CF 官方大段(随机发现新地址, 命中率低但覆盖广) 合并返回。
+    返回 ip_network 列表: 优选条目是 /128 主机, 官方是大段。
     """
     def _parse(raw):
         out = []
@@ -325,9 +325,8 @@ def fetch_networks_v6(operator=""):
         except Exception:
             continue
     seeds = list(dict.fromkeys(seeds))
-    if seeds:
-        return [ipaddress.ip_network(s, strict=False) for s in seeds]
-    nets = []
+    nets = [ipaddress.ip_network(s, strict=False) for s in seeds] if seeds else []
+    # 官方大段也一并加入, 用于随机发现新 v6 地址(命中率低但覆盖广)
     try:
         raw = asyncio.run(fetch(urllib.parse.urlparse(OFFICIAL_V6_URL)))
         for l in raw.decode().splitlines():
@@ -338,8 +337,6 @@ def fetch_networks_v6(operator=""):
                 except ValueError:
                     continue
     except Exception:
-        pass
-    if not nets:
         for r in FALLBACK_RANGES_V6:
             try:
                 nets.append(ipaddress.ip_network(r))
@@ -476,7 +473,11 @@ def discover(nets, hot24, count, ports, known, cooldown, exploit_frac):
 
 
 def discover_v6(nets6, count, ports, known, cooldown):
-    """IPv6 候选抽样: 官方 /32 等大段随机采样 (邻域加权只适用于 v4 /24)"""
+    """IPv6 候选抽样。
+
+    1) 先用尽优选 /128 列表(命中率高, 避开冷却期)
+    2) 再对官方大段(/64 以下)随机抽样发现新地址, 总数不超过 count
+    """
     now = time.time()
 
     def eligible(ip):
@@ -484,27 +485,37 @@ def discover_v6(nets6, count, ports, known, cooldown):
         return t is None or (now - t) >= cooldown
 
     cands = []
-    exhausted = set()
-    for _ in range(count):
-        if not nets6:
-            break
-        net = random.choice(nets6)
-        if net in exhausted:
+    seen = set()
+
+    curated = [n for n in nets6 if n.prefixlen >= 64]
+    for net in curated:
+        ip = str(random_ip_in_net(net))
+        if ip in known or not eligible(ip):
             continue
+        known[ip] = now
+        seen.add(ip)
+        cands.append((ip, tuple(ports)))
+
+    big = [n for n in nets6 if n.prefixlen < 64]
+    remaining = max(0, count - len(cands))
+    for _ in range(remaining):
+        if not big:
+            break
+        net = random.choice(big)
         max_tries = min(count * 8, 1 << (net.max_prefixlen - net.prefixlen))
         got = None
         for _ in range(max_tries):
             ip = str(random_ip_in_net(net))
-            if ip in known:
+            if ip in seen or ip in known:
                 continue
             if not eligible(ip):
                 continue
             got = ip
             break
         if got is None:
-            exhausted.add(net)
             continue
         known[got] = now
+        seen.add(got)
         cands.append((got, tuple(ports)))
     return cands
 

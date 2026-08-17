@@ -32,6 +32,11 @@ import threading
 import time
 import types
 import webbrowser
+import base64
+import hmac
+import secrets
+import string
+import subprocess
 from collections import OrderedDict, defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -706,6 +711,26 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def _auth_ok(self):
+        sec = SECRET
+        if not sec:
+            return True
+        h = self.headers.get("Authorization", "")
+        if h.startswith("Basic "):
+            try:
+                raw = base64.b64decode(h[6:]).decode("utf-8")
+                u, _, p = raw.partition(":")
+                if (hmac.compare_digest(u, sec["user"])
+                        and hmac.compare_digest(p, sec["pass"])):
+                    return True
+            except Exception:
+                pass
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="cf-optimizer"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return False
+
     def _send(self, code, body, ctype="application/json; charset=utf-8", fname=None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -725,6 +750,8 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length).decode("utf-8"))
 
     def do_GET(self):
+        if not self._auth_ok():
+            return
         u = urlparse(self.path)
         path = u.path
         q = parse_qs(u.query)
@@ -758,6 +785,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, json.dumps({"error": str(e)}).encode("utf-8"))
 
     def do_POST(self):
+        if not self._auth_ok():
+            return
         path = urlparse(self.path).path
         params = self._read_json()
         db = get_state()["db"] or DB or "cf_ips.db"
@@ -1978,6 +2007,63 @@ def daemon_status(pidfile):
         print("未在运行")
 
 
+SECRET_FILE = os.path.join(BASE, "cf_secret.json")
+CERT_FILE = os.path.join(BASE, "cf_https_cert.pem")
+KEY_FILE = os.path.join(BASE, "cf_https_key.pem")
+SECRET = None
+
+
+def load_secret():
+    try:
+        with open(SECRET_FILE, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        if d.get("user") and d.get("pass"):
+            return d
+    except Exception:
+        pass
+    return None
+
+
+def init_secret():
+    """确保登录凭据存在 (首次自动生成随机密码), 返回凭据 dict."""
+    global SECRET
+    SECRET = load_secret()
+    if SECRET:
+        return SECRET
+    pw = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))
+    SECRET = {"user": "admin", "pass": pw, "https": True}
+    try:
+        with open(SECRET_FILE, "w", encoding="utf-8") as fh:
+            json.dump(SECRET, fh, ensure_ascii=False)
+        os.chmod(SECRET_FILE, 0o600)
+    except Exception as e:
+        print(f"写入凭据文件失败: {e}", file=sys.stderr)
+    print("=" * 60, flush=True)
+    print(f"首次启动, 已生成管理台登录凭据 (保存于 {SECRET_FILE})", flush=True)
+    print(f"  用户名: {SECRET['user']}", flush=True)
+    print(f"  密码:   {SECRET['pass']}", flush=True)
+    print("  需改密码直接编辑该文件; 关闭加密把 https 设为 false", flush=True)
+    print("=" * 60, flush=True)
+    return SECRET
+
+
+def ensure_cert():
+    """生成自签名 HTTPS 证书 (需 openssl); 失败返回 None 则退回 http."""
+    if os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE):
+        return CERT_FILE
+    try:
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048",
+             "-keyout", KEY_FILE, "-out", CERT_FILE, "-days", "3650",
+             "-nodes", "-subj", "/CN=cf-optimizer", "-sha256"],
+            check=True, capture_output=True, timeout=90)
+        os.chmod(KEY_FILE, 0o600)
+        return CERT_FILE
+    except Exception as e:
+        print(f"HTTPS 证书生成失败(需要 openssl 命令): {e}", file=sys.stderr)
+        return None
+
+
 def serve_forever(args, host, port):
     if not os.path.exists(args.db):
         conn = cf_db.open_db(args.db)
@@ -2003,13 +2089,25 @@ def serve_forever(args, host, port):
         return False
     port = srv.server_address[1]
     local = "127.0.0.1" if bind_host in ("0.0.0.0", "::", "") else bind_host
+    scheme = "http"
+    if SECRET and SECRET.get("https"):
+        cert = ensure_cert()
+        if cert:
+            try:
+                import ssl
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.load_cert_chain(cert, KEY_FILE)
+                srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+                scheme = "https"
+            except Exception as e:
+                print(f"HTTPS 启动失败, 退回 http: {e}", file=sys.stderr)
     print(f"CF 优选IP 扫描管理台已启动  数据库: {os.path.abspath(args.db)}", flush=True)
-    print(f"  本机打开: http://{local}:{port}/", flush=True)
+    print(f"  访问: {scheme}://{local}:{port}/   (需登录, 用户名: {SECRET['user'] if SECRET else '无'})", flush=True)
     for ip in lan_ips():
         disp = "[%s]" % ip if ":" in ip else ip
-        print(f"  局域网打开: http://{disp}:{port}/", flush=True)
+        print(f"  局域网: {scheme}://{disp}:{port}/", flush=True)
     if not args.no_browser:
-        webbrowser.open(f"http://{local}:{port}/")
+        webbrowser.open(f"{scheme}://{local}:{port}/")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -2067,6 +2165,7 @@ def main():
     if args.status:
         daemon_status(args.pidfile)
         return
+    init_secret()
     if args.child:
         child_main(args)
         return

@@ -369,6 +369,30 @@ def api_copy(db, q):
     return {"rows": out}
 
 
+def api_optimize(db, q):
+    """手动优选: 从本地库按当前条件抽最优 N 条 (仅查询, 不写入数据库)"""
+    try:
+        n = max(1, min(int(q.get("count", [""])[0] or 10), 500))
+    except ValueError:
+        n = 10
+    where, params = build_where(q)
+    sql = (f"SELECT ip, port, colo, loc, latency_ms, bw_last_mbps, route_class "
+           f"FROM ips WHERE {where} ORDER BY {build_order(q)} LIMIT ?")
+    rows = q_rows(db, sql, params + [n])
+    out = []
+    for ip, port, colo, loc, lat, bw, rclass in rows:
+        if colo:
+            name = country(colo)
+        elif loc:
+            name = loc
+        else:
+            name = "未知"
+        out.append({"ip": ip, "port": port, "country": name,
+                    "latency": round(lat, 1) if lat is not None else None,
+                    "bandwidth": bw, "route_class": rclass})
+    return {"rows": out}
+
+
 def export_body(db, q, fmt):
     where, params = build_where(q)
     sql = (f"SELECT ip, port, colo, loc, latency_ms, bandwidth_mbps, route_class FROM ips "
@@ -635,6 +659,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, body.encode("utf-8"), ctype, fname)
             elif path == "/api/copy":
                 self._send(200, json.dumps(api_copy(db, q)).encode("utf-8"))
+            elif path == "/api/optimize":
+                self._send(200, json.dumps(api_optimize(db, q)).encode("utf-8"))
             else:
                 self._send(404, b'{"error":"not found"}')
         except Exception as e:
@@ -731,6 +757,8 @@ button.ghost{background:var(--panel2);border:1px solid var(--line);color:var(--t
 button:disabled{opacity:.4;cursor:not-allowed}
 .chk{display:flex;align-items:center;gap:6px;font-size:13px;padding-bottom:8px}
 .chk input{accent-color:var(--acc);width:16px;height:16px}
+#f_premium:checked+label,#f_hasbw:checked+label,#f_v6:checked+label{color:var(--acc2);font-weight:700}
+.optbox{white-space:pre;font-family:ui-monospace,Consolas,monospace;font-size:12px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:8px;max-height:220px;overflow:auto;line-height:1.6;color:var(--txt);user-select:text}
 .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
 .chart h3{font-size:14px;color:var(--dim);margin-bottom:8px;font-weight:600}
 canvas{width:100%;height:250px}
@@ -916,6 +944,20 @@ font-family:ui-monospace,Consolas,monospace;font-size:12.5px;padding:10px;margin
   </div>
 </div>
 
+<div class="card">
+  <div class="h">🎯 手动优选 <span class="sub">从本地库已优选 IP 中即时抽取, 结果不保存</span></div>
+  <div class="row">
+    <div class="f"><label>数量</label><input id="opt_count" type="number" min="1" max="500" value="10"></div>
+    <div class="f"><label>地区过滤</label><input id="opt_region" placeholder="如 HKG,NRT,留空全部" style="width:170px"></div>
+    <div class="chk"><input type="checkbox" id="opt_premium"><label for="opt_premium">仅精品</label></div>
+    <div class="chk"><input type="checkbox" id="opt_hasbw" checked><label for="opt_hasbw">仅有带宽</label></div>
+    <div class="chk"><input type="checkbox" id="opt_v6"><label for="opt_v6">仅IPv6</label></div>
+    <button class="ghost" onclick="runOpt()">优选</button>
+    <button class="ghost" onclick="copyOpt()">复制结果</button>
+  </div>
+  <div class="optbox" id="optBox">点击「优选」从数据库已优选 IP 中按带宽/延迟抽出最优 N 条, 点击「复制结果」一次性复制</div>
+</div>
+
 <footer>数据来源: <span id="srcHost">speed.cloudflare.com</span> 实测带宽 &amp; /cdn-cgi/trace 地区识别 &nbsp;|&nbsp; 服务端 v<span id="ver">?</span></footer>
 
 <div id="chartTip"><div class="t-title"></div><div class="t-body"></div></div>
@@ -988,6 +1030,32 @@ function jumpPage(){
   $("pageJump").value=pg;
   OFFSET=(pg-1)*LIMIT;
   loadTable();
+}
+let OPT=[];
+function optParams(){
+  const p=new URLSearchParams();
+  p.set("count",$("opt_count").value||10);
+  if($("opt_region").value.trim())p.set("region",$("opt_region").value.trim());
+  if($("opt_premium").checked)p.set("route","premium");
+  if($("opt_hasbw").checked)p.set("hasbw","1");
+  if($("opt_v6").checked)p.set("v6","1");
+  return p;
+}
+function runOpt(){
+  const btn=document.querySelector(".card .ghost");
+  fetch("/api/optimize?"+optParams()).then(r=>r.json()).then(d=>{
+    if(!d.rows||!d.rows.length){OPT=[];$("optBox").textContent="无符合条件的结果";toast("无符合条件的结果","err");return}
+    OPT=d.rows.map(r=>r.ip+":"+r.port+"#"+r.country+(r.route_class==="premium"?"精品":""));
+    $("optBox").textContent=OPT.join("\n");
+    toast("优选完成: "+OPT.length+" 条","ok");
+  }).catch(()=>toast("优选请求失败","err"));
+}
+function copyOpt(){
+  if(!OPT.length){toast("请先点「优选」","err");return}
+  copyText(OPT.join("\n")).then(ok=>{
+    if(ok)toast("已复制 "+OPT.length+" 条","ok");
+    else toast("复制失败, 请手动复制","err");
+  });
 }
 const MANUAL={};
 const HOPS={};
@@ -1499,7 +1567,7 @@ function scrollGuardSetup(){
 ["f_region","f_minbw","f_maxlat","f_q","f_port"].forEach(id=>{
   $(id).addEventListener("input",()=>{OFFSET=0;loadTable()});
 });
-["f_hasbw","f_premium"].forEach(id=>{
+["f_hasbw","f_premium","f_v6"].forEach(id=>{
   $(id).addEventListener("change",()=>{OFFSET=0;loadTable()});
 });
 loadSet();

@@ -11,5 +11,8 @@
   "exploit": "0.6",
   "max_latency": "2000",
   "tls_check": "1",
-  "bench_host": "speed.cloudflare.com"
+  "bench_host": "speed.cloudflare.com",
+  "route_check": "1",
+  "route_budget": "20",
+  "route_stale_hours": "6"
 }

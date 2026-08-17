@@ -36,6 +36,7 @@ CF 优选IP 扫描数据库 (常驻稳定扫描器) - 增强版
 import argparse
 import asyncio
 import ipaddress
+import json
 import os
 import queue
 import random
@@ -47,6 +48,11 @@ import threading
 import time
 import types
 import urllib.parse
+
+try:
+    import route_probe
+except ImportError:
+    route_probe = None
 
 OFFICIAL_V4_URL = "https://www.cloudflare.com/ips-v4"
 FALLBACK_RANGES = [
@@ -66,6 +72,8 @@ TRACE_HOST = "cloudflare.com"
 SPEED_HOST = "speed.cloudflare.com"
 PORTS_DEFAULT = [443, 2053, 2083, 8443]
 
+# 路由线路分类由独立模块 route_probe.py 负责 (AS 基准/判定逻辑见该模块)
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ips(
   ip TEXT PRIMARY KEY,
@@ -80,15 +88,28 @@ CREATE TABLE IF NOT EXISTS ips(
   verified_at REAL,
   first_seen REAL,
   ok_count INTEGER DEFAULT 0,
-  fail_count INTEGER DEFAULT 0
+  fail_count INTEGER DEFAULT 0,
+  route_as_list TEXT,
+  route_class TEXT,
+  route_hops TEXT,
+  route_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_ips_score ON ips(latency_ms, verified_at, bandwidth_mbps);
 CREATE INDEX IF NOT EXISTS idx_ips_tested ON ips(tested_at);
 """
 
+ROUTE_INDEX_SQL = "CREATE INDEX IF NOT EXISTS idx_ips_route_class ON ips(route_class)"
+
 MIGRATIONS = [
     "ALTER TABLE ips ADD COLUMN bw_last_mbps REAL",
     "ALTER TABLE ips ADD COLUMN bw_last_at REAL",
+    "ALTER TABLE ips ADD COLUMN route_as_list TEXT",
+    "ALTER TABLE ips ADD COLUMN route_class TEXT",
+    "ALTER TABLE ips ADD COLUMN route_hops TEXT",
+    "ALTER TABLE ips ADD COLUMN route_at REAL",
+    "DROP INDEX IF EXISTS idx_ips_route",
+    "ALTER TABLE ips DROP COLUMN route",
+    "ALTER TABLE ips DROP COLUMN route_premium",
 ]
 
 N24_SQL = ("substr(ip,1,"
@@ -108,11 +129,24 @@ def open_db(path):
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SCHEMA)
-    have = {r[1] for r in conn.execute("PRAGMA table_info(ips)").fetchall()}
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(ips)").fetchall()}
     for m in MIGRATIONS:
-        col = m.split(" ADD COLUMN ")[1].split(" ")[0]
-        if col not in have:
+        if m.startswith("ALTER TABLE ips ADD COLUMN "):
+            col = m.split(" ADD COLUMN ")[1].split(" ")[0]
+            if col in cols:
+                continue
+        elif m.startswith("ALTER TABLE ips DROP COLUMN "):
+            col = m.split(" DROP COLUMN ")[1].split(" ")[0]
+            if col not in cols:
+                continue
+        try:
             conn.execute(m)
+        except Exception:
+            pass
+    try:
+        conn.execute(ROUTE_INDEX_SQL)
+    except Exception:
+        pass
     conn.commit()
     return conn
 
@@ -124,22 +158,42 @@ def load_known(conn):
 
 async def fetch(url, timeout=10):
     loop = asyncio.get_running_loop()
-    _, writer = await asyncio.wait_for(asyncio.open_connection(
-        url.host, url.port or 443, ssl=True, server_hostname=url.host), timeout)
+    reader, writer = await asyncio.wait_for(asyncio.open_connection(
+        url.hostname, url.port or 443, ssl=True, server_hostname=url.hostname), timeout)
     try:
-        writer.write("GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: cf-optimizer\r\nConnection: close\r\n\r\n".format(
-            path=url.path or "/", host=url.host).encode())
+        path = url.path or "/"
+        if url.query:
+            path += "?" + url.query
+        writer.write("GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: cf-optimizer\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n".format(
+            path=path, host=url.hostname).encode())
         await writer.drain()
-        data = b""
-        while True:
-            chunk = await asyncio.wait_for(writer.wait_for_read, 1)
+        data = await asyncio.wait_for(reader.read(), timeout)
+        idx = data.find(b"\r\n\r\n")
+        if idx < 0:
+            return data
+        header = data[:idx].decode("latin-1")
+        body = data[idx + 4:]
+        clen = None
+        for line in header.split("\r\n")[1:]:
+            k, _, v = line.partition(":")
+            if k.strip().lower() == "content-length":
+                try:
+                    clen = int(v.strip())
+                except ValueError:
+                    clen = None
+                break
+        while clen is not None and len(body) < clen:
+            chunk = await asyncio.wait_for(reader.read(65536), timeout)
             if not chunk:
                 break
-            data += chunk
-        return data
+            body += chunk
+        return body
     finally:
         writer.close()
-        await writer.wait_closed()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
 
 
 def upsert(conn, rec):
@@ -151,8 +205,9 @@ def upsert(conn, rec):
         """
         INSERT INTO ips(ip,port,colo,loc,latency_ms,bandwidth_mbps,
                         bw_last_mbps,bw_last_at,
-                        tested_at,verified_at,first_seen,ok_count,fail_count)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        tested_at,verified_at,first_seen,ok_count,fail_count,
+                        route_as_list,route_class,route_hops,route_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(ip) DO UPDATE SET
           port=CASE WHEN excluded.latency_ms IS NOT NULL THEN excluded.port ELSE port END,
           latency_ms=CASE WHEN excluded.latency_ms IS NOT NULL THEN excluded.latency_ms ELSE latency_ms END,
@@ -165,7 +220,11 @@ def upsert(conn, rec):
           bw_last_mbps=CASE WHEN excluded.bw_last_mbps IS NOT NULL THEN excluded.bw_last_mbps ELSE bw_last_mbps END,
           bw_last_at=CASE WHEN excluded.bw_last_at IS NOT NULL THEN excluded.bw_last_at ELSE bw_last_at END,
           ok_count=ok_count+excluded.ok_count,
-          fail_count=fail_count+excluded.fail_count
+          fail_count=fail_count+excluded.fail_count,
+          route_as_list=CASE WHEN excluded.route_as_list IS NOT NULL THEN excluded.route_as_list ELSE route_as_list END,
+          route_class=CASE WHEN excluded.route_class IS NOT NULL THEN excluded.route_class ELSE route_class END,
+          route_hops=CASE WHEN excluded.route_hops IS NOT NULL THEN excluded.route_hops ELSE route_hops END,
+          route_at=CASE WHEN excluded.route_at IS NOT NULL THEN excluded.route_at ELSE route_at END
         """,
         (
             rec.get("ip"), rec.get("port") or 443,
@@ -175,8 +234,14 @@ def upsert(conn, rec):
             rec.get("tested_at") or time.time(),
             rec.get("verified_at"), rec.get("first_seen") or time.time(),
             ok, fail,
+            rec.get("route_as_list"), rec.get("route_class"),
+            rec.get("route_hops"), rec.get("route_at"),
         ),
     )
+
+
+# ------------------------------------------------------------ 路由线路检测
+# 由独立模块 route_probe.py 提供, 见 route_probe.classify_route()
 
 
 def fetch_networks(operator, port):
@@ -375,7 +440,7 @@ async def probe_ip(ip, ports, args):
         if args.tls_check:
             tls = await tls_probe(ip, p, min(args.ping_timeout * 2, 4.0))
             if tls is None:
-                return ip, None, None, False
+                continue
         return ip, p, tcp, True
     return ip, None, None, False
 
@@ -527,7 +592,7 @@ async def run_session(nets, known, q, args, stop):
                         out[idx] = None
         return out
 
-    async def verify_one(ip, p, lat, do_bench):
+    async def verify_one(ip, p, lat, do_bench, do_route=False):
         args_ns = types.SimpleNamespace(bench_size=args.bench_size,
                                         bench_timeout=args.bench_timeout,
                                         bench_parallel=args.bench_parallel,
@@ -546,19 +611,63 @@ async def run_session(nets, known, q, args, stop):
                     bw = await bench_bandwidth(ip, p, args_ns)
                 except Exception:
                     bw = None
+        route_as_list = route_class = route_hops = route_at = None
+        if do_route:
+            try:
+                res = await asyncio.to_thread(route_probe.classify_route, ip)
+                route_class, as_list, hops = res["route_class"], res["as_list"], res["hops"]
+                if as_list:
+                    route_as_list = json.dumps(as_list)
+                if hops:
+                    route_hops = json.dumps(hops, ensure_ascii=False)
+                route_at = time.time()
+            except Exception:
+                route_as_list = route_class = route_hops = route_at = None
         rec = {"type": "result", "ip": ip, "port": p, "ok": True,
                "latency": lat, "colo": colo, "loc": loc, "bandwidth": bw,
+               "route_as_list": route_as_list, "route_class": route_class,
+               "route_hops": route_hops, "route_at": route_at,
                "tested_at": time.time()}
         if verified_at:
             rec["verified_at"] = verified_at
         q.put(rec)
 
     async def verify_batch(pend):
+        if not pend:
+            return
         vsem = asyncio.Semaphore(min(8, len(pend)))
+        budget = int(getattr(args, "route_budget", 0) or 0)
+        if not getattr(args, "route_check", True):
+            budget = 0
+        route_targets = set()
+        if budget > 0:
+            meta = {}
+            try:
+                conn_r = sqlite3.connect(args.db)
+                meta = {r[0]: (r[1], r[2]) for r in conn_r.execute(
+                    "SELECT ip, bandwidth_mbps, route_at FROM ips")}
+                conn_r.close()
+            except Exception:
+                pass
+            stale_after = float(getattr(args, "route_stale_hours", 6) or 6) * 3600
+            now = time.time()
+
+            def prio(ip):
+                if ip not in meta:
+                    return 0
+                bw, rt = meta[ip]
+                if rt is None:
+                    return 1 if bw is not None else 2
+                if bw is not None and (now - rt) >= stale_after:
+                    return 1
+                return 3
+
+            ranked = sorted(pend, key=lambda x: prio(x[0]))
+            route_targets = {ip for ip, _, _ in ranked[:budget] if prio(ip) < 3}
 
         async def v(ip, p, lat, idx):
             async with vsem:
-                await verify_one(ip, p, lat, idx < args.bench)
+                await verify_one(ip, p, lat, idx < args.bench, ip in route_targets)
 
         await run_tasks([v(ip, p, lat, i) for i, (ip, p, lat) in enumerate(pend)])
 
@@ -665,17 +774,18 @@ def export_report(args):
         params.extend(keep)
         params.extend(keep)
     rows = conn.execute(
-        f"SELECT ip, port, colo, loc, latency_ms, bandwidth_mbps FROM ips "
+        f"SELECT ip, port, colo, loc, latency_ms, bandwidth_mbps, route_class FROM ips "
         f"WHERE {where} "
         f"ORDER BY (CASE WHEN bandwidth_mbps IS NULL THEN 0 ELSE bandwidth_mbps END) DESC, "
         f"latency_ms ASC LIMIT ?", params + [args.top if args.top else 100]).fetchall()
     conn.close()
     lines = []
-    csv_lines = ["rank,ip,port,latency_ms,bandwidth_mbps,colo,loc"]
-    for i, (ip, p, colo, loc, lat, bw) in enumerate(rows, 1):
+    csv_lines = ["rank,ip,port,latency_ms,bandwidth_mbps,colo,loc,route_class"]
+    for i, (ip, p, colo, loc, lat, bw, route_class) in enumerate(rows, 1):
         remark = f"{colo or 'UNK'}-{loc or 'UNK'}-{i}"
         lines.append(f"{ip}:{p}#{remark}")
-        csv_lines.append(f"{i},{ip},{p},{lat or ''},{bw if bw is not None else ''},{colo or ''},{loc or ''}")
+        csv_lines.append(f"{i},{ip},{p},{lat if lat is not None else ''},"
+                         f"{bw if bw is not None else ''},{colo or ''},{loc or ''},{route_class or ''}")
     mode = args.mode
     if mode == "txt":
         body = "\n".join(lines) + ("\n" if lines else "")
@@ -696,6 +806,13 @@ def stats_report(args):
         "SELECT colo, COUNT(*) FROM ips WHERE ok_count>0 GROUP BY colo ORDER BY COUNT(*) DESC LIMIT 10").fetchall()
     port_rows = conn.execute(
         "SELECT port, COUNT(*) FROM ips WHERE ok_count>0 GROUP BY port ORDER BY COUNT(*) DESC LIMIT 6").fetchall()
+    route_rows = conn.execute(
+        "SELECT route_class, COUNT(*) FROM ips WHERE route_class IS NOT NULL "
+        "GROUP BY route_class ORDER BY COUNT(*) DESC LIMIT 10").fetchall()
+    with_route = conn.execute(
+        "SELECT COUNT(*) FROM ips WHERE route_class IS NOT NULL").fetchone()[0]
+    premium = conn.execute(
+        "SELECT COUNT(*) FROM ips WHERE route_class='premium'").fetchone()[0]
     conn.close()
     nets, label = fetch_networks(args.operator, args.port)
     cov = net_total(nets)
@@ -704,18 +821,24 @@ def stats_report(args):
         f"覆盖源: {label}  地址总量约: {cov:,}",
         f"已测试IP: {total:,}  (覆盖率 {total / cov * 100 if cov else 0:.2f}%)",
         f"存活IP:  {ok:,}  已验证地区: {verified:,}  未识别地区: {unverified:,}  有带宽数据: {with_bw:,}",
+        f"已测线路: {with_route:,}  精品线路: {premium:,}",
         f"平均延迟(存活): {avg_lat}ms",
         f"常用端口: " + ", ".join(f"{p}:{c}" for p, c in port_rows),
         "机房分布(前10):",
     ]
     for colo, c in rows:
         out.append(f"  {colo}: {c}")
+    if route_rows:
+        out.append("线路分布(前10):")
+        for r, c in route_rows:
+            out.append(f"  {r}: {c}")
     return "\n".join(out)
 
 
 def seed_db(args):
     conn = open_db(args.db)
     n = 0
+    known = load_known(conn)
     for path in [args.seed]:
         with open(path, "r", encoding="utf-8") as fh:
             for line in fh:
@@ -739,9 +862,9 @@ def seed_db(args):
                 rec = {"ip": host, "port": port, "ok": True, "latency": 0,
                        "colo": colo, "loc": loc, "tested_at": time.time(),
                        "verified_at": time.time()}
-                known = load_known(conn)
                 if host in known:
                     continue
+                known[host] = time.time()
                 upsert(conn, rec)
                 conn.commit()
                 n += 1
@@ -776,6 +899,14 @@ def main():
                     help="每轮复核库内旧IP数量(存活刷新+失败重试, 默认30; 0=关闭)")
     ap.add_argument("--backfill", type=int, default=0,
                     help="每轮为'存活但缺地区(colo/loc)'的旧IP补全地区识别数量(默认0; GUI默认开启)")
+    ap.add_argument("--route-check", dest="route_check", action="store_true", default=True,
+                    help="对验证通过的IP做路由线路分类(ping TTL traceroute, 默认开)")
+    ap.add_argument("--no-route-check", dest="route_check", action="store_false",
+                    help="关闭路由线路分类检测")
+    ap.add_argument("--route-budget", type=int, default=20,
+                    help="每轮做线路检测的IP上限(默认20; 0=关闭; 新发现优先, 已测且新鲜的不占额度)")
+    ap.add_argument("--route-stale-hours", type=float, default=6, dest="route_stale_hours",
+                    help="已测线路的IP超过该小时数且本轮有带宽数据才重测(默认6), 避免重复探测")
     ap.add_argument("--bench-size", type=int, default=50_000_000)
     ap.add_argument("--bench-timeout", type=float, default=12)
     ap.add_argument("--bench-parallel", type=int, default=4)

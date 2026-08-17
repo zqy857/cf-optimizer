@@ -10,7 +10,8 @@
 - 📊 **实时看板**: 已测/存活/已验证/带宽/平均延迟统计卡片 + 机房 / 国家 / 延迟 / 带宽分布图表
 - 🚀 **带宽实测**: 内置测速模块,支持自定义测速域名(可配合自建 Cloudflare Worker 规避公共限流)
 - 🌍 **地区识别**: 自动识别机房 (colo) 与国家/地区,支持按地区筛选导出
-- 📋 **结果表**: 可排序 / 多条件筛选,一键导出 `ADD.txt` / `CSV`
+- 🛤️ **线路分类**: 去程 ASN 判定精品/普通/混合/未识别(CN2-GIA/9929/CMIN2 为精品,163/169/9808 为普通),表格悬停可查看逐跳 Traceroute 详情
+- 📋 **结果表**: 可排序 / 多条件筛选 / 勾选批量操作,一键导出 `ADD.txt` / `CSV`
 - ⚙️ **灵活配置**: 扫描参数随时通过 Web 界面调整并热重启
 - 💾 **断点续扫**: 所有结果累积进 SQLite,随时退出,下次继续
 
@@ -20,6 +21,7 @@
 |---|---|
 | `cf_db.py` | 核心扫描引擎(命令行工具) |
 | `cf_web.py` | Web 管理台(内置调用 cf_db) |
+| `route_probe.py` | 路由线路分类探测器(去程 ASN 判定 + 逐跳 Traceroute) |
 | `cf_speedtest_worker.js` | 自建测速 Cloudflare Worker(可选) |
 | `cf_settings.json` | Web 界面保存的参数(可选,缺失时用默认值) |
 
@@ -28,7 +30,7 @@
 ### 方式一:直接使用 Web 管理台(推荐)
 
 ```bash
-# 单文件下载 cf_web.py 和 cf_db.py 到同一目录
+# 下载 cf_web.py、cf_db.py、route_probe.py 到同一目录
 python3 cf_web.py --db cf_ips.db
 ```
 
@@ -57,6 +59,9 @@ python3 cf_db.py --ports 443,8443     # 只测 443 和 8443
 python3 cf_db.py --no-tls-check       # 关闭 TLS 二次确认(更快但质量略低)
 python3 cf_db.py --exploit 0.8        # 更多向优质 C 段倾斜
 python3 cf_db.py --reverify           # 只复核库内现有优质 IP
+python3 cf_db.py --route-check         # 开启线路分类检测(精品/普通/混合, 需要 ping 命令)
+python3 cf_db.py --route-budget 30     # 每轮线路检测的 IP 数上限
+python3 cf_db.py --route-stale-hours 12# 线路重测周期(小时)
 python3 cf_db.py --stats              # 查看库统计 / 覆盖率
 python3 cf_db.py --export top.txt     # 导出当前最优 N 条 (--top N, 可加 --region)
 python3 cf_db.py --seed myadd.txt     # 把现有优选名单导入数据库作为种子
@@ -86,6 +91,9 @@ python3 cf_db.py --seed myadd.txt     # 把现有优选名单导入数据库作�
 | `--exploit` | 0.6 | 优质 C 段加权比例 |
 | `--max-latency` | 2000 | 延迟上限(ms) |
 | `--tls-check` | 1 | TLS 二次确认开关 |
+| `--route-check` | 1 | 线路分类检测开关 |
+| `--route-budget` | 20 | 每轮线路检测的 IP 数上限 |
+| `--route-stale-hours` | 6 | 有带宽 IP 的线路重测周期(小时) |
 | `--gap` | 10 | 轮间隔(秒) |
 
 ## 🛠 技术栈

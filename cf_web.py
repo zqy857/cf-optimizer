@@ -24,6 +24,7 @@ import asyncio
 import json
 import os
 import queue
+import re
 import socket
 import sqlite3
 import sys
@@ -36,9 +37,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import cf_db
+import route_probe
 
 COV_TOTAL = sum(1 << (32 - int(r.split("/")[1])) for r in cf_db.FALLBACK_RANGES)
-VERSION = "1.2.6"
+VERSION = "1.3.0"
 
 COLO_COUNTRY = {
     "LAX": "美国", "SJC": "美国", "SEA": "美国", "PDX": "美国",
@@ -68,7 +70,7 @@ COLO_COUNTRY = {
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cf_settings.json")
 SETTINGS_KEYS = ["operator", "ports", "count", "concurrency", "verify", "bench",
                  "bench_parallel", "backfill", "recheck", "exploit", "max_latency", "tls_check",
-                 "bench_host"]
+                 "bench_host", "route_check", "route_budget", "route_stale_hours"]
 
 
 def load_settings():
@@ -192,6 +194,13 @@ def build_where(q):
     if port and port.isdigit():
         where.append("port = ?")
         params.append(int(port))
+    rq = (q.get("route", [""])[0] or "").strip()
+    if rq:
+        keep = [r.strip() for r in rq.split(",") if r.strip()]
+        if keep:
+            ph = ",".join("?" for _ in keep)
+            where.append(f"route_class IN ({ph})")
+            params.extend(keep)
     ipq = (q.get("q", [""])[0] or "").strip()
     if ipq:
         where.append("ip LIKE ?")
@@ -211,6 +220,7 @@ def build_order(q):
         return "port ASC, latency_ms ASC"
     if sort == "time":
         return "tested_at DESC"
+    # route_class 仅作筛选标签, 不参与排序权重 (红线4)
     return "(CASE WHEN bw_last_mbps IS NULL THEN -1 ELSE bw_last_mbps END) DESC, latency_ms ASC"
 
 
@@ -239,6 +249,12 @@ def api_stats(db):
                       "GROUP BY loc ORDER BY COUNT(*) DESC LIMIT 10")
     ports = q_rows(db, "SELECT port, COUNT(*) FROM ips WHERE ok_count>0 GROUP BY port "
                        "ORDER BY COUNT(*) DESC LIMIT 8")
+    route_rows = q_rows(db, "SELECT route_class, COUNT(*) FROM ips WHERE route_class IS NOT NULL "
+                            "GROUP BY route_class ORDER BY COUNT(*) DESC LIMIT 12")
+    route_done = q_one(db, "SELECT COUNT(*) FROM ips WHERE route_class IS NOT NULL")
+    route_done = route_done[0] if route_done else 0
+    premium = q_one(db, "SELECT COUNT(*) FROM ips WHERE route_class='premium'")
+    premium = premium[0] if premium else 0
 
     lat_buckets = [0] * 8
     lat_labels = ["<50", "50-100", "100-200", "200-300", "300-500", "500-800", "800-1500", ">1500"]
@@ -286,6 +302,10 @@ def api_stats(db):
         "total": total, "alive": alive, "verified": verified, "withbw": withbw,
         "avglat": avglat, "maxbw": maxbw, "bwbest": bwbest, "minlat": minlat,
         "coverage": round(total / COV_TOTAL * 100, 3) if COV_TOTAL else 0,
+        "route_done": route_done, "premium": premium,
+        "routes": [{"name": route_probe.get_class_label(r) if r else "未知",
+                    "class": r, "count": n, "premium": 1 if r == "premium" else 0}
+                   for r, n in route_rows],
         "colos": [{"name": c or "UNK", "count": n} for c, n in colos],
         "countries": countries,
         "locs": [{"name": l or "UNK", "count": n} for l, n in locs],
@@ -310,33 +330,53 @@ def api_table(db, q):
     total_row = q_one(db, f"SELECT COUNT(*) FROM ips WHERE {where}", params)
     total = total_row[0] if total_row else 0
     sql = (f"SELECT ip, port, colo, loc, latency_ms, bandwidth_mbps, bw_last_mbps, bw_last_at, "
-           f"tested_at, ok_count, fail_count "
+           f"tested_at, ok_count, fail_count, route_as_list, route_class, route_hops "
            f"FROM ips WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?")
     rows = q_rows(db, sql, params + [limit, offset])
     out = []
-    for ip, port, colo, loc, lat, bw, bw_last, bw_last_at, tested, okc, failc in rows:
+    for ip, port, colo, loc, lat, bw, bw_last, bw_last_at, tested, okc, failc, rasl, rclass, rhops in rows:
         out.append({"ip": ip, "port": port, "colo": colo or "UNK",
                     "country": country(colo or "UNK"), "loc": loc or "UNK",
                     "latency": round(lat, 1) if lat is not None else None,
                     "bandwidth": bw_last if bw_last is not None else None,
                     "bw_best": bw if bw is not None else None,
                     "bw_last_at": bw_last_at,
+                    "route_class": rclass, "route_as_list": rasl,
+                    "route_hops": rhops,
                     "tested": tested, "ok": okc, "fail": failc})
     return {"rows": out, "total": total, "offset": offset, "limit": limit}
 
 
+def api_copy(db, q):
+    ips = [s.strip() for s in re.split(r"[,;\n\r]+", q.get("ips", [""])[0]) if s.strip()]
+    if not ips:
+        return {"rows": []}
+    ph = ",".join("?" * len(ips))
+    rows = q_rows(db, f"SELECT ip, port, colo, loc, route_class FROM ips WHERE ip IN ({ph})", ips)
+    out = []
+    for ip, p, c, l, rclass in rows:
+        if c:
+            name = country(c)
+        elif l:
+            name = l
+        else:
+            name = "未知"
+        out.append({"ip": ip, "port": p, "country": name, "route_class": rclass})
+    return {"rows": out}
+
+
 def export_body(db, q, fmt):
     where, params = build_where(q)
-    sql = (f"SELECT ip, port, colo, loc, latency_ms, bandwidth_mbps FROM ips "
+    sql = (f"SELECT ip, port, colo, loc, latency_ms, bandwidth_mbps, route_class FROM ips "
            f"WHERE {where} ORDER BY {build_order(q)} LIMIT 2000")
     rows = q_rows(db, sql, params)
     if fmt == "csv":
-        lines = ["rank,ip,port,latency_ms,bandwidth_mbps,colo,loc"]
-        for i, (ip, p, c, l, lat, bw) in enumerate(rows, 1):
-            lines.append(f"{i},{ip},{p},{lat or ''},{bw if bw is not None else ''},{c or ''},{l or ''}")
+        lines = ["rank,ip,port,latency_ms,bandwidth_mbps,colo,loc,route_class"]
+        for i, (ip, p, c, l, lat, bw, rclass) in enumerate(rows, 1):
+            lines.append(f"{i},{ip},{p},{lat if lat is not None else ''},{bw if bw is not None else ''},{c or ''},{l or ''},{rclass or ''}")
         return "\n".join(lines) + "\n", "text/csv", "cf_optimizer.csv"
     lines = []
-    for i, (ip, p, c, l, lat, bw) in enumerate(rows, 1):
+    for i, (ip, p, c, l, lat, bw, rclass) in enumerate(rows, 1):
         lines.append(f"{ip}:{p}#{c or 'UNK'}-{l or 'UNK'}-{i}")
     return "\n".join(lines) + "\n", "text/plain; charset=utf-8", "ADD.txt"
 
@@ -355,24 +395,27 @@ def scan_args(params, db):
     return types.SimpleNamespace(
         db=db,
         operator=(params.get("operator") or None),
-        count=int(num("count", 5000, int)),
-        verify=int(num("verify", 400, int)),
-        bench=int(num("bench", 20, int)),
-        backfill=int(num("backfill", 300, int)),
-        recheck=int(num("recheck", 200, int)),
-        concurrency=int(num("concurrency", 400, int)),
-        ping_timeout=num("ping_timeout", 1.2),
-        max_latency=num("max_latency", 2000),
+        count=max(1, int(num("count", 5000, int))),
+        verify=max(0, int(num("verify", 400, int))),
+        bench=max(0, int(num("bench", 20, int))),
+        backfill=max(0, int(num("backfill", 300, int))),
+        recheck=max(0, int(num("recheck", 200, int))),
+        concurrency=max(1, int(num("concurrency", 400, int))),
+        ping_timeout=max(0.1, num("ping_timeout", 1.2)),
+        max_latency=max(1, num("max_latency", 2000)),
         port=int(num("port", 443, int)),
         ports=tuple(ports),
         tls_check=str(params.get("tls_check", "1")) not in ("0", "false", ""),
-        exploit=num("exploit", 0.6),
-        cooldown=num("cooldown", 3600),
-        bench_size=int(num("bench_size", 30_000_000, int)),
-        bench_timeout=num("bench_timeout", 10),
-        bench_parallel=int(num("bench_parallel", 6, int)),
+        exploit=min(1.0, max(0.0, num("exploit", 0.6))),
+        cooldown=max(1, num("cooldown", 3600)),
+        bench_size=int(max(1_000_000, min(num("bench_size", 30_000_000, int), 80_000_000))),
+        bench_timeout=max(1, num("bench_timeout", 10)),
+        bench_parallel=max(1, int(num("bench_parallel", 6, int))),
         bench_host=str(params.get("bench_host", "")).strip() or cf_db.SPEED_HOST,
-        cycles=0, gap=num("gap", 5), once=False, reverify=0,
+        route_check=str(params.get("route_check", "1")) not in ("0", "false", ""),
+        route_budget=max(0, int(num("route_budget", 20, int))),
+        route_stale_hours=max(1, num("route_stale_hours", 6)),
+        cycles=0, gap=max(1, num("gap", 5)), once=False, reverify=0,
     )
 
 
@@ -387,7 +430,8 @@ def scanner_worker(args):
         nets, label = cf_db.fetch_networks(args.operator, args.port)
         set_state(label=label, db=os.path.abspath(args.db),
                   msg=f"已启动: {label} | 抽样{args.count} 并发{args.concurrency} | "
-                      f"端口{','.join(map(str, args.ports))} | TLS确认{'开' if args.tls_check else '关'}")
+                      f"端口{','.join(map(str, args.ports))} | TLS确认{'开' if args.tls_check else '关'} | "
+                      f"线路检测{'开' if args.route_check else '关'}({args.route_budget}/轮)")
 
         pend_count = 0
 
@@ -487,9 +531,9 @@ def test_ip(db, params):
         port = 443
     if not ip:
         return {"ok": False, "error": "缺少 ip"}
-    if act not in ("lat", "bw"):
-        return {"ok": False, "error": "action 只能是 lat/bw"}
-    log_event(f"手动测试: {ip}:{port} ({'延迟' if act=='lat' else '带宽'})")
+    if act not in ("lat", "bw", "route"):
+        return {"ok": False, "error": "action 只能是 lat/bw/route"}
+    log_event(f"手动测试: {ip}:{port} ({'延迟' if act=='lat' else '带宽' if act=='bw' else '线路'})")
     try:
         if act == "lat":
             lat = asyncio.run(cf_db.tls_probe(ip, port, 4.0))
@@ -497,7 +541,7 @@ def test_ip(db, params):
                 return {"ok": False, "error": "连接失败或超时"}
             upsert_test(db, ip, port, latency=lat)
             return {"ok": True, "latency": round(lat, 1)}
-        else:
+        elif act == "bw":
             ns = types.SimpleNamespace(bench_size=30_000_000, bench_timeout=12,
                                        bench_parallel=6,
                                        bench_host=(params.get("bench_host") or cf_db.SPEED_HOST))
@@ -506,16 +550,30 @@ def test_ip(db, params):
                 return {"ok": False, "error": "测速失败"}
             upsert_test(db, ip, port, bandwidth=bw)
             return {"ok": True, "bandwidth": bw}
+        else:
+            res = route_probe.classify_route(ip)
+            route_class, as_list, hops = res["route_class"], res["as_list"], res["hops"]
+            upsert_test(db, ip, port, route_class=route_class, route_as_list=as_list,
+                        route_hops=hops)
+            return {"ok": True, "route_class": route_class,
+                    "label": route_probe.get_class_label(route_class),
+                    "as_list": as_list, "hops": hops}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 
-def upsert_test(db, ip, port, latency=None, bandwidth=None):
+def upsert_test(db, ip, port, latency=None, bandwidth=None, route_class=None,
+                route_as_list=None, route_hops=None):
     try:
         conn = sqlite3.connect(db)
-        cf_db.upsert(conn, {"ip": ip, "port": port, "ok": True,
-                            "latency": latency, "bandwidth": bandwidth,
-                            "tested_at": time.time()})
+        rec = {"ip": ip, "port": port, "ok": True,
+               "latency": latency, "bandwidth": bandwidth,
+               "route_class": route_class,
+               "route_as_list": json.dumps(route_as_list) if route_as_list else None,
+               "route_hops": json.dumps(route_hops, ensure_ascii=False) if route_hops else None,
+               "route_at": time.time() if route_class else None,
+               "tested_at": time.time()}
+        cf_db.upsert(conn, rec)
         conn.commit()
         conn.close()
     except Exception:
@@ -568,6 +626,8 @@ class Handler(BaseHTTPRequestHandler):
                 fmt = q.get("fmt", ["txt"])[0]
                 body, ctype, fname = export_body(db, q, fmt)
                 self._send(200, body.encode("utf-8"), ctype, fname)
+            elif path == "/api/copy":
+                self._send(200, json.dumps(api_copy(db, q)).encode("utf-8"))
             else:
                 self._send(404, b'{"error":"not found"}')
         except Exception as e:
@@ -677,6 +737,7 @@ canvas{width:100%;height:250px}
 #chartTip .t-row{display:flex;justify-content:space-between;gap:30px;font-size:13.5px;
   padding:3px 0;line-height:1.4}
 #chartTip .t-row .k{color:#9aa6b0}
+#chartTip .t-row .k.sec{width:100%;color:#5b6570;font-weight:700;letter-spacing:.5px;border-top:1px solid rgba(255,255,255,.08);padding-top:3px}
 #chartTip .t-row .v{font-weight:700;color:#fff}
 .toolbar{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin-bottom:10px}
 .toolbar .f input{min-width:76px}
@@ -694,18 +755,39 @@ tbody tr:hover{transform:scale(1.012);box-shadow:0 2px 14px rgba(0,0,0,.25);z-in
 .bw.muted{color:var(--dim);font-weight:400}
 .lat{color:var(--warn)}
 .colo{font-weight:700;color:var(--purp)}
+.route{color:var(--dim);cursor:help}
+ .route:hover{text-decoration:underline dotted}
+.route.premium{color:var(--acc2);font-weight:700}
+.route.mixed{color:var(--warn);font-weight:600}
+.route.undetected{color:var(--dim);font-style:italic}
+tr.route-premium-row{outline:1.5px solid var(--acc2);outline-offset:-1.5px}
+tr.route-premium-row td{background:linear-gradient(90deg,rgba(34,197,94,.07),transparent)}
+.route-hint{color:#7a8695;font-size:12px;line-height:1.6;background:#0f1419;
+  border:1px dashed #2c3540;border-radius:8px;padding:8px 12px;margin:10px 0 4px}
+.route-hint b{color:#9aa7b5}
 .dead{color:var(--dim);text-align:center;padding:20px;font-size:13px}
 #tabWrap{max-height:560px;overflow-y:auto;overflow-x:hidden}
 .mini{font-size:12px;padding:4px 9px;border-radius:5px}
 .mini.lat{background:var(--panel2);color:var(--warn);border:1px solid var(--line)}
 .mini.bw{background:var(--panel2);color:var(--acc2);border:1px solid var(--line)}
+.mini.route{background:var(--panel2);color:var(--purp);border:1px solid var(--line)}
+.mini.route.done{color:var(--acc2)}
 .mini.done{background:linear-gradient(135deg,var(--panel2),var(--panel));color:var(--txt);font-weight:700;border-color:var(--acc);transform:scale(1.05);transition:all .2s ease}
 .mini.done:hover{transform:scale(1.12);box-shadow:0 0 10px rgba(0,0,0,.3)}
 .mini:disabled{opacity:.35}
 .pager{display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap}
 .pager span{font-size:13px;color:var(--dim)}
+.pager input{width:54px;padding:4px 6px;background:var(--panel2);border:1px solid var(--line);border-radius:5px;color:var(--txt);text-align:center}
+.pager .pg{display:inline-flex;align-items:center;gap:4px}
+.pager .pg input{width:46px}
+tbody .ck,#ckAll{accent-color:var(--acc);cursor:pointer}
+td.ck{width:26px;text-align:center}
 footer{margin-top:14px;color:var(--dim);font-size:12px;text-align:center}
 #msg{color:var(--warn);font-size:13px;min-height:18px;margin:8px 0}
+#toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%) translateY(16px);background:rgba(18,26,38,.94);color:#fff;padding:10px 20px;border-radius:8px;font-size:13px;opacity:0;pointer-events:none;transition:opacity .25s ease,transform .25s ease;z-index:999}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+#toast.ok{background:linear-gradient(135deg,#0b3d2e,#14532d);border:1px solid #22c55e}
+#toast.err{background:linear-gradient(135deg,#5c1515,#7f1d1d);border:1px solid #ef4444}
 .prog{display:flex;align-items:center;gap:12px;margin-top:12px}
 .prog .bar{flex:1;height:16px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;overflow:hidden}
 .prog .fill{height:100%;width:0;background:linear-gradient(90deg,var(--acc),var(--acc2));transition:width .8s}
@@ -725,7 +807,9 @@ font-family:ui-monospace,Consolas,monospace;font-size:12.5px;padding:10px;margin
   <span id="pill" class="pill idle">待命</span>
   <span id="dbpath" class="sub" style="margin:0"></span>
 </div>
-<div class="sub">多端口 + TLS确认 + 优质C段加权 + 地区补全 + 带宽实测 &nbsp;|&nbsp; 数据实时落库 SQLite</div>
+<div class="sub">多端口 + TLS确认 + 优质C段加权 + 地区补全 + 带宽实测 + 线路分类 &nbsp;|&nbsp; 数据实时落库 SQLite</div>
+
+<div class="route-hint">⚠️ <b>路由检测仅识别去程方向，无法探测回程；晚高峰卡顿多由回程链路导致，实际体验请以延迟、抖动、丢包、下载速度为准。</b></div>
 
 <div class="card">
   <div class="row">
@@ -743,9 +827,12 @@ font-family:ui-monospace,Consolas,monospace;font-size:12.5px;padding:10px;margin
     <div class="f"><label>测速域名<span class="tip">?<span class="pop">带宽实测用的测速服务域名. 默认 speed.cloudflare.com(会被限流); 可填自己的CF Worker域名如 myspeedtest.workers.dev, 不受公共限流</span></span></label><input id="bench_host" value="speed.cloudflare.com" style="min-width:220px"></div>
     <div class="f"><label>地区补全/轮<span class="tip">?<span class="pop">对还没有地区信息的旧IP补做识别. 修复历史遗留数据</span></span></label><input id="backfill" type="number" value="300"></div>
     <div class="f"><label>复核/轮<span class="tip">?<span class="pop">对冷却期已过的最旧IP重新探测, 防止IP失效后仍留在列表</span></span></label><input id="recheck" type="number" value="200"></div>
+    <div class="f"><label>线路检测/轮<span class="tip">?<span class="pop">每轮做线路分类的IP上限. 新发现的IP优先测, 已有带宽的IP会在超时后重测, 已测且新鲜的自动跳过不占额度. 每个IP约1-2秒(并行发包)</span></span></label><input id="route_budget" type="number" value="20"></div>
+    <div class="f"><label>线路重测周期(时)<span class="tip">?<span class="pop">已测过线路的IP, 若超过该小时数且本轮IP有带宽数据才重测; 新发现的IP始终测. 避免每轮重复探测消耗资源</span></span></label><input id="route_stale_hours" type="number" value="6"></div>
     <div class="f"><label>优质C段比例<span class="tip">?<span class="pop">抽样时0-1比例的IP从历史优质C段(邻居表现好)里选. 0.6=6成优质邻域+4成随机</span></span></label><input id="exploit" type="number" step="0.1" value="0.6"></div>
     <div class="f"><label>最大延迟ms<span class="tip">?<span class="pop">延迟超过该值的IP不算"达标", 不会被送去验证和测速</span></span></label><input id="max_latency" type="number" value="2000"></div>
     <div class="chk"><input type="checkbox" id="tls_check" checked><label for="tls_check">TLS二次确认<span class="tip">?<span class="pop">TCP能连后还要TLS握手(SNI=cloudflare.com)成功才算存活, 过滤假IP. 吃CPU但结果更干净</span></span></label></div>
+    <div class="chk"><input type="checkbox" id="route_check" checked><label for="route_check">线路分类检测<span class="tip">?<span class="pop">对达标IP做路由线路分类: 只识别去程方向(CN2-GIA/9929/CMIN2为精品, 163/169/9808为普通), 需系统有ping命令</span></span></label></div>
     <button id="startBtn" onclick="control('start')">开始扫描</button>
     <button id="stopBtn" class="stop" onclick="control('stop')" disabled>停止</button>
     <button class="ghost" onclick="saveSet()">保存设置</button>
@@ -768,6 +855,7 @@ font-family:ui-monospace,Consolas,monospace;font-size:12.5px;padding:10px;margin
     <div class="stat"><div class="v" id="st_maxbw">-</div><div class="l">最高带宽Mbps</div></div>
     <div class="stat"><div class="v" id="st_minlat">-</div><div class="l">最低延迟ms</div></div>
     <div class="stat"><div class="v" id="st_cov">0%</div><div class="l">覆盖率</div></div>
+    <div class="stat"><div class="v" id="st_route">-</div><div class="l">精品线路IP</div></div>
   </div>
 </div>
 
@@ -777,6 +865,7 @@ font-family:ui-monospace,Consolas,monospace;font-size:12.5px;padding:10px;margin
     <div class="chart"><h3>国家/地区分布 (colo 前12)</h3><canvas id="ch_country"></canvas></div>
     <div class="chart"><h3>延迟分布 (ms)</h3><canvas id="ch_lat"></canvas></div>
     <div class="chart"><h3>带宽分布 (Mbps)</h3><canvas id="ch_bw"></canvas></div>
+    <div class="chart"><h3>线路分布 (前12)</h3><canvas id="ch_route"></canvas></div>
   </div>
 </div>
 
@@ -787,6 +876,7 @@ font-family:ui-monospace,Consolas,monospace;font-size:12.5px;padding:10px;margin
     <div class="f"><label>最大延迟ms</label><input id="f_maxlat" type="number" value="2000"></div>
     <div class="f"><label>IP包含</label><input id="f_q" placeholder="IP关键字"></div>
     <div class="f"><label>端口</label><input id="f_port" placeholder="全部"></div>
+    <div class="chk"><input type="checkbox" id="f_premium"><label for="f_premium">只显示精品互联线路</label></div>
     <div class="chk"><input type="checkbox" id="f_hasbw"><label for="f_hasbw">仅有带宽</label></div>
     <button class="ghost" onclick="exportF('txt')">导出 ADD.txt</button>
     <button class="ghost" onclick="exportF('csv')">导出 CSV</button>
@@ -794,23 +884,30 @@ font-family:ui-monospace,Consolas,monospace;font-size:12.5px;padding:10px;margin
   <div id="tabWrap">
     <table>
       <thead><tr>
+        <th style="width:26px"><input type="checkbox" id="ckAll" title="全选本页" onclick="togglePageSel(this)"></th>
         <th>#</th><th onclick="sortBy('bw')">带宽Mbps</th><th onclick="sortBy('lat')">延迟ms</th>
         <th onclick="sortBy('ip')">IP</th><th onclick="sortBy('port')">端口</th>
         <th onclick="sortBy('colo')">机房</th><th>国家/地区</th>
-        <th onclick="sortBy('time')">最近测试</th><th>存活/失败</th><th>操作</th>
-      </tr></thead>
+        <th title="仅作筛选标签, 不参与排序">线路</th>
+        <th onclick="sortBy('time')">最近测试</th><th>存活/失败</th><th>操作</th></thead>
       <tbody id="tbody"></tbody>
     </table>
     <div class="dead" id="emptyTip">暂无数据 — 点击"开始扫描"</div>
   </div>
   <div class="pager">
+    <button class="ghost mini" onclick="copySel()">复制选中IP(<span id="selCount">0</span>)</button>
+    <button class="ghost mini" onclick="exportSel()">导出选中</button>
+    <button class="ghost mini" onclick="clearSel()">清空选中</button>
+    <span style="flex:1"></span>
     <button class="ghost mini" onclick="page(-1)">上一页</button>
     <span id="pageInfo">共 0 条</span>
+    <span class="pg">第 <input id="pageJump" type="number" min="1" value="1"> / <span id="pageTotal">1</span> 页</span>
+    <button class="ghost mini" onclick="jumpPage()">跳转</button>
     <button class="ghost mini" onclick="page(1)">下一页</button>
   </div>
 </div>
 
-<footer>数据来源: speed.cloudflare.com 实测带宽 &amp; /cdn-cgi/trace 地区识别 &nbsp;|&nbsp; 服务端 v<span id="ver">?</span></footer>
+<footer>数据来源: <span id="srcHost">speed.cloudflare.com</span> 实测带宽 &amp; /cdn-cgi/trace 地区识别 &nbsp;|&nbsp; 服务端 v<span id="ver">?</span></footer>
 
 <div id="chartTip"><div class="t-title"></div><div class="t-body"></div></div>
 
@@ -819,7 +916,73 @@ const $=id=>document.getElementById(id);
 let SORT="bw";
 let OFFSET=0;
 const LIMIT=100;
+let PAGE_TOTAL=0;
+const SEL=new Set();
+function updateSelUI(){const el=$("selCount");if(el)el.textContent=SEL.size;}
+function togglePageSel(ck){
+  document.querySelectorAll("#tbody .ck").forEach(c=>{c.checked=ck.checked;
+    if(ck.checked)SEL.add(c.dataset.ip);else SEL.delete(c.dataset.ip);});
+  updateSelUI();
+}
+function rowSelChange(c){
+  if(c.checked)SEL.add(c.dataset.ip);else SEL.delete(c.dataset.ip);
+  updateSelUI();
+}
+function copyText(txt){
+  if(navigator.clipboard&&window.isSecureContext)return navigator.clipboard.writeText(txt).then(()=>true);
+  return new Promise(res=>{
+    const ta=document.createElement("textarea");ta.value=txt;
+    ta.style.cssText="position:fixed;opacity:0";document.body.appendChild(ta);
+    ta.select();
+    let ok=false;try{ok=document.execCommand("copy")}catch(e){}
+    ta.remove();res(ok);
+  });
+}
+function toast(text,cls){
+  const t=$("toast");if(!t)return;
+  t.textContent=text;t.className=cls||"";t.classList.add("show");
+  clearTimeout(toast._t);
+  toast._t=setTimeout(()=>{t.classList.remove("show")},2400);
+}
+function copySel(){
+  const ips=[...SEL].sort();
+  if(!ips.length){toast("未选中任何IP","err");return}
+  fetch("/api/copy?ips="+encodeURIComponent(ips.join(","))).then(r=>r.json()).then(d=>{
+    if(!d.rows||!d.rows.length){toast("所选IP在数据库中无记录","err");return}
+    const lines=d.rows.map(r=>r.ip+":"+r.port+"#"+r.country+(r.route_class==="premium"?"精品":""));
+    copyText(lines.join("\n")).then(ok=>{
+      if(ok)toast("复制成功: "+lines.length+" 条","ok");
+      else toast("复制失败, 请手动复制","err");
+    });
+  }).catch(()=>toast("复制请求失败","err"));
+}
+function exportSel(){
+  const ips=[...SEL].sort();
+  if(!ips.length){toast("未选中任何IP","err");return}
+  fetch("/api/copy?ips="+encodeURIComponent(ips.join(","))).then(r=>r.json()).then(d=>{
+    if(!d.rows||!d.rows.length){toast("所选IP在数据库中无记录","err");return}
+    const lines=d.rows.map(r=>r.ip+":"+r.port+"#"+r.country+(r.route_class==="premium"?"精品":""));
+    const a=document.createElement("a");
+    a.href=URL.createObjectURL(new Blob([lines.join("\n")+"\n"],{type:"text/plain;charset=utf-8"}));
+    a.download="selected.txt";
+    document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a);a.remove()},400);
+    toast("已导出 "+lines.length+" 条","ok");
+  }).catch(()=>toast("导出请求失败","err"));
+}
+function clearSel(){SEL.clear();
+  document.querySelectorAll("#tbody .ck").forEach(c=>c.checked=false);
+  const ca=$("ckAll");if(ca)ca.checked=false;updateSelUI();}
+function jumpPage(){
+  const totalPages=Math.max(1,Math.ceil(PAGE_TOTAL/LIMIT));
+  let pg=Math.floor(+$("pageJump").value||1);
+  pg=Math.max(1,Math.min(pg,totalPages));
+  $("pageJump").value=pg;
+  OFFSET=(pg-1)*LIMIT;
+  loadTable();
+}
 const MANUAL={};
+const HOPS={};
+const RCL={premium:"🏆 精品互联线路",common:"⚡ 普通国际线路",mixed:"🔀 混合互联线路",undetected:"🧪 无法判定路由"};
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
 
 function fmt(v){return v==null?"-":v}
@@ -970,6 +1133,9 @@ function control(act){
       exploit:$("exploit").value,max_latency:$("max_latency").value,
       bench_parallel:$("bench_parallel").value,
       bench_host:$("bench_host").value,
+      route_budget:$("route_budget").value,
+      route_stale_hours:$("route_stale_hours").value,
+      route_check:$("route_check").checked?"1":"0",
       tls_check:$("tls_check").checked?"1":"0"})}).then(r=>r.json()).then(r=>{
     $("startBtn").textContent="开始扫描";
     if(!r.ok&&r.error){$("msg").textContent="启动失败: "+r.error}
@@ -984,6 +1150,7 @@ function tableParams(){
   const region=($("f_region").value||"").split(",").map(s=>s.trim()).filter(Boolean);
   const p=new URLSearchParams();
   if(region.length)p.set("region",region.join(","));
+  if($("f_premium").checked)p.set("route","premium");
   if(+$("f_minbw")>0)p.set("minbw",$("f_minbw"));
   if(+$("f_maxlat")<99999)p.set("maxlat",$("f_maxlat"));
   if($("f_q").value)p.set("q",$("f_q"));
@@ -1007,25 +1174,47 @@ function bwCellHtml(r){
 }
 function renderTable(data){
   const rows=data.rows, tb=$("tbody"); tb.innerHTML="";
+  PAGE_TOTAL=data.total;
   $("pageInfo").textContent="共 "+data.total+" 条 · 显示 "+(data.offset+1)+"~"+(data.offset+rows.length)+" · 每页 "+data.limit;
+  $("pageTotal").textContent=Math.max(1,Math.ceil(data.total/LIMIT));
+  $("pageJump").value=Math.floor(data.offset/LIMIT)+1;
   if(!rows.length){$("emptyTip").style.display="block";return}
   $("emptyTip").style.display="none";
+  for(const k in HOPS)delete HOPS[k];
   rows.forEach((r,i)=>{
     const bwCell=bwCellHtml(r);
     const lat=r.latency==null?"-":'<span class="lat">'+r.latency+"</span>";
     const tt=r.tested?new Date(r.tested*1000).toLocaleString("zh-CN",{hour12:false}):"-";
-    const mla=MANUAL[r.ip+":"+r.port+":lat"], mbw=MANUAL[r.ip+":"+r.port+":bw"];
+    const rcl=r.route_class;
+    const hk=r.ip+":"+r.port;
+    let hopsData=null;
+    if(r.route_hops){try{hopsData=JSON.parse(r.route_hops)}catch(e){}}
+    if(hopsData&&hopsData.length)HOPS[hk]=hopsData;else delete HOPS[hk];
+    const routeAttrs=rcl?(' data-cls="'+esc(rcl)+'"'+(hopsData&&hopsData.length?(' data-hk="'+hk+'"'):'')):'';
+    const routeCell=rcl
+      ?'<span class="route '+esc(rcl)+'"'+routeAttrs+'>'+esc(RCL[rcl]||rcl)+'</span>'
+      :'<span class="route">未检测</span>';
+    const mla=MANUAL[r.ip+":"+r.port+":lat"], mbw=MANUAL[r.ip+":"+r.port+":bw"], mrt=MANUAL[r.ip+":"+r.port+":route"];
     const latBtn=mla?`<button class="mini lat done" title="${esc(mla.title)}" onclick="testIp('lat','${r.ip}',${r.port},this)">${mla.text}</button>`
                    :`<button class="mini lat" onclick="testIp('lat','${r.ip}',${r.port},this)">测延迟</button>`;
     const bwBtn=mbw?`<button class="mini bw done" title="${esc(mbw.title)}" onclick="testIp('bw','${r.ip}',${r.port},this)">${mbw.text}</button>`
                    :`<button class="mini bw" onclick="testIp('bw','${r.ip}',${r.port},this)">测带宽</button>`;
+    const rtBtn=mrt?`<button class="mini route done" title="${esc(mrt.title)}" onclick="testIp('route','${r.ip}',${r.port},this)">${mrt.text}</button>`
+                   :`<button class="mini route" onclick="testIp('route','${r.ip}',${r.port},this)">测线路</button>`;
     const tr=document.createElement("tr");
-    tr.innerHTML=`<td>${data.offset+i+1}</td><td>${bwCell}</td><td>${lat}</td><td>${esc(r.ip)}</td><td>${r.port}</td>`+
-      `<td class="colo">${esc(r.colo)}</td><td>${esc(r.country)}</td><td>${tt}</td>`+
+    if(rcl==="premium")tr.className="route-premium-row";
+    tr.setAttribute("data-aslist", r.route_as_list||"");
+    const ck=SEL.has(r.ip);
+    tr.innerHTML=`<td class="ck"><input type="checkbox" class="ck" data-ip="${esc(r.ip)}" ${ck?"checked":""} onchange="rowSelChange(this)"></td>`+
+      `<td>${data.offset+i+1}</td><td>${bwCell}</td><td>${lat}</td><td>${esc(r.ip)}</td><td>${r.port}</td>`+
+      `<td class="colo">${esc(r.colo)}</td><td>${esc(r.country)}</td><td>${routeCell}</td><td>${tt}</td>`+
       `<td>${fmt(r.ok)}/<span style="color:var(--err)">${r.fail}</span></td>`+
-      `<td>${latBtn}${bwBtn}</td>`;
+      `<td>${latBtn}${bwBtn}${rtBtn}</td>`;
     tb.appendChild(tr);
   });
+  const ca=$("ckAll");
+  if(ca)ca.checked=rows.length>0&&rows.every(r=>SEL.has(r.ip));
+  updateSelUI();
 }
 function sortBy(k){SORT=k;OFFSET=0;loadTable()}
 function page(d){OFFSET=Math.max(0,OFFSET+d*LIMIT);loadTable()}
@@ -1037,13 +1226,19 @@ function testIp(act,ip,port,btn){
   fetch("/api/test",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({action:act,ip:ip,port:port,bench_host:$("bench_host").value})}).then(r=>r.json()).then(r=>{
     if(r.ok){
-      MANUAL[ip+":"+port+":"+act]={text:act==="lat"?(r.latency+"ms"):(r.bandwidth+"M"),
-        title:act==="lat"?("实测延迟 "+r.latency+"ms"):("实测带宽 "+r.bandwidth+" Mbps"),ok:true};
-      btn.textContent=act==="lat"?(r.latency+"ms"):(r.bandwidth+"M");
-      btn.classList.add("done");btn.title=MANUAL[ip+":"+port+":"+act].title;
-      btn.disabled=false;loadTable();
+      if(act==="route"){
+        MANUAL[ip+":"+port+":route"]={text:r.label,title:r.label+(r.route_class==="premium"?" (精品)":"")+" [AS: "+(r.as_list||[]).join(",")+"] · 悬停线路列看逐跳详情",ok:true};
+        btn.textContent=r.label;btn.title=MANUAL[ip+":"+port+":route"].title;
+        btn.classList.add("done");btn.disabled=false;loadTable();
+      }else{
+        MANUAL[ip+":"+port+":"+act]={text:act==="lat"?(r.latency+"ms"):(r.bandwidth+"M"),
+          title:act==="lat"?("实测延迟 "+r.latency+"ms"):("实测带宽 "+r.bandwidth+" Mbps"),ok:true};
+        btn.textContent=act==="lat"?(r.latency+"ms"):(r.bandwidth+"M");
+        btn.classList.add("done");btn.title=MANUAL[ip+":"+port+":"+act].title;
+        btn.disabled=false;loadTable();
+      }
     }
-    else{btn.textContent="失败";btn.title=act==="lat"?"延迟测试失败":"带宽测试失败";
+    else{btn.textContent="失败";btn.title={lat:"延迟测试失败",bw:"带宽测试失败",route:"线路检测失败"}[act];
       setTimeout(()=>{btn.textContent=old;btn.disabled=false},8000);
     }
   }).catch(e=>{btn.textContent=old;btn.disabled=false;alert("请求失败: "+e)});
@@ -1053,7 +1248,9 @@ function saveSet(){
     concurrency:$("concurrency").value,verify:$("verify").value,bench:$("bench").value,
     backfill:$("backfill").value,recheck:$("recheck").value,exploit:$("exploit").value,
     max_latency:$("max_latency").value,bench_parallel:$("bench_parallel").value,
-    bench_host:$("bench_host").value,
+    bench_host:$("bench_host").value,route_budget:$("route_budget").value,
+    route_stale_hours:$("route_stale_hours").value,
+    route_check:$("route_check").checked?"1":"0",
     tls_check:$("tls_check").checked?"1":"0"};
   fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify(body)}).then(r=>r.json()).then(r=>{
@@ -1064,18 +1261,14 @@ function loadSet(){
   fetch("/api/settings").then(r=>r.json()).then(d=>{
     if(!d||!Object.keys(d).length)return;
     if(d.operator!==undefined)$("operator").value=d.operator||"";
-    if(d.ports)$("ports").value=d.ports;
-    if(d.count)$("count").value=d.count;
-    if(d.concurrency)$("concurrency").value=d.concurrency;
-    if(d.verify)$("verify").value=d.verify;
-    if(d.bench)$("bench").value=d.bench;
-    if(d.bench_parallel)$("bench_parallel").value=d.bench_parallel;
-    if(d.bench_host)$("bench_host").value=d.bench_host;
-    if(d.backfill)$("backfill").value=d.backfill;
-    if(d.recheck)$("recheck").value=d.recheck;
-    if(d.exploit)$("exploit").value=d.exploit;
-    if(d.max_latency)$("max_latency").value=d.max_latency;
-    if(d.tls_check)$("tls_check").checked=d.tls_check!=="0";
+    ["ports","count","concurrency","verify","bench","bench_parallel","bench_host",
+     "backfill","recheck","exploit","max_latency","route_budget","route_stale_hours"].forEach(k=>{
+       const v=d[k];
+       if(v!==undefined&&v!==null&&v!=="")$(k).value=v;
+    });
+    if(d.tls_check!==undefined)$("tls_check").checked=d.tls_check!=="0";
+    if(d.route_check!==undefined)$("route_check").checked=d.route_check!=="0";
+    $("srcHost").textContent=$("bench_host").value||"speed.cloudflare.com";
   }).catch(e=>{});
 }
 function exportF(fmt){
@@ -1089,6 +1282,8 @@ function exportF(fmt){
 
 function renderLog(entries){
   const box=$("logbox"); if(!box)return;
+  const tsStr=ts=>{const dt=new Date(ts*1000);
+    return ("0"+dt.getHours()).slice(-2)+":"+("0"+dt.getMinutes()).slice(-2)+":"+("0"+dt.getSeconds()).slice(-2)};
   let changed=false;
   if(!(entries&&entries.length)){ if(box.childElementCount!==1){box.innerHTML=
     '<div class="logline"><span class="t">--:--:--</span><span class="m">等待事件...</span></div>'} return; }
@@ -1096,10 +1291,11 @@ function renderLog(entries){
   if(n!==entries.length)changed=true;
   else for(let i=0;i<n;i++){
     const lt=box.children[i].querySelector(".t");
-    if(!lt||lt.textContent!=entries[i][0]){changed=true;break;}
+    if(!lt||lt.textContent!==tsStr(entries[i][0])){changed=true;break;}
   }
   if(!changed&&box.dataset.ver===$("ver").textContent&&n===entries.length)return;
   box.dataset.ver=$("ver").textContent;
+  const nearBottom=box.scrollTop+box.clientHeight>=box.scrollHeight-4;
   box.innerHTML="";
   entries.forEach(e=>{
     const msg=String(e[1]||""), dt=new Date(e[0]*1000);
@@ -1109,7 +1305,7 @@ function renderLog(entries){
     d.innerHTML='<span class="t">'+pad+'</span><span class="m">'+esc(msg)+'</span>';
     box.appendChild(d);
   });
-  box.scrollTop=box.scrollHeight;
+  if(nearBottom)box.scrollTop=box.scrollHeight;
 }
 
 async function poll(){
@@ -1140,10 +1336,12 @@ async function poll(){
     $("st_maxbw").textContent=fmt(s.maxbw);
     countTo("st_minlat",s.minlat,false);
     countTo("st_cov",s.coverage,false,"%");
+    $("st_route").textContent=s.premium!=null?fmt(s.premium):"-";
     barChart("ch_colo",s.colos.slice(0,12),"#a78bfa");
     barChart("ch_country",s.countries.slice(0,12),"#3b82f6");
     histChart("ch_lat",s.lat.labels,s.lat.data,"#f59e0b");
     histChart("ch_bw",s.bw.labels,s.bw.data,"#22c55e");
+    barChart("ch_route",s.routes||[],"#22c55e");
   }catch(e){}
   setTimeout(poll,2000);
 }
@@ -1172,7 +1370,12 @@ function statTipSetup(){
     st_avglat:{t:"平均延迟",c:"var(--warn)",rows:s=>[["平均值",s.avglat??"-","#f59e0b"],["最低",s.minlat??"-","#fff"]]},
     st_maxbw:{t:"最高带宽",c:"var(--acc)",rows:s=>[["最近最高",s.maxbw??"-","#fff"],["历史最高",s.bwbest??"-","#22c55e"]]},
     st_minlat:{t:"最低延迟",c:"var(--warn)",rows:s=>[["最低",s.minlat??"-","#fff"],["平均",s.avglat??"-","#f59e0b"]]},
-    st_cov:{t:"覆盖率",rows:s=>[["覆盖",s.coverage+"%","#fff"],["已发现",s.total,"#22c55e"]]}
+    st_cov:{t:"覆盖率",rows:s=>[["覆盖",s.coverage+"%","#fff"],["已发现",s.total,"#22c55e"]]},
+    st_route:{t:"精品线路",c:"var(--acc2)",rows:s=>{const rts=(s.routes||[]).slice(0,5);
+      const base=[["已测线路",s.route_done??0,"#fff"],["其中精品",s.premium??0,"#22c55e"]];
+      if(!rts.length)return base;
+      return base.concat([["分布"]], rts.map(r=>[r.name, r.count, r.premium?"#22c55e":"#8b98a5"]));}
+    }
   };
   Object.entries(map).forEach(([id,cfg])=>{
     const el=$(id); if(!el)return;
@@ -1182,7 +1385,7 @@ function statTipSetup(){
       TIP.querySelector(".t-title").textContent=cfg.t;
       TIP.querySelector(".t-title").style.borderLeftColor=cfg.c;
       TIP.querySelector(".t-body").innerHTML=cfg.rows(STATS).map(r=>
-        `<div class="t-row"><span class="k">${esc(r[0])}</span><span class="v" style="color:${r[2]}">${esc(r[1])}</span></div>`
+        `<div class="t-row">${r.length>1&&r[1]!==undefined?`<span class="k">${esc(r[0])}</span><span class="v" style="color:${r[2]||"#fff"}">${esc(r[1])}</span>`:`<span class="k sec">${esc(r[0])}</span>`}</div>`
       ).join("");
       TIP.classList.add("show");
       const r=el.getBoundingClientRect(),nw=TIP.offsetWidth,nh=TIP.offsetHeight;
@@ -1198,16 +1401,17 @@ function statTipSetup(){
 }
 function bwTipSetup(){
   const TIP=$("chartTip");
-  let tmr=null;
   document.addEventListener("mouseover",e=>{
     const bw=e.target.closest&&e.target.closest(".bw");
     if(!bw||!bw.dataset.bw){
       if(e.target.closest&&e.target.closest(".stat"))return;
-      clearTimeout(tmr);
-      tmr=setTimeout(()=>TIP.classList.remove("show"),60);
+      if(e.target.closest&&e.target.closest(".route[data-cls]"))return;
+      if(TIP._hideTmr)clearTimeout(TIP._hideTmr);
+      TIP._hideTmr=setTimeout(()=>TIP.classList.remove("show"),60);
       return;
     }
     if(bw.dataset.bw==="none")return;
+    if(TIP._hideTmr){clearTimeout(TIP._hideTmr);TIP._hideTmr=null;}
     const d=JSON.parse(bw.dataset.bw);
     const diff=(d.best!=="—"&&d.best!==d.bw)?Math.round(d.bw-d.best):null;
     TIP.querySelector(".t-title").textContent="带宽详情";
@@ -1219,6 +1423,48 @@ function bwTipSetup(){
       '<div class="t-row"><span class="k">最近测于</span><span class="v">'+esc(d.lastAt)+'</span></div>'+
       '<div class="t-row"><span class="k">延迟</span><span class="v">'+esc(d.lat)+'</span></div>'+
       '<div class="t-row"><span class="k">存活/失败</span><span class="v">'+esc(d.ok)+' / '+esc(d.fail)+'</span></div>';
+    TIP.classList.add("show");
+    const nw=TIP.offsetWidth,nh=TIP.offsetHeight;
+    let lx=e.clientX+14,ty=e.clientY+12;
+    if(lx+nw>innerWidth-8)lx=e.clientX-nw-14;
+    if(ty+nh>innerHeight-8)ty=e.clientY-nh-12;
+    TIP.style.left=lx+"px";TIP.style.top=ty+"px";
+    TIP.style.transform="translate(0,0)";
+  });
+}
+function routeTipSetup(){
+  const TIP=$("chartTip");
+  document.addEventListener("mouseover",e=>{
+    const rt=e.target.closest&&e.target.closest(".route[data-cls]");
+    if(!rt){
+      if(e.target.closest&&(e.target.closest(".stat")||e.target.closest(".bw[data-bw]")))return;
+      if(TIP._hideTmr)clearTimeout(TIP._hideTmr);
+      TIP._hideTmr=setTimeout(()=>TIP.classList.remove("show"),60);
+      return;
+    }
+    if(TIP._hideTmr){clearTimeout(TIP._hideTmr);TIP._hideTmr=null;}
+    const rcl=rt.dataset.cls, label=RCL[rcl]||rcl||"线路";
+    const hops=rt.dataset.hk?HOPS[rt.dataset.hk]:null;
+    const rc=rcl==="premium"?"#22c55e":rcl==="mixed"?"#f59e0b":"#fff";
+    TIP.querySelector(".t-title").textContent="线路详情";
+    TIP.querySelector(".t-title").style.borderLeftColor=rcl==="premium"?"#22c55e":"var(--acc2)";
+    let body='<div class="t-row"><span class="k">线路分类</span><span class="v" style="color:'+rc+'">'+esc(label)+'</span></div>';
+    if(hops&&hops.length){
+      body+='<div class="t-row"><span class="k sec">Traceroute 逐跳</span></div>';
+      hops.forEach(h=>{
+        const ip=h.ip||"*";
+        const tag=h.asn?("AS"+h.asn+" "+esc(h.name||"")):esc(h.name||"");
+        const tm=h.time!=null?(h.time+"ms"):"-";
+        const tgt=h.target?" ✓目标":"";
+        body+='<div class="t-row"><span class="k">'+esc(h.n+". "+ip)+'</span>'+
+          '<span class="v" style="color:'+(h.target?"#22c55e":h.time!=null?"#fff":"#5b6570")+'">'+tag+' '+tm+tgt+'</span></div>';
+      });
+    }else{
+      body+='<div class="t-row"><span class="k sec">逐跳数据缺失(重新测线路后可见)</span></div>';
+    }
+    body+='<div class="t-row"><span class="k sec">跨境AS</span></div><div class="t-row"><span class="k">识别结果</span>'+
+      '<span class="v" style="color:#9aa6b0">'+esc((rt.closest("tr")&&rt.closest("tr").dataset.aslist)||"—")+'</span></div>';
+    TIP.querySelector(".t-body").innerHTML=body;
     TIP.classList.add("show");
     const nw=TIP.offsetWidth,nh=TIP.offsetHeight;
     let lx=e.clientX+14,ty=e.clientY+12;
@@ -1240,9 +1486,14 @@ function scrollGuardSetup(){
 ["f_region","f_minbw","f_maxlat","f_q","f_port"].forEach(id=>{
   $(id).addEventListener("input",()=>{OFFSET=0;loadTable()});
 });
-$("f_hasbw").addEventListener("change",()=>{OFFSET=0;loadTable()});
-loadSet();loadTable();statTipSetup();bwTipSetup();scrollGuardSetup();poll();
+["f_hasbw","f_premium"].forEach(id=>{
+  $(id).addEventListener("change",()=>{OFFSET=0;loadTable()});
+});
+loadSet();
+$("bench_host").addEventListener("input",()=>{$("srcHost").textContent=$("bench_host").value||"speed.cloudflare.com"});
+loadTable();statTipSetup();bwTipSetup();routeTipSetup();scrollGuardSetup();poll();
 </script>
+<div id="toast"></div>
 </body>
 </html>
 """
@@ -1280,9 +1531,13 @@ DEFAULT_LOGFILE = os.path.join(BASE, "cf_web.log")
 def pid_alive(pid):
     try:
         os.kill(pid, 0)
-        return True
-    except (OSError, ProcessLookupError):
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def get_pid(pidfile):
@@ -1339,7 +1594,7 @@ def daemon_stop(pidfile):
         if not pid_alive(pid):
             break
         time.sleep(0.1)
-    for p in (pidfile, pidfile + "-wal", pidfile + "-shm"):
+    for p in (pidfile,):
         try:
             os.remove(p)
         except OSError:
@@ -1373,9 +1628,7 @@ def serve_forever(args, host, port):
         print(f"端口 {port} 可能已被占用, 换端口: python3 cf_web.py --port 9000", file=sys.stderr)
         return False
     port = srv.server_address[1]
-    local = "127.0.0.1"
-    if host not in ("0.0.0.0", "::", ""):
-        local = host
+    local = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     print(f"CF 优选IP 扫描管理台已启动  数据库: {os.path.abspath(args.db)}", flush=True)
     print(f"  本机打开: http://{local}:{port}/", flush=True)
     for ip in lan_ips():

@@ -1829,10 +1829,16 @@ def lan_ips():
             ips.append(info[4][0])
     except Exception:
         pass
+    try:
+        host = socket.gethostname()
+        for info in socket.getaddrinfo(host, None, socket.AF_INET6):
+            ips.append(info[4][0])
+    except Exception:
+        pass
     seen = set()
     out = []
     for ip in ips:
-        if ip not in seen and not ip.startswith("127."):
+        if ip not in seen and not ip.startswith("127.") and ip not in ("::1",):
             seen.add(ip)
             out.append(ip)
     return out
@@ -1936,18 +1942,32 @@ def serve_forever(args, host, port):
     if not os.path.exists(args.db):
         conn = cf_db.open_db(args.db)
         conn.close()
+    server_cls = ThreadingHTTPServer
+    bind_host = host
+    if host in ("0.0.0.0", "", None):
+        # 双栈: 优先绑定 IPv6 通配符 :: (Linux 默认接受 v4-mapped 连接, 同时覆盖 v4/v6)
+        try:
+            class V6Server(ThreadingHTTPServer):
+                address_family = socket.AF_INET6
+            probe = V6Server(("::", port), Handler)
+            probe.server_close()
+            server_cls = V6Server
+            bind_host = "::"
+        except OSError:
+            bind_host = "0.0.0.0"
     try:
-        srv = ThreadingHTTPServer((host, port), Handler)
+        srv = server_cls((bind_host, port), Handler)
     except OSError as e:
         print(f"启动失败: {e}", file=sys.stderr)
         print(f"端口 {port} 可能已被占用, 换端口: python3 cf_web.py --port 9000", file=sys.stderr)
         return False
     port = srv.server_address[1]
-    local = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    local = "127.0.0.1" if bind_host in ("0.0.0.0", "::", "") else bind_host
     print(f"CF 优选IP 扫描管理台已启动  数据库: {os.path.abspath(args.db)}", flush=True)
     print(f"  本机打开: http://{local}:{port}/", flush=True)
     for ip in lan_ips():
-        print(f"  局域网打开: http://{ip}:{port}/", flush=True)
+        disp = "[%s]" % ip if ":" in ip else ip
+        print(f"  局域网打开: http://{disp}:{port}/", flush=True)
     if not args.no_browser:
         webbrowser.open(f"http://{local}:{port}/")
     try:

@@ -323,6 +323,12 @@ def api_stats(db):
 def api_table(db, q):
     where, params = build_where(q)
     order = build_order(q)
+    order_params = []
+    top_ips = [s.strip() for s in (q.get("top", [""])[0] or "").split(",") if s.strip()]
+    if top_ips:
+        order = ("(CASE " + " ".join(f"WHEN ip=? THEN {i}" for i in range(len(top_ips))) +
+                 " ELSE 10000 END), " + order)
+        order_params = list(top_ips)
     try:
         limit = max(1, min(int(q.get("limit", [""])[0] or 100), 500))
     except ValueError:
@@ -336,7 +342,7 @@ def api_table(db, q):
     sql = (f"SELECT ip, port, colo, loc, latency_ms, bandwidth_mbps, bw_last_mbps, bw_last_at, "
            f"tested_at, ok_count, fail_count, route_as_list, route_class, route_hops "
            f"FROM ips WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?")
-    rows = q_rows(db, sql, params + [limit, offset])
+    rows = q_rows(db, sql, params + order_params + [limit, offset])
     out = []
     for ip, port, colo, loc, lat, bw, bw_last, bw_last_at, tested, okc, failc, rasl, rclass, rhops in rows:
         out.append({"ip": ip, "port": port, "colo": colo or "UNK",
@@ -370,17 +376,38 @@ def api_copy(db, q):
 
 
 def api_optimize(db, q):
-    """手动优选: 从本地库按当前条件抽最优 N 条 (仅查询, 不写入数据库)"""
+    """手动优选: 从本地库抽候选 -> 现场重测(探测+识别+测速) -> 取最优 N 条。
+    重测结果会写入 ips (正常测试记录), 但"优选清单"本身不保存, 仅返回展示。"""
     try:
-        n = max(1, min(int(q.get("count", [""])[0] or 10), 500))
+        n = max(1, min(int(q.get("count", [""])[0] or 10), 200))
     except ValueError:
         n = 10
     where, params = build_where(q)
-    sql = (f"SELECT ip, port, colo, loc, latency_ms, bw_last_mbps, route_class "
-           f"FROM ips WHERE {where} ORDER BY {build_order(q)} LIMIT ?")
-    rows = q_rows(db, sql, params + [n])
+    m = min(max(n * 5, 20), 150)
+    cand_rows = q_rows(db, f"SELECT ip, port FROM ips WHERE {where} "
+                           f"ORDER BY {build_order(q)} LIMIT ?", params + [m])
+    if not cand_rows:
+        return {"rows": [], "live": 0, "cands": 0}
+    flat = load_settings()
+    flat["count"] = "1"
+    flat["bench"] = "1"
+    flat["verify"] = str(m)
+    flat["ipv6"] = "0"
+    for k in ("count", "region", "route", "hasbw", "v6", "sort"):
+        v = (q.get(k, [""])[0] or "").strip()
+        if v:
+            flat[k] = v
+    args = scan_args(flat, db)
+    loop = asyncio.new_event_loop()
+    try:
+        live = loop.run_until_complete(_optimize_live(args, cand_rows, db))
+    finally:
+        loop.close()
+    top = live[:n]
     out = []
-    for ip, port, colo, loc, lat, bw, rclass in rows:
+    for r in top:
+        ip, port, lat, colo, loc, bw = (r["ip"], r["port"], r["latency"],
+                                        r["colo"], r["loc"], r["bandwidth"])
         if colo:
             name = country(colo)
         elif loc:
@@ -389,8 +416,63 @@ def api_optimize(db, q):
             name = "未知"
         out.append({"ip": ip, "port": port, "country": name,
                     "latency": round(lat, 1) if lat is not None else None,
-                    "bandwidth": bw, "route_class": rclass})
-    return {"rows": out}
+                    "bandwidth": bw})
+    if out:
+        ph = ",".join("?" for _ in out)
+        rcmap = {r[0]: r[1] for r in q_rows(
+            db, f"SELECT ip, route_class FROM ips WHERE ip IN ({ph})", [r["ip"] for r in out])}
+        for r in out:
+            r["route_class"] = rcmap.get(r["ip"])
+    return {"rows": out, "live": len(live), "cands": len(cand_rows)}
+
+
+async def _optimize_live(args, cands, db):
+    """现场重测候选: 探测连通 -> 识别地区 -> 实测带宽; 结果写回 ips 并排序返回"""
+    sem = asyncio.Semaphore(min(20, len(cands)))
+
+    async def one(item):
+        ip, port = item
+        async with sem:
+            try:
+                r = await cf_db.probe_ip(ip, [port], args)
+            except Exception:
+                return None
+            if r is None or r[1] is None:
+                return None
+            _, p, lat, _ = r
+            args_ns = types.SimpleNamespace(
+                bench_size=args.bench_size, bench_timeout=args.bench_timeout,
+                bench_parallel=args.bench_parallel, bench_host=args.bench_host)
+            info = None
+            try:
+                info = await cf_db.identify(ip, p, args_ns, latency=lat)
+            except Exception:
+                info = None
+            bw = None
+            if info:
+                try:
+                    bw = await cf_db.bench_bandwidth(ip, p, args_ns)
+                except Exception:
+                    bw = None
+            return {"ip": ip, "port": p, "latency": lat,
+                    "colo": info["colo"] if info else None,
+                    "loc": info["loc"] if info else None, "bandwidth": bw}
+
+    results = await asyncio.gather(*(one(c) for c in cands))
+    conn = cf_db.open_db(db)
+    for r in results:
+        if r is None:
+            continue
+        rec = {"ip": r["ip"], "port": r["port"], "ok": True, "latency": r["latency"],
+               "colo": r["colo"], "loc": r["loc"], "bandwidth": r["bandwidth"],
+               "tested_at": time.time(),
+               "verified_at": time.time() if r["colo"] else None}
+        cf_db.upsert(conn, rec)
+    conn.commit()
+    conn.close()
+    live = [r for r in results if r is not None]
+    live.sort(key=lambda x: (-(x["bandwidth"] or 0), x["latency"]))
+    return live
 
 
 def export_body(db, q, fmt):
@@ -759,6 +841,8 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .chk input{accent-color:var(--acc);width:16px;height:16px}
 #f_premium:checked+label,#f_hasbw:checked+label,#f_v6:checked+label{color:var(--acc2);font-weight:700}
 .optbox{white-space:pre;font-family:ui-monospace,Consolas,monospace;font-size:12px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:8px;max-height:220px;overflow:auto;line-height:1.6;color:var(--txt);user-select:text}
+.pin{color:var(--acc2);font-size:13px;font-weight:700;cursor:pointer;user-select:none}
+.pin:hover{text-decoration:underline}
 .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
 .chart h3{font-size:14px;color:var(--dim);margin-bottom:8px;font-weight:600}
 canvas{width:100%;height:250px}
@@ -935,6 +1019,7 @@ font-family:ui-monospace,Consolas,monospace;font-size:12.5px;padding:10px;margin
     <button class="ghost mini" onclick="copySel()">复制选中IP(<span id="selCount">0</span>)</button>
     <button class="ghost mini" onclick="exportSel()">导出选中</button>
     <button class="ghost mini" onclick="clearSel()">清空选中</button>
+    <span class="pin" id="pinInfo"></span>
     <span style="flex:1"></span>
     <button class="ghost mini" onclick="page(-1)">上一页</button>
     <span id="pageInfo">共 0 条</span>
@@ -952,10 +1037,10 @@ font-family:ui-monospace,Consolas,monospace;font-size:12.5px;padding:10px;margin
     <div class="chk"><input type="checkbox" id="opt_premium"><label for="opt_premium">仅精品</label></div>
     <div class="chk"><input type="checkbox" id="opt_hasbw" checked><label for="opt_hasbw">仅有带宽</label></div>
     <div class="chk"><input type="checkbox" id="opt_v6"><label for="opt_v6">仅IPv6</label></div>
-    <button class="ghost" onclick="runOpt()">优选</button>
+    <button class="ghost" id="optBtn" onclick="runOpt()">优选</button>
     <button class="ghost" onclick="copyOpt()">复制结果</button>
   </div>
-  <div class="optbox" id="optBox">点击「优选」从数据库已优选 IP 中按带宽/延迟抽出最优 N 条, 点击「复制结果」一次性复制</div>
+  <div class="optbox" id="optBox">点击「优选」: 从本地库已优选 IP 中抽候选, 现场重测(连通+识别+测速)后取最优 N 条, 并置顶显示在下方 IP 列表顶部</div>
 </div>
 
 <footer>数据来源: <span id="srcHost">speed.cloudflare.com</span> 实测带宽 &amp; /cdn-cgi/trace 地区识别 &nbsp;|&nbsp; 服务端 v<span id="ver">?</span></footer>
@@ -1032,6 +1117,7 @@ function jumpPage(){
   loadTable();
 }
 let OPT=[];
+let TOP=[];
 function optParams(){
   const p=new URLSearchParams();
   p.set("count",$("opt_count").value||10);
@@ -1042,13 +1128,25 @@ function optParams(){
   return p;
 }
 function runOpt(){
-  const btn=document.querySelector(".card .ghost");
+  const btn=document.querySelector("#optBtn");
+  if(btn){btn.disabled=true;btn.textContent="优选中...";}
+  $("optBox").textContent="正在从本地库抽候选并现场重测(探测+测速)...";
   fetch("/api/optimize?"+optParams()).then(r=>r.json()).then(d=>{
-    if(!d.rows||!d.rows.length){OPT=[];$("optBox").textContent="无符合条件的结果";toast("无符合条件的结果","err");return}
+    if(!d.rows||!d.rows.length){OPT=[];TOP=[];$("optBox").textContent="无符合条件的结果";toast("无符合条件的结果","err");return}
     OPT=d.rows.map(r=>r.ip+":"+r.port+"#"+r.country+(r.route_class==="premium"?"精品":""));
+    TOP=d.rows.map(r=>r.ip);
     $("optBox").textContent=OPT.join("\n");
-    toast("优选完成: "+OPT.length+" 条","ok");
-  }).catch(()=>toast("优选请求失败","err"));
+    toast("优选完成: 候选"+d.cands+"条/存活"+d.live+"条, 置顶"+TOP.length+"条","ok");
+    loadTable();
+  }).catch(e=>toast("优选请求失败: "+e,"err")).finally(()=>{
+    if(btn){btn.disabled=false;btn.textContent="优选";}
+  });
+}
+function clearTop(){
+  TOP=[];OFFSET=0;
+  $("pinInfo").textContent="";
+  loadTable();
+  toast("已取消置顶","ok");
 }
 function copyOpt(){
   if(!OPT.length){toast("请先点「优选」","err");return}
@@ -1237,6 +1335,7 @@ function tableParams(){
   if($("f_v6").checked)p.set("v6","1");
   p.set("sort",SORT);
   p.set("offset",OFFSET);
+  if(TOP.length)p.set("top",TOP.join(","));
   return p;
 }
 
@@ -1254,6 +1353,8 @@ function bwCellHtml(r){
 function renderTable(data){
   const rows=data.rows, tb=$("tbody"); tb.innerHTML="";
   PAGE_TOTAL=data.total;
+  const pinEl=$("pinInfo");
+  if(pinEl)pinEl.innerHTML=TOP.length?("🔝 优选结果已置顶 "+TOP.length+" 条 · <span onclick=\"clearTop()\">取消置顶</span>"):"";
   $("pageInfo").textContent="共 "+data.total+" 条 · 显示 "+(data.offset+1)+"~"+(data.offset+rows.length)+" · 每页 "+data.limit;
   $("pageTotal").textContent=Math.max(1,Math.ceil(data.total/LIMIT));
   $("pageJump").value=Math.floor(data.offset/LIMIT)+1;

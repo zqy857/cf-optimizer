@@ -2064,6 +2064,20 @@ def ensure_cert():
         return None
 
 
+def build_ssl_ctx():
+    cert = ensure_cert()
+    if not cert:
+        return None
+    try:
+        import ssl
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, KEY_FILE)
+        return ctx
+    except Exception as e:
+        print(f"HTTPS 初始化失败, 退回 http: {e}", file=sys.stderr)
+        return None
+
+
 def serve_forever(args, host, port):
     if not os.path.exists(args.db):
         conn = cf_db.open_db(args.db)
@@ -2081,6 +2095,27 @@ def serve_forever(args, host, port):
             bind_host = "::"
         except OSError:
             bind_host = "0.0.0.0"
+    scheme = "http"
+    ssl_ctx = None
+    if SECRET and SECRET.get("https"):
+        ssl_ctx = build_ssl_ctx()
+    if ssl_ctx is not None:
+        class SecureServer(server_cls):
+            def get_request(self):
+                sock, addr = super().get_request()
+                try:
+                    sock.settimeout(5)
+                    s = ssl_ctx.wrap_socket(sock, server_side=True)
+                    s.settimeout(None)
+                except Exception:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                    raise
+                return s, addr
+        server_cls = SecureServer
+        scheme = "https"
     try:
         srv = server_cls((bind_host, port), Handler)
     except OSError as e:
@@ -2089,18 +2124,6 @@ def serve_forever(args, host, port):
         return False
     port = srv.server_address[1]
     local = "127.0.0.1" if bind_host in ("0.0.0.0", "::", "") else bind_host
-    scheme = "http"
-    if SECRET and SECRET.get("https"):
-        cert = ensure_cert()
-        if cert:
-            try:
-                import ssl
-                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-                ctx.load_cert_chain(cert, KEY_FILE)
-                srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
-                scheme = "https"
-            except Exception as e:
-                print(f"HTTPS 启动失败, 退回 http: {e}", file=sys.stderr)
     print(f"CF 优选IP 扫描管理台已启动  数据库: {os.path.abspath(args.db)}", flush=True)
     print(f"  访问: {scheme}://{local}:{port}/   (需登录, 用户名: {SECRET['user'] if SECRET else '无'})", flush=True)
     for ip in lan_ips():

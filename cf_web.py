@@ -926,6 +926,9 @@ footer{margin-top:14px;color:var(--dim);font-size:12px;text-align:center}
 #routeDiag{background:rgba(220,38,38,.12);border:1px solid rgba(220,38,38,.5);color:#fda4af;font-size:12.5px;padding:8px 12px;border-radius:8px;margin:6px 0;line-height:1.6}
 #routeDiag b{color:#fecaca}
 #routeDiag code{background:rgba(0,0,0,.35);padding:1px 6px;border-radius:4px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
+.pin-bar{display:flex;align-items:center;gap:8px;font-size:12.5px;color:#86efac;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.4);padding:7px 12px;border-radius:8px;margin:6px 0}
+.pin-bar b{font-family:ui-monospace,Menlo,Consolas,monospace}
+tr.just-tested{outline:2px solid rgba(34,197,94,.65);outline-offset:-2px;background:rgba(34,197,94,.08)}
 #toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%) translateY(16px);background:rgba(18,26,38,.94);color:#fff;padding:10px 20px;border-radius:8px;font-size:13px;opacity:0;pointer-events:none;transition:opacity .25s ease,transform .25s ease;z-index:999}
 #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 #toast.ok{background:linear-gradient(135deg,#0b3d2e,#14532d);border:1px solid #22c55e}
@@ -1055,6 +1058,7 @@ font-family:ui-monospace,Consolas,monospace;font-size:12.5px;padding:10px;margin
     <button class="ghost" onclick="exportF('csv')">导出 CSV</button>
   </div>
   <div id="tabWrap">
+    <div id="pinBar" class="pin-bar" style="display:none"></div>
     <table>
       <thead><tr>
         <th style="width:26px"><input type="checkbox" id="ckAll" title="全选本页" onclick="togglePageSel(this)"></th>
@@ -1112,6 +1116,7 @@ const $=id=>document.getElementById(id);
 let SORT="bw";
 let OFFSET=0;
 const LIMIT=100;
+let PIN="",PIN_TS=0;
 let PAGE_TOTAL=0;
 const SEL=new Set();
 function openAbout(){const v=$("ver2");if(v)v.textContent=$("ver").textContent||"?";$("aboutMask").classList.add("open");}
@@ -1446,6 +1451,7 @@ function tableParams(){
   if($("f_v6").checked)p.set("v6","1");
   p.set("sort",SORT);
   p.set("offset",OFFSET);
+  if(PIN&&Date.now()-PIN_TS<30000)p.set("top",PIN);
   return p;
 }
 
@@ -1463,6 +1469,11 @@ function bwCellHtml(r){
 function renderTable(data){
   const rows=data.rows, tb=$("tbody"); tb.innerHTML="";
   PAGE_TOTAL=data.total;
+  const pinBar=$("pinBar");
+  if(PIN&&Date.now()-PIN_TS<30000){
+    pinBar.innerHTML='已置顶刚测试的 IP <b>'+esc(PIN)+'</b> <span class="link" onclick="unpin()">✕ 取消置顶</span>';
+    pinBar.style.display="flex";
+  }else{pinBar.style.display="none";}
   $("pageInfo").textContent="共 "+data.total+" 条 · 显示 "+(data.offset+1)+"~"+(data.offset+rows.length)+" · 每页 "+data.limit;
   $("pageTotal").textContent=Math.max(1,Math.ceil(data.total/LIMIT));
   $("pageJump").value=Math.floor(data.offset/LIMIT)+1;
@@ -1493,6 +1504,7 @@ function renderTable(data){
                    :`<button class="mini route" onclick="testIp('route','${r.ip}',${r.port},this)">测线路</button>`;
     const tr=document.createElement("tr");
     if(rcl==="premium")tr.className="route-premium-row";
+    if(r.ip===PIN&&Date.now()-PIN_TS<30000)tr.classList.add("just-tested");
     tr.setAttribute("data-aslist", r.route_as_list||"");
     const ck=SEL.has(r.ip);
     tr.innerHTML=`<td class="ck"><input type="checkbox" class="ck" data-ip="${esc(r.ip)}" ${ck?"checked":""} onchange="rowSelChange(this)"></td>`+
@@ -1507,6 +1519,7 @@ function renderTable(data){
   updateSelUI();
 }
 function sortBy(k){SORT=k;OFFSET=0;loadTable()}
+function unpin(){PIN="";PIN_TS=0;loadTable()}
 function page(d){OFFSET=Math.max(0,OFFSET+d*LIMIT);loadTable()}
 function loadTable(){
   fetch("/api/table?"+tableParams()).then(r=>r.json()).then(data=>renderTable(data));
@@ -1516,6 +1529,7 @@ function testIp(act,ip,port,btn){
   fetch("/api/test",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({action:act,ip:ip,port:port,bench_host:$("bench_host").value})}).then(r=>r.json()).then(r=>{
     if(r.ok){
+      PIN=ip;PIN_TS=Date.now();
       if(act==="route"){
         const err=r.error?(" · 原因: "+r.error):"";
         MANUAL[ip+":"+port+":route"]={text:r.label,title:r.label+(r.route_class==="premium"?" (精品)":"")+err+" [AS: "+(r.as_list||[]).join(",")+"] · 悬停线路列看逐跳详情",ok:true};

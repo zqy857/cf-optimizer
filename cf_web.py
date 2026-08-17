@@ -974,7 +974,7 @@ font-family:ui-monospace,Consolas,monospace;font-size:12.5px;padding:10px;margin
     <div class="f"><label>最大延迟ms<span class="tip">?<span class="pop">延迟超过该值的IP不算"达标", 不会被送去验证和测速</span></span></label><input id="max_latency" type="number" value="2000"></div>
     <div class="chk"><input type="checkbox" id="tls_check" checked><label for="tls_check">TLS二次确认<span class="tip">?<span class="pop">TCP能连后还要TLS握手(SNI=cloudflare.com)成功才算存活, 过滤假IP. 吃CPU但结果更干净</span></span></label></div>
     <div class="chk"><input type="checkbox" id="route_check" checked><label for="route_check">线路分类检测<span class="tip">?<span class="pop">对达标IP做路由线路分类: 只识别去程方向(CN2-GIA/9929/CMIN2为精品, 163/169/9808为普通), 需系统有ping命令</span></span></label></div>
-    <div class="chk"><input type="checkbox" id="ipv6"><label for="ipv6">同时扫描IPv6<span class="tip">?<span class="pop">IPv6 池 = 公开优选 v6 列表(优先测, 命中率高) + CF官方大段(随机发现新地址). 本机需有IPv6网络. 注意: v6 线路分类暂不支持 ASN 判定, 一律显示"未识别", 不参与精品识别</span></span></label></div>
+    <div class="chk"><input type="checkbox" id="ipv6"><label for="ipv6">同时扫描IPv6<span class="tip">?<span class="pop">IPv6 池 = 公开优选 v6 列表(优先测, 命中率高) + CF官方大段(随机发现新地址). 本机需有IPv6网络. IPv6 同样支持线路分类(ASN 判定同 v4), 仅需首次联网下载 ip2asn v6 数据</span></span></label></div>
     <button id="startBtn" onclick="control('start')">开始扫描</button>
     <button id="stopBtn" class="stop" onclick="control('stop')" disabled>停止</button>
     <button class="ghost" onclick="saveSet()">保存设置</button>

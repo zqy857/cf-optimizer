@@ -61,6 +61,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DAT_FILE = os.path.join(BASE_DIR, "ipasn-v4.dat")
 TSV_GZ = os.path.join(BASE_DIR, "ip2asn-v4.tsv.gz")
 IPASN_URL = "https://iptoasn.com/data/ip2asn-v4.tsv.gz"
+TSV_GZ6 = os.path.join(BASE_DIR, "ip2asn-v6.tsv.gz")
+IPASN_URL6 = "https://iptoasn.com/data/ip2asn-v6.tsv.gz"
 
 # ------------------------- AS 基准表 (禁止修改) -------------------------
 PREMIUM_ASN = {4809, 9929, 58807}          # 精品跨境AS (仅3个)
@@ -239,6 +241,12 @@ _ASN_STARTS = array("I")
 _ASN_ENDS = array("I")
 _ASN_VALS = array("I")
 
+_ASN_DB6 = None
+_ASN_LOCK6 = threading.Lock()
+_ASN_STARTS6 = []
+_ASN_ENDS6 = []
+_ASN_VALS6 = []
+
 
 def _download(url, dest):
     req = urllib.request.Request(url, headers={"User-Agent": "cf-optimizer/route-probe"})
@@ -286,27 +294,79 @@ def _load_ranges():
     _ASN_DB = True
 
 
+def _load_ranges6():
+    """从 ip2asn-v6.tsv.gz 加载 IPv6 段->ASN (纯标准库二分查找)。
+    段数较少(约十万级), 直接用列表存 128 位整数。"""
+    global _ASN_DB6
+    if not os.path.exists(TSV_GZ6):
+        _download(IPASN_URL6, TSV_GZ6)
+    starts = []
+    ends = []
+    vals = []
+    with gzip.open(TSV_GZ6, "rt", encoding="utf-8") as fin:
+        for line in fin:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 3:
+                continue
+            try:
+                s = int(ipaddress.IPv6Address(parts[0]))
+                e = int(ipaddress.IPv6Address(parts[1]))
+            except Exception:
+                continue
+            asn = parts[2]
+            if not asn.isdigit():
+                continue
+            av = int(asn)
+            if av <= 0 or av > 0xFFFFFFFF:
+                continue
+            starts.append(s)
+            ends.append(e)
+            vals.append(av)
+    order = sorted(range(len(starts)), key=lambda i: starts[i])
+    _ASN_STARTS6[:] = [starts[i] for i in order]
+    _ASN_ENDS6[:] = [ends[i] for i in order]
+    _ASN_VALS6[:] = [vals[i] for i in order]
+    _ASN_DB6 = True
+
+
 def ensure_db(force=False):
-    """确保离线 ASN 数据库就绪 (缺失则下载 ip2asn tsv.gz 并加载到内存)"""
-    global _ASN_DB
-    if _ASN_DB is not None and not force:
+    """确保离线 ASN 数据库就绪 (v4+v6, 缺失则下载 ip2asn tsv.gz 并加载到内存)。
+    v6 数据下载失败不影响 v4 判定。"""
+    global _ASN_DB, _ASN_DB6
+    done = (_ASN_DB is not None and _ASN_DB6 is not None)
+    if done and not force:
         return _ASN_DB
     with _ASN_LOCK:
-        if _ASN_DB is not None and not force:
+        done = (_ASN_DB is not None and _ASN_DB6 is not None)
+        if done and not force:
             return _ASN_DB
-        _load_ranges()
+        if _ASN_DB is None or force:
+            _load_ranges()
+        if _ASN_DB6 is None or force:
+            try:
+                _load_ranges6()
+            except Exception:
+                sys.stderr.write("route_probe: 加载 IPv6 ASN 数据失败, v6 线路判定降级为未识别(不影响 v4)\n")
+                _ASN_DB6 = False
         return _ASN_DB
 
 
 def lookup_asn(ip, db=None):
-    """IP -> ASN (离线二分查找), 查不到返回 None"""
+    """IP -> ASN (离线二分查找, 按地址族自动选择 v4/v6 库), 查不到返回 None"""
     try:
         if db is None:
             ensure_db()
-        ip_int = int(ipaddress.IPv4Address(ip))
-        n = bisect.bisect_right(_ASN_STARTS, ip_int) - 1
-        if n >= 0 and _ASN_ENDS[n] >= ip_int:
-            return int(_ASN_VALS[n])
+        if ":" in ip:
+            if not _ASN_DB6:
+                return None
+            ip_int = int(ipaddress.IPv6Address(ip))
+            starts, ends, vals = _ASN_STARTS6, _ASN_ENDS6, _ASN_VALS6
+        else:
+            ip_int = int(ipaddress.IPv4Address(ip))
+            starts, ends, vals = _ASN_STARTS, _ASN_ENDS, _ASN_VALS
+        n = bisect.bisect_right(starts, ip_int) - 1
+        if n >= 0 and ends[n] >= ip_int:
+            return int(vals[n])
     except Exception:
         pass
     return None
@@ -332,23 +392,6 @@ def classify_route(ip, max_hops=18, timeout=1.5):
       as_list     探测到的跨境相关 AS 编号列表 (JSON 可序列化)
       hops        逐跳日志 [{n,ip,time,asn,name,target}], 可直接 JSON 序列化存储
     """
-    if ":" in ip:
-        # IPv6 暂不做 ASN 判定(离线库只有 v4 数据), 只记录逐跳; 分类统一 undetected
-        try:
-            log, _timeouts, _reached = probe_hops(ip, max_hops=max_hops, timeout=timeout)
-        except PingProbeError as e:
-            return {"route_class": "undetected", "as_list": [], "hops": [], "error": str(e)}
-        for h in log:
-            if h["ip"] is None:
-                h["asn"] = None
-                h["name"] = "超时(*)"
-            elif _is_private(h["ip"]):
-                h["asn"] = None
-                h["name"] = "内网"
-            else:
-                h["asn"] = None
-                h["name"] = "未知"
-        return {"route_class": "undetected", "as_list": [], "hops": log}
     try:
         log, _timeouts, _reached = probe_hops(ip, max_hops=max_hops, timeout=timeout)
     except PingProbeError as e:

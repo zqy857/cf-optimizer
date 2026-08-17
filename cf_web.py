@@ -340,11 +340,11 @@ def api_table(db, q):
     total_row = q_one(db, f"SELECT COUNT(*) FROM ips WHERE {where}", params)
     total = total_row[0] if total_row else 0
     sql = (f"SELECT ip, port, colo, loc, latency_ms, bandwidth_mbps, bw_last_mbps, bw_last_at, "
-           f"tested_at, ok_count, fail_count, route_as_list, route_class, route_hops "
+           f"tested_at, ok_count, fail_count, route_as_list, route_class, route_hops, route_error "
            f"FROM ips WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?")
     rows = q_rows(db, sql, params + order_params + [limit, offset])
     out = []
-    for ip, port, colo, loc, lat, bw, bw_last, bw_last_at, tested, okc, failc, rasl, rclass, rhops in rows:
+    for ip, port, colo, loc, lat, bw, bw_last, bw_last_at, tested, okc, failc, rasl, rclass, rhops, rerr in rows:
         out.append({"ip": ip, "port": port, "colo": colo or "UNK",
                     "country": country(colo or "UNK"), "loc": loc or "UNK",
                     "latency": round(lat, 1) if lat is not None else None,
@@ -352,7 +352,7 @@ def api_table(db, q):
                     "bw_best": bw if bw is not None else None,
                     "bw_last_at": bw_last_at,
                     "route_class": rclass, "route_as_list": rasl,
-                    "route_hops": rhops,
+                    "route_hops": rhops, "route_error": rerr,
                     "tested": tested, "ok": okc, "fail": failc})
     return {"rows": out, "total": total, "offset": offset, "limit": limit}
 
@@ -671,17 +671,18 @@ def test_ip(db, params):
         else:
             res = route_probe.classify_route(ip)
             route_class, as_list, hops = res["route_class"], res["as_list"], res["hops"]
+            err = res.get("error")
             upsert_test(db, ip, port, route_class=route_class, route_as_list=as_list,
-                        route_hops=hops)
+                        route_hops=hops, route_error=err)
             return {"ok": True, "route_class": route_class,
                     "label": route_probe.get_class_label(route_class),
-                    "as_list": as_list, "hops": hops}
+                    "as_list": as_list, "hops": hops, "error": err}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 
 def upsert_test(db, ip, port, latency=None, bandwidth=None, route_class=None,
-                route_as_list=None, route_hops=None):
+                route_as_list=None, route_hops=None, route_error=None):
     try:
         conn = sqlite3.connect(db)
         rec = {"ip": ip, "port": port, "ok": True,
@@ -690,6 +691,7 @@ def upsert_test(db, ip, port, latency=None, bandwidth=None, route_class=None,
                "route_as_list": json.dumps(route_as_list) if route_as_list else None,
                "route_hops": json.dumps(route_hops, ensure_ascii=False) if route_hops else None,
                "route_at": time.time() if route_class else None,
+               "route_error": route_error,
                "tested_at": time.time()}
         cf_db.upsert(conn, rec)
         conn.commit()
@@ -1469,7 +1471,9 @@ function renderTable(data){
     let hopsData=null;
     if(r.route_hops){try{hopsData=JSON.parse(r.route_hops)}catch(e){}}
     if(hopsData&&hopsData.length)HOPS[hk]=hopsData;else delete HOPS[hk];
-    const routeAttrs=rcl?(' data-cls="'+esc(rcl)+'"'+(hopsData&&hopsData.length?(' data-hk="'+hk+'"'):'')):'';
+    let routeAttrs=rcl?(' data-cls="'+esc(rcl)+'"'):'';
+    if(hopsData&&hopsData.length)routeAttrs+=' data-hk="'+hk+'"';
+    if(r.route_error)routeAttrs+=' title="'+esc(r.route_error)+'"';
     const routeCell=rcl
       ?'<span class="route '+esc(rcl)+'"'+routeAttrs+'>'+esc(RCL[rcl]||rcl)+'</span>'
       :'<span class="route">未检测</span>';
@@ -1506,7 +1510,8 @@ function testIp(act,ip,port,btn){
     body:JSON.stringify({action:act,ip:ip,port:port,bench_host:$("bench_host").value})}).then(r=>r.json()).then(r=>{
     if(r.ok){
       if(act==="route"){
-        MANUAL[ip+":"+port+":route"]={text:r.label,title:r.label+(r.route_class==="premium"?" (精品)":"")+" [AS: "+(r.as_list||[]).join(",")+"] · 悬停线路列看逐跳详情",ok:true};
+        const err=r.error?(" · 原因: "+r.error):"";
+        MANUAL[ip+":"+port+":route"]={text:r.label,title:r.label+(r.route_class==="premium"?" (精品)":"")+err+" [AS: "+(r.as_list||[]).join(",")+"] · 悬停线路列看逐跳详情",ok:true};
         btn.textContent=r.label;btn.title=MANUAL[ip+":"+port+":route"].title;
         btn.classList.add("done");btn.disabled=false;loadTable();
       }else{

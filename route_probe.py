@@ -110,6 +110,15 @@ _SRC_RE = re.compile(r"(?:From|来自|Reply from)\s+(\d{1,3}(?:\.\d{1,3}){3})")
 _SRC_RE6 = re.compile(r"(?:From|来自|Reply from)\s+([0-9a-fA-F:]+)")
 _TIME_RE = re.compile(r"(?:time|時間|时间)[=:]\s*(\d+(?:\.\d+)?)\s*(?:ms|毫秒)")
 _EXPIRED_RE = re.compile(r"超过生存时间|time to live exceeded|TTL expired|已过期|过期")
+_ERR_RE = re.compile(
+    r"(?:无效|未知|无法识别|不能识别|错误)的?选项|invalid option|unknown option|"
+    r"usage:|not found|未找到|找不到|No such file|"
+    r"Operation not permitted|权限不够|不允许的操作|需要 root|requires root|"
+    r"no permission|permission denied|权限不足")
+
+
+class PingProbeError(RuntimeError):
+    """ping 命令本身不可用/参数不支持/权限不足等导致探测失败 (区别于单纯超时)"""
 
 
 def _ping_cmd(ip, ttl, timeout):
@@ -135,6 +144,8 @@ def probe_hops(ip, max_hops=18, timeout=1.5):
                 _ping_cmd(ip, ttl, timeout),
                 capture_output=True, text=True, timeout=timeout + 1)
             return r.stdout + r.stderr
+        except FileNotFoundError:
+            raise PingProbeError("系统缺少 ping 命令")
         except Exception:
             return None
 
@@ -150,6 +161,9 @@ def probe_hops(ip, max_hops=18, timeout=1.5):
             log.append({"n": ttl, "ip": None, "time": None, "target": False})
             timeouts += 1
             continue
+        if _ERR_RE.search(out):
+            msg = re.sub(r"\s+", " ", out.strip())[:200]
+            raise PingProbeError(msg)
         mt = _TIME_RE.search(out)
         tm = float(mt.group(1)) if mt else None
         if tm is not None and not _EXPIRED_RE.search(out):
@@ -273,7 +287,10 @@ def classify_route(ip, max_hops=18, timeout=1.5):
     """
     if ":" in ip:
         # IPv6 暂不做 ASN 判定(离线库只有 v4 数据), 只记录逐跳; 分类统一 undetected
-        log, _timeouts, _reached = probe_hops(ip, max_hops=max_hops, timeout=timeout)
+        try:
+            log, _timeouts, _reached = probe_hops(ip, max_hops=max_hops, timeout=timeout)
+        except PingProbeError as e:
+            return {"route_class": "undetected", "as_list": [], "hops": [], "error": str(e)}
         for h in log:
             if h["ip"] is None:
                 h["asn"] = None
@@ -289,7 +306,10 @@ def classify_route(ip, max_hops=18, timeout=1.5):
         db = ensure_db()
     except Exception:
         return {"route_class": "undetected", "as_list": [], "hops": []}
-    log, _timeouts, _reached = probe_hops(ip, max_hops=max_hops, timeout=timeout)
+    try:
+        log, _timeouts, _reached = probe_hops(ip, max_hops=max_hops, timeout=timeout)
+    except PingProbeError as e:
+        return {"route_class": "undetected", "as_list": [], "hops": [], "error": str(e)}
 
     asns = []
     for h in log:

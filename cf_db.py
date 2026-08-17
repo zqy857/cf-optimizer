@@ -106,7 +106,8 @@ CREATE TABLE IF NOT EXISTS ips(
   route_as_list TEXT,
   route_class TEXT,
   route_hops TEXT,
-  route_at REAL
+  route_at REAL,
+  route_error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ips_score ON ips(latency_ms, verified_at, bandwidth_mbps);
 CREATE INDEX IF NOT EXISTS idx_ips_tested ON ips(tested_at);
@@ -121,6 +122,7 @@ MIGRATIONS = [
     "ALTER TABLE ips ADD COLUMN route_class TEXT",
     "ALTER TABLE ips ADD COLUMN route_hops TEXT",
     "ALTER TABLE ips ADD COLUMN route_at REAL",
+    "ALTER TABLE ips ADD COLUMN route_error TEXT",
     "DROP INDEX IF EXISTS idx_ips_route",
     "ALTER TABLE ips DROP COLUMN route",
     "ALTER TABLE ips DROP COLUMN route_premium",
@@ -220,8 +222,8 @@ def upsert(conn, rec):
         INSERT INTO ips(ip,port,colo,loc,latency_ms,bandwidth_mbps,
                         bw_last_mbps,bw_last_at,
                         tested_at,verified_at,first_seen,ok_count,fail_count,
-                        route_as_list,route_class,route_hops,route_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        route_as_list,route_class,route_hops,route_at,route_error)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(ip) DO UPDATE SET
           port=CASE WHEN excluded.latency_ms IS NOT NULL THEN excluded.port ELSE port END,
           latency_ms=CASE WHEN excluded.latency_ms IS NOT NULL THEN excluded.latency_ms ELSE latency_ms END,
@@ -238,7 +240,8 @@ def upsert(conn, rec):
           route_as_list=CASE WHEN excluded.route_as_list IS NOT NULL THEN excluded.route_as_list ELSE route_as_list END,
           route_class=CASE WHEN excluded.route_class IS NOT NULL THEN excluded.route_class ELSE route_class END,
           route_hops=CASE WHEN excluded.route_hops IS NOT NULL THEN excluded.route_hops ELSE route_hops END,
-          route_at=CASE WHEN excluded.route_at IS NOT NULL THEN excluded.route_at ELSE route_at END
+          route_at=CASE WHEN excluded.route_at IS NOT NULL THEN excluded.route_at ELSE route_at END,
+          route_error=CASE WHEN excluded.route_error IS NOT NULL THEN excluded.route_error ELSE route_error END
         """,
         (
             rec.get("ip"), rec.get("port") or 443,
@@ -250,6 +253,7 @@ def upsert(conn, rec):
             ok, fail,
             rec.get("route_as_list"), rec.get("route_class"),
             rec.get("route_hops"), rec.get("route_at"),
+            rec.get("route_error"),
         ),
     )
 
@@ -731,22 +735,24 @@ async def run_session(nets, known, q, args, stop, nets6=None):
                     bw = await bench_bandwidth(ip, p, args_ns)
                 except Exception:
                     bw = None
-        route_as_list = route_class = route_hops = route_at = None
+        route_as_list = route_class = route_hops = route_at = route_error = None
         if do_route:
             try:
                 res = await asyncio.to_thread(route_probe.classify_route, ip)
                 route_class, as_list, hops = res["route_class"], res["as_list"], res["hops"]
+                route_error = res.get("error")
                 if as_list:
                     route_as_list = json.dumps(as_list)
                 if hops:
                     route_hops = json.dumps(hops, ensure_ascii=False)
                 route_at = time.time()
             except Exception:
-                route_as_list = route_class = route_hops = route_at = None
+                route_as_list = route_class = route_hops = route_at = route_error = None
         rec = {"type": "result", "ip": ip, "port": p, "ok": True,
                "latency": lat, "colo": colo, "loc": loc, "bandwidth": bw,
                "route_as_list": route_as_list, "route_class": route_class,
                "route_hops": route_hops, "route_at": route_at,
+               "route_error": route_error,
                "tested_at": time.time()}
         if verified_at:
             rec["verified_at"] = verified_at

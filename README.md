@@ -60,8 +60,9 @@ python3 cf_db.py --no-tls-check       # 关闭 TLS 二次确认(更快但质量�
 python3 cf_db.py --exploit 0.8        # 更多向优质 C 段倾斜
 python3 cf_db.py --reverify           # 只复核库内现有优质 IP
 python3 cf_db.py --route-check         # 开启线路分类检测(精品/普通/混合, 需要 ping 命令)
-python3 cf_db.py --route-budget 30     # 每轮线路检测的 IP 数上限
+python3 cf_db.py --route-budget 100    # 每轮线路检测的 IP 数上限
 python3 cf_db.py --route-stale-hours 12# 线路重测周期(小时)
+python3 cf_db.py --ipv6                # 同时扫描 IPv6(用公开优选 v6 列表, 需本机有 IPv6)
 python3 cf_db.py --stats              # 查看库统计 / 覆盖率
 python3 cf_db.py --export top.txt     # 导出当前最优 N 条 (--top N, 可加 --region)
 python3 cf_db.py --seed myadd.txt     # 把现有优选名单导入数据库作为种子
@@ -92,9 +93,15 @@ python3 cf_db.py --seed myadd.txt     # 把现有优选名单导入数据库作�
 | `--max-latency` | 2000 | 延迟上限(ms) |
 | `--tls-check` | 1 | TLS 二次确认开关 |
 | `--route-check` | 1 | 线路分类检测开关 |
-| `--route-budget` | 20 | 每轮线路检测的 IP 数上限 |
+| `--route-budget` | 100 | 每轮线路检测的 IP 数上限 |
 | `--route-stale-hours` | 6 | 有带宽 IP 的线路重测周期(小时) |
+| `--ipv6` | 0 | 同时扫描 IPv6 |
 | `--gap` | 10 | 轮间隔(秒) |
+
+## 🌐 关于 IPv6 与精品线路识别
+
+- **IPv4 精品线路**:去程 ASN 判定(CN2-GIA/9929/CMIN2 为精品)。但**精品在 CF 边缘 IP 中占比极低(通常不足 1%)**,需要测大量 IP 才有机会命中,`--route-budget` 越大命中率越高(默认 100)。
+- **IPv6**:用公开「优选 v6 IP 列表」(运营商匹配 + 通用源)采样,命中率远高于官方大段随机采样。但 **IPv6 线路分类暂不支持 ASN 判定(离线库仅 v4 数据),一律显示"未识别",不参与精品识别**。需要本机有 IPv6 网络。
 
 ## 🛠 技术栈
 

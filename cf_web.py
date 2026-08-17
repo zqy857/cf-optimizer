@@ -70,7 +70,7 @@ COLO_COUNTRY = {
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cf_settings.json")
 SETTINGS_KEYS = ["operator", "ports", "count", "concurrency", "verify", "bench",
                  "bench_parallel", "backfill", "recheck", "exploit", "max_latency", "tls_check",
-                 "bench_host", "route_check", "route_budget", "route_stale_hours"]
+                 "bench_host", "route_check", "route_budget", "route_stale_hours", "ipv6"]
 
 
 def load_settings():
@@ -205,6 +205,10 @@ def build_where(q):
     if ipq:
         where.append("ip LIKE ?")
         params.append(f"%{ipq}%")
+    if q.get("v6", [""])[0] in ("1", "true"):
+        where.append("instr(ip, ':') > 0")
+    if q.get("v4", [""])[0] in ("1", "true"):
+        where.append("instr(ip, ':') = 0")
     return " AND ".join(where), params
 
 
@@ -413,8 +417,9 @@ def scan_args(params, db):
         bench_parallel=max(1, int(num("bench_parallel", 6, int))),
         bench_host=str(params.get("bench_host", "")).strip() or cf_db.SPEED_HOST,
         route_check=str(params.get("route_check", "1")) not in ("0", "false", ""),
-        route_budget=max(0, int(num("route_budget", 20, int))),
+        route_budget=max(0, int(num("route_budget", 100, int))),
         route_stale_hours=max(1, num("route_stale_hours", 6)),
+        ipv6=str(params.get("ipv6", "0")) not in ("0", "false", ""),
         cycles=0, gap=max(1, num("gap", 5)), once=False, reverify=0,
     )
 
@@ -428,9 +433,11 @@ def scanner_worker(args):
         conn = cf_db.open_db(args.db)
         known = cf_db.load_known(conn)
         nets, label = cf_db.fetch_networks(args.operator, args.port)
+        nets6 = cf_db.fetch_networks_v6(args.operator or "") if args.ipv6 else []
         set_state(label=label, db=os.path.abspath(args.db),
                   msg=f"已启动: {label} | 抽样{args.count} 并发{args.concurrency} | "
                       f"端口{','.join(map(str, args.ports))} | TLS确认{'开' if args.tls_check else '关'} | "
+                      f"IPv6{'开' if args.ipv6 else '关'} | "
                       f"线路检测{'开' if args.route_check else '关'}({args.route_budget}/轮)")
 
         pend_count = 0
@@ -473,7 +480,7 @@ def scanner_worker(args):
                 set_state(msg=f"错误: {rec.get('msg')}")
 
         async def drive():
-            task = asyncio.create_task(cf_db.run_session(nets, known, q, args, stop))
+            task = asyncio.create_task(cf_db.run_session(nets, known, q, args, stop, nets6=nets6))
             while not task.done():
                 try:
                     rec = q.get_nowait()
@@ -827,12 +834,13 @@ font-family:ui-monospace,Consolas,monospace;font-size:12.5px;padding:10px;margin
     <div class="f"><label>测速域名<span class="tip">?<span class="pop">带宽实测用的测速服务域名. 默认 speed.cloudflare.com(会被限流); 可填自己的CF Worker域名如 myspeedtest.workers.dev, 不受公共限流</span></span></label><input id="bench_host" value="speed.cloudflare.com" style="min-width:220px"></div>
     <div class="f"><label>地区补全/轮<span class="tip">?<span class="pop">对还没有地区信息的旧IP补做识别. 修复历史遗留数据</span></span></label><input id="backfill" type="number" value="300"></div>
     <div class="f"><label>复核/轮<span class="tip">?<span class="pop">对冷却期已过的最旧IP重新探测, 防止IP失效后仍留在列表</span></span></label><input id="recheck" type="number" value="200"></div>
-    <div class="f"><label>线路检测/轮<span class="tip">?<span class="pop">每轮做线路分类的IP上限. 新发现的IP优先测, 已有带宽的IP会在超时后重测, 已测且新鲜的自动跳过不占额度. 每个IP约1-2秒(并行发包)</span></span></label><input id="route_budget" type="number" value="20"></div>
+    <div class="f"><label>线路检测/轮<span class="tip">?<span class="pop">每轮做线路分类的IP上限. 新发现的IP优先测, 已有带宽的IP会在超时后重测, 已测且新鲜的自动跳过不占额度. 精品线路占比极低, 想提高命中率请调大(默认100). 每个IP约1-2秒(并行发包)</span></span></label><input id="route_budget" type="number" value="100"></div>
     <div class="f"><label>线路重测周期(时)<span class="tip">?<span class="pop">已测过线路的IP, 若超过该小时数且本轮IP有带宽数据才重测; 新发现的IP始终测. 避免每轮重复探测消耗资源</span></span></label><input id="route_stale_hours" type="number" value="6"></div>
     <div class="f"><label>优质C段比例<span class="tip">?<span class="pop">抽样时0-1比例的IP从历史优质C段(邻居表现好)里选. 0.6=6成优质邻域+4成随机</span></span></label><input id="exploit" type="number" step="0.1" value="0.6"></div>
     <div class="f"><label>最大延迟ms<span class="tip">?<span class="pop">延迟超过该值的IP不算"达标", 不会被送去验证和测速</span></span></label><input id="max_latency" type="number" value="2000"></div>
     <div class="chk"><input type="checkbox" id="tls_check" checked><label for="tls_check">TLS二次确认<span class="tip">?<span class="pop">TCP能连后还要TLS握手(SNI=cloudflare.com)成功才算存活, 过滤假IP. 吃CPU但结果更干净</span></span></label></div>
     <div class="chk"><input type="checkbox" id="route_check" checked><label for="route_check">线路分类检测<span class="tip">?<span class="pop">对达标IP做路由线路分类: 只识别去程方向(CN2-GIA/9929/CMIN2为精品, 163/169/9808为普通), 需系统有ping命令</span></span></label></div>
+    <div class="chk"><input type="checkbox" id="ipv6"><label for="ipv6">同时扫描IPv6<span class="tip">?<span class="pop">IPv6 用公开「优选 v6 IP 列表」(运营商匹配+通用源)采样, 本机需有IPv6网络. 注意: v6 线路分类暂不支持 ASN 判定, 一律显示"未识别", 不参与精品识别</span></span></label></div>
     <button id="startBtn" onclick="control('start')">开始扫描</button>
     <button id="stopBtn" class="stop" onclick="control('stop')" disabled>停止</button>
     <button class="ghost" onclick="saveSet()">保存设置</button>
@@ -878,6 +886,7 @@ font-family:ui-monospace,Consolas,monospace;font-size:12.5px;padding:10px;margin
     <div class="f"><label>端口</label><input id="f_port" placeholder="全部"></div>
     <div class="chk"><input type="checkbox" id="f_premium"><label for="f_premium">只显示精品互联线路</label></div>
     <div class="chk"><input type="checkbox" id="f_hasbw"><label for="f_hasbw">仅有带宽</label></div>
+    <div class="chk"><input type="checkbox" id="f_v6"><label for="f_v6">仅IPv6</label></div>
     <button class="ghost" onclick="exportF('txt')">导出 ADD.txt</button>
     <button class="ghost" onclick="exportF('csv')">导出 CSV</button>
   </div>
@@ -1136,7 +1145,8 @@ function control(act){
       route_budget:$("route_budget").value,
       route_stale_hours:$("route_stale_hours").value,
       route_check:$("route_check").checked?"1":"0",
-      tls_check:$("tls_check").checked?"1":"0"})}).then(r=>r.json()).then(r=>{
+      tls_check:$("tls_check").checked?"1":"0",
+      ipv6:$("ipv6").checked?"1":"0"})}).then(r=>r.json()).then(r=>{
     $("startBtn").textContent="开始扫描";
     if(!r.ok&&r.error){$("msg").textContent="启动失败: "+r.error}
     else if(act==="start"){$("msg").textContent="启动指令已送达, 扫描开始, 请留意下方状态与日志";}
@@ -1156,6 +1166,7 @@ function tableParams(){
   if($("f_q").value)p.set("q",$("f_q"));
   if($("f_port").value)p.set("port",$("f_port"));
   if($("f_hasbw").checked)p.set("hasbw","1");
+  if($("f_v6").checked)p.set("v6","1");
   p.set("sort",SORT);
   p.set("offset",OFFSET);
   return p;
@@ -1251,7 +1262,8 @@ function saveSet(){
     bench_host:$("bench_host").value,route_budget:$("route_budget").value,
     route_stale_hours:$("route_stale_hours").value,
     route_check:$("route_check").checked?"1":"0",
-    tls_check:$("tls_check").checked?"1":"0"};
+    tls_check:$("tls_check").checked?"1":"0",
+    ipv6:$("ipv6").checked?"1":"0"};
   fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify(body)}).then(r=>r.json()).then(r=>{
     $("msg").textContent=r.ok?"设置已保存到服务器, 下次刷新也会保留":"保存失败: "+r.error;
@@ -1268,6 +1280,7 @@ function loadSet(){
     });
     if(d.tls_check!==undefined)$("tls_check").checked=d.tls_check!=="0";
     if(d.route_check!==undefined)$("route_check").checked=d.route_check!=="0";
+    if(d.ipv6!==undefined)$("ipv6").checked=d.ipv6!=="0"&&d.ipv6!==false;
     $("srcHost").textContent=$("bench_host").value||"speed.cloudflare.com";
   }).catch(e=>{});
 }

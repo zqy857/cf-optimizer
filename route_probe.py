@@ -106,16 +106,18 @@ _PROBE_POOL = ThreadPoolExecutor(max_workers=10, thread_name_prefix="probe")
 
 
 # ------------------------------- ICMP 探测 ------------------------------
-_SRC_RE = re.compile(r"(?:From|来自|Reply from)\s+(\d+\.\d+\.\d+\.\d+)")
+_SRC_RE = re.compile(r"(?:From|来自|Reply from)\s+(\d{1,3}(?:\.\d{1,3}){3})")
+_SRC_RE6 = re.compile(r"(?:From|来自|Reply from)\s+([0-9a-fA-F:]+)")
 _TIME_RE = re.compile(r"(?:time|時間|时间)[=:]\s*(\d+(?:\.\d+)?)\s*(?:ms|毫秒)")
 _EXPIRED_RE = re.compile(r"超过生存时间|time to live exceeded|TTL expired|已过期|过期")
 
 
 def _ping_cmd(ip, ttl, timeout):
-    """TTL=ttl 的单包 ping; Linux 用 -t, Windows 用 -i, 均无需 root"""
+    """TTL=ttl 的单包 ping; Linux 用 -t, Windows 用 -i, 均无需 root; 按地址族选 -4/-6"""
+    family = "-6" if ":" in ip else "-4"
     if sys.platform.startswith("win"):
-        return ["ping", "-4", "-n", "1", "-i", str(ttl), "-w", str(int(timeout * 1000)), ip]
-    return ["ping", "-4", "-n", "-c", "1", "-t", str(ttl), "-W", str(int(timeout)), ip]
+        return ["ping", family, "-n", "1", "-i", str(ttl), "-w", str(int(timeout * 1000)), ip]
+    return ["ping", family, "-n", "-c", "1", "-t", str(ttl), "-W", str(int(timeout)), ip]
 
 
 def probe_hops(ip, max_hops=18, timeout=1.5):
@@ -136,6 +138,7 @@ def probe_hops(ip, max_hops=18, timeout=1.5):
         except Exception:
             return None
 
+    srcre = _SRC_RE6 if ":" in ip else _SRC_RE
     outs = list(_PROBE_POOL.map(_run, range(1, max_hops + 1)))
     log = []
     timeouts = 0
@@ -153,7 +156,7 @@ def probe_hops(ip, max_hops=18, timeout=1.5):
             reached = True
             log.append({"n": ttl, "ip": ip, "time": round(tm, 1), "target": True})
             break
-        m = _SRC_RE.search(out)
+        m = srcre.search(out)
         if m:
             src = m.group(1)
             if src == ip:
@@ -268,6 +271,20 @@ def classify_route(ip, max_hops=18, timeout=1.5):
       as_list     探测到的跨境相关 AS 编号列表 (JSON 可序列化)
       hops        逐跳日志 [{n,ip,time,asn,name,target}], 可直接 JSON 序列化存储
     """
+    if ":" in ip:
+        # IPv6 暂不做 ASN 判定(离线库只有 v4 数据), 只记录逐跳; 分类统一 undetected
+        log, _timeouts, _reached = probe_hops(ip, max_hops=max_hops, timeout=timeout)
+        for h in log:
+            if h["ip"] is None:
+                h["asn"] = None
+                h["name"] = "超时(*)"
+            elif _is_private(h["ip"]):
+                h["asn"] = None
+                h["name"] = "内网"
+            else:
+                h["asn"] = None
+                h["name"] = "未知"
+        return {"route_class": "undetected", "as_list": [], "hops": log}
     try:
         db = ensure_db()
     except Exception:

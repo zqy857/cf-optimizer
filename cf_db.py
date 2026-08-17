@@ -40,6 +40,7 @@ import json
 import os
 import queue
 import random
+import re
 import socket
 import sqlite3
 import ssl
@@ -61,6 +62,19 @@ FALLBACK_RANGES = [
     "190.93.240.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
     "131.0.72.0/22", "108.162.192.0/18", "103.28.248.0/22", "192.0.77.0/24",
 ]
+OFFICIAL_V6_URL = "https://www.cloudflare.com/ips-v6"
+FALLBACK_RANGES_V6 = [
+    "2606:4700::/32", "2606:4700:3000::/48", "2606:4700:3100::/48",
+    "2400:cb00::/32", "2803:f800::/32",
+]
+# IPv6 地址池: 优先用公开「优选 v6 IP 列表」(命中率高, 体积小), 运营商列表+通用列表合并;
+# 都拉不到才回退 CF 官方 /32 大段随机采样
+V6_CURATED_URLS = {
+    "cmcc": "https://addressesapi.090227.xyz/cmcc-ipv6",
+    "ct": "https://addressesapi.090227.xyz/ct-ipv6",
+    "cu": "https://addressesapi.090227.xyz/cu-ipv6",
+}
+V6_CURATED_GENERAL = "https://raw.githubusercontent.com/joname1/BestCFip/refs/heads/main/ipv6.txt"
 OPERATOR_URLS = {
     "cf": "https://raw.githubusercontent.com/cmliu/cmliu/main/CF-CIDR.txt",
     "ct": "https://raw.githubusercontent.com/cmliu/cmliu/main/CF-CIDR/ct.txt",
@@ -274,13 +288,73 @@ def fetch_networks(operator, port):
     return nets, label
 
 
+def fetch_networks_v6(operator=""):
+    """IPv6 地址池。
+
+    优先用公开「优选 v6 IP 列表」(运营商匹配 + 通用源合并, 均为已优选好的具体IP,
+    命中率高), 全部失败才回退 CF 官方 /32 大段随机采样(命中率极低)。
+    返回 ip_network 列表: 优选列表条目是 /128 主机, 回退是大段。
+    """
+    def _parse(raw):
+        out = []
+        for line in raw.decode("utf-8", "replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("["):
+                ip = line.split("]", 1)[0].lstrip("[")
+            else:
+                ip = line.split("#", 1)[0].split()[0]
+            try:
+                a = ipaddress.ip_address(ip)
+            except ValueError:
+                continue
+            if a.version == 6:
+                out.append(str(a))
+        return out
+
+    seeds = []
+    urls = []
+    if operator in V6_CURATED_URLS:
+        urls.append(V6_CURATED_URLS[operator])
+    urls.append(V6_CURATED_GENERAL)
+    for u in urls:
+        try:
+            raw = asyncio.run(fetch(urllib.parse.urlparse(u)))
+            seeds.extend(_parse(raw))
+        except Exception:
+            continue
+    seeds = list(dict.fromkeys(seeds))
+    if seeds:
+        return [ipaddress.ip_network(s, strict=False) for s in seeds]
+    nets = []
+    try:
+        raw = asyncio.run(fetch(urllib.parse.urlparse(OFFICIAL_V6_URL)))
+        for l in raw.decode().splitlines():
+            l = l.strip()
+            if "/" in l:
+                try:
+                    nets.append(ipaddress.ip_network(l, strict=False))
+                except ValueError:
+                    continue
+    except Exception:
+        pass
+    if not nets:
+        for r in FALLBACK_RANGES_V6:
+            try:
+                nets.append(ipaddress.ip_network(r))
+            except ValueError:
+                continue
+    return nets
+
+
 def net_total(nets):
-    return sum(1 << (32 - n.prefixlen) for n in nets)
+    return sum(1 << (n.max_prefixlen - n.prefixlen) for n in nets)
 
 
 def random_ip_in_net(net):
     base = int(net.network_address)
-    size = 1 << (32 - net.prefixlen)
+    size = 1 << (net.max_prefixlen - net.prefixlen)
     return ipaddress.ip_address(base + random.randrange(size))
 
 
@@ -292,7 +366,8 @@ def fetch_hot24(path, limit=200, raw=False):
     try:
         conn = sqlite3.connect(path)
         q = (f"SELECT {N24_SQL} AS n, SUM(ok_count) g, SUM(fail_count) f, COUNT(*) c "
-             f"FROM ips GROUP BY n ORDER BY (SUM(ok_count)-SUM(fail_count)) DESC, g DESC LIMIT ?")
+             f"FROM ips WHERE instr(ip, ':')=0 GROUP BY n "
+             f"ORDER BY (SUM(ok_count)-SUM(fail_count)) DESC, g DESC LIMIT ?")
         rows = conn.execute(q, (limit,)).fetchall()
         conn.close()
     except Exception:
@@ -397,6 +472,40 @@ def discover(nets, hot24, count, ports, known, cooldown, exploit_frac):
         known[ip] = now
         cands.append((ip, tuple(ports)))
 
+    return cands
+
+
+def discover_v6(nets6, count, ports, known, cooldown):
+    """IPv6 候选抽样: 官方 /32 等大段随机采样 (邻域加权只适用于 v4 /24)"""
+    now = time.time()
+
+    def eligible(ip):
+        t = known.get(ip)
+        return t is None or (now - t) >= cooldown
+
+    cands = []
+    exhausted = set()
+    for _ in range(count):
+        if not nets6:
+            break
+        net = random.choice(nets6)
+        if net in exhausted:
+            continue
+        max_tries = min(count * 8, 1 << (net.max_prefixlen - net.prefixlen))
+        got = None
+        for _ in range(max_tries):
+            ip = str(random_ip_in_net(net))
+            if ip in known:
+                continue
+            if not eligible(ip):
+                continue
+            got = ip
+            break
+        if got is None:
+            exhausted.add(net)
+            continue
+        known[got] = now
+        cands.append((got, tuple(ports)))
     return cands
 
 
@@ -558,7 +667,7 @@ async def bench_bandwidth(ip, port, args, parallel=4):
     return round(mbps, 2)
 
 
-async def run_session(nets, known, q, args, stop):
+async def run_session(nets, known, q, args, stop, nets6=None):
     sem = asyncio.Semaphore(args.concurrency)
     max_lat = args.max_latency
     ports = list(args.ports)
@@ -674,6 +783,8 @@ async def run_session(nets, known, q, args, stop):
     async def discovery_cycle():
         hot24 = fetch_hot24(args.db) if args.exploit > 0 else []
         cands = discover(nets, hot24, args.count, ports, known, args.cooldown, args.exploit)
+        if nets6:
+            cands.extend(discover_v6(nets6, args.count, ports, known, args.cooldown))
         backfill_ips = set()
         if args.recheck and not args.once:
             for ip, p in fetch_recheck(args.db, args.recheck, args.cooldown):
@@ -878,6 +989,8 @@ def main():
     ap.add_argument("--db", default="cf_ips.db", help="SQLite 数据库路径(默认 cf_ips.db)")
     ap.add_argument("--operator", choices=["cf", "ct", "cu", "cmcc"], default=None,
                     help="地址源: 官方/电信(ct)/联通(cu)/移动(cmcc)")
+    ap.add_argument("--ipv6", action="store_true", default=False,
+                    help="同时采样 CF 官方 IPv6 地址池(需本机有IPv6网络)")
     ap.add_argument("--count", type=int, default=5000, help="每轮发现抽样数(默认 5000)")
     ap.add_argument("--verify", type=int, default=30, help="每轮验证地区预算(默认30)")
     ap.add_argument("--bench", type=int, default=40, help="每轮带宽测试预算(默认40)")
@@ -903,8 +1016,8 @@ def main():
                     help="对验证通过的IP做路由线路分类(ping TTL traceroute, 默认开)")
     ap.add_argument("--no-route-check", dest="route_check", action="store_false",
                     help="关闭路由线路分类检测")
-    ap.add_argument("--route-budget", type=int, default=20,
-                    help="每轮做线路检测的IP上限(默认20; 0=关闭; 新发现优先, 已测且新鲜的不占额度)")
+    ap.add_argument("--route-budget", type=int, default=100,
+                    help="每轮做线路检测的IP上限(默认100; 0=关闭; 新发现优先, 已测且新鲜的不占额度)")
     ap.add_argument("--route-stale-hours", type=float, default=6, dest="route_stale_hours",
                     help="已测线路的IP超过该小时数且本轮有带宽数据才重测(默认6), 避免重复探测")
     ap.add_argument("--bench-size", type=int, default=50_000_000)
@@ -949,6 +1062,7 @@ def main():
     conn = open_db(args.db)
     known = load_known(conn)
     nets, label = fetch_networks(args.operator, args.port)
+    nets6 = fetch_networks_v6(args.operator or "") if args.ipv6 else []
     q = queue.Queue()
     stop = threading.Event()
 
@@ -967,7 +1081,7 @@ def main():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(run_session(nets, known, q, args, stop))
+            loop.run_until_complete(run_session(nets, known, q, args, stop, nets6=nets6))
         except Exception as e:
             q.put({"type": "error", "msg": str(e)})
         finally:
@@ -986,6 +1100,7 @@ def main():
     else:
         print(f"地址源: {label} | 每轮抽样 {args.count} | 验证 {args.verify} | 测带宽 {args.bench} | "
               f"端口 {','.join(map(str, args.ports))} | TLS确认 {'开' if args.tls_check else '关'} | "
+              f"IPv6 {'开' if args.ipv6 else '关'} | "
               f"优质邻域 {int(args.exploit*100)}% | 复测冷却 {args.cooldown:.0f}s", flush=True)
     print("Ctrl+C 安全退出(数据已实时落库), 重跑命令即可续扫", flush=True)
     try:

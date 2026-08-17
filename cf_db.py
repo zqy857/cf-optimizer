@@ -556,12 +556,15 @@ async def tls_probe(ip, port, timeout):
     return elapsed
 
 
-async def probe_ip(ip, ports, args):
+async def probe_ip(ip, ports, args, do_tls=None):
+    """探测一个IP: TCP可达则(可选)TLS确认. do_tls=None 时按 args.tls_check 决定."""
+    if do_tls is None:
+        do_tls = args.tls_check
     for p in ports:
         tcp = await tcp_latency(ip, p, args.ping_timeout)
         if tcp is None:
             continue
-        if args.tls_check:
+        if do_tls:
             tls = await tls_probe(ip, p, min(args.ping_timeout * 2, 4.0))
             if tls is None:
                 continue
@@ -687,10 +690,12 @@ async def run_session(nets, known, q, args, stop, nets6=None):
     max_lat = args.max_latency
     ports = list(args.ports)
     now = time.time()
+    verified = set()
 
     async def probe(ip, ports_seq):
         async with sem:
-            return await probe_ip(ip, ports_seq, args)
+            do_tls = bool(args.tls_check) and ip not in verified
+            return await probe_ip(ip, ports_seq, args, do_tls=do_tls)
 
     async def run_tasks(coros):
         """并发运行协程集合; 保持结果顺序; 每0.3s检查stop, 停止则取消剩余快速退出"""
@@ -798,6 +803,13 @@ async def run_session(nets, known, q, args, stop, nets6=None):
         await run_tasks([v(ip, p, lat, i) for i, (ip, p, lat) in enumerate(pend)])
 
     async def discovery_cycle():
+        nonlocal verified
+        try:
+            conn_v = sqlite3.connect(args.db)
+            verified = {r[0] for r in conn_v.execute("SELECT ip FROM ips WHERE ok_count>0")}
+            conn_v.close()
+        except Exception:
+            verified = set()
         hot24 = fetch_hot24(args.db) if args.exploit > 0 else []
         cands = discover(nets, hot24, args.count, ports, known, args.cooldown, args.exploit)
         if nets6:

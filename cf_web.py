@@ -492,7 +492,8 @@ def export_body(db, q, fmt):
         return "\n".join(lines) + "\n", "text/csv", "cf_optimizer.csv"
     lines = []
     for i, (ip, p, c, l, lat, bw, rclass) in enumerate(rows, 1):
-        lines.append(f"{ip}:{p}#{c or 'UNK'}-{l or 'UNK'}-{i}")
+        host = "[%s]:%s" % (ip, p) if ":" in ip else "%s:%s" % (ip, p)
+        lines.append(f"{host}#{c or 'UNK'}-{l or 'UNK'}-{i}")
     return "\n".join(lines) + "\n", "text/plain; charset=utf-8", "ADD.txt"
 
 
@@ -1125,6 +1126,7 @@ function rowSelChange(c){
   if(c.checked)SEL.add(c.dataset.ip);else SEL.delete(c.dataset.ip);
   updateSelUI();
 }
+function ep(ip,port){return (ip&&ip.indexOf(":")>=0?"["+ip+"]":ip)+":"+port;}
 function copyText(txt){
   if(navigator.clipboard&&window.isSecureContext)return navigator.clipboard.writeText(txt).then(()=>true);
   return new Promise(res=>{
@@ -1146,7 +1148,7 @@ function copySel(){
   if(!ips.length){toast("未选中任何IP","err");return}
   fetch("/api/copy?ips="+encodeURIComponent(ips.join(","))).then(r=>r.json()).then(d=>{
     if(!d.rows||!d.rows.length){toast("所选IP在数据库中无记录","err");return}
-    const lines=d.rows.map(r=>r.ip+":"+r.port+"#"+r.country+(r.route_class==="premium"?"精品":""));
+    const lines=d.rows.map(r=>ep(r.ip,r.port)+"#"+r.country+(r.route_class==="premium"?"精品":""));
     copyText(lines.join("\n")).then(ok=>{
       if(ok)toast("复制成功: "+lines.length+" 条","ok");
       else toast("复制失败, 请手动复制","err");
@@ -1158,7 +1160,7 @@ function exportSel(){
   if(!ips.length){toast("未选中任何IP","err");return}
   fetch("/api/copy?ips="+encodeURIComponent(ips.join(","))).then(r=>r.json()).then(d=>{
     if(!d.rows||!d.rows.length){toast("所选IP在数据库中无记录","err");return}
-    const lines=d.rows.map(r=>r.ip+":"+r.port+"#"+r.country+(r.route_class==="premium"?"精品":""));
+    const lines=d.rows.map(r=>ep(r.ip,r.port)+"#"+r.country+(r.route_class==="premium"?"精品":""));
     const a=document.createElement("a");
     a.href=URL.createObjectURL(new Blob([lines.join("\n")+"\n"],{type:"text/plain;charset=utf-8"}));
     a.download="selected.txt";
@@ -1188,7 +1190,7 @@ function optParams(){
   if($("opt_v6").checked)p.set("v6","1");
   return p;
 }
-function optLine(r){return r.ip+":"+r.port+"#"+r.country+(r.route_class==="premium"?"精品":"");}
+function optLine(r){return ep(r.ip,r.port)+"#"+r.country+(r.route_class==="premium"?"精品":"");}
 function optSelUI(){
   const c=$("optSelCount");if(c)c.textContent=OSEL.size;
   const all=$("optCkAll");

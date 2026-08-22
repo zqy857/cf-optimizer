@@ -149,6 +149,7 @@ python3 cf_db.py --seed myadd.txt     # 把现有优选名单导入数据库作�
 | `--seed` | 无 | 把名单文件导入数据库作为种子 |
 | `--top` | 10 | `--export` 时导出的条数 |
 | `--region` | 无 | `--export` 时按机房/地区过滤 |
+| `--max-ips` | 0 | 库内IP上限, 每轮结束超出部分按质量评分剔除(精品/带宽/延迟优先保留), 死IP入墓碑静默7天免重测, 0=不限制 |
 
 ## 🌐 关于 IPv6 与精品线路识别
 
@@ -162,6 +163,19 @@ python3 cf_db.py --seed myadd.txt     # 把现有优选名单导入数据库作�
   sysctl -w net.ipv4.ping_group_range="0 2147483647"   # 放开无特权 ICMP 组范围
   ```
 - **BusyBox ping 不支持 `-t`**:精简系统的 ping 可能没有 TTL 参数,此时会提示 `invalid option -- t`,请换装完整版 `iputils-ping`。
+- **线路检测极速模式与权限**:所有平台优先使用**原生 ICMP 套接字并行探测**(IPv4/IPv6 均 1~3 秒/个),需要特权:**Windows 管理员 / Linux root**。无权限时自动回退系统命令——Windows 的 IPv6 退到 tracert(约15秒/个,且 Windows ping 无法判定 v6),其余退到并行 ping(同样较快)。启动日志会提示当前模式。提权任选其一:
+  ```bash
+  # Linux/NAS 方式一: sudo 直接运行
+  sudo python3 cf_web.py --db cf_ips.db --daemon --no-browser
+
+  # Linux/NAS 方式二(推荐): 给 Python 加原始套接字能力, 之后免 root 常驻
+  sudo setcap cap_net_raw+ep $(which python3)
+
+  # Windows: 开始菜单搜 PowerShell -> 右键「以管理员身份运行」-> cd 到程序目录启动
+  # 或计划任务 SYSTEM 常驻:
+  schtasks /Create /TN "cf-optimizer" /SC ONSTART /RU SYSTEM ^
+    /TR "python D:\你的程序目录\cf_web.py --db cf_ips.db --daemon --no-browser"
+  ```
 
 ## 🛠 技术栈
 

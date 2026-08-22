@@ -54,8 +54,13 @@ import sys
 import threading
 import urllib.request
 import bisect
+import socket
+import struct
+import time
 from array import array
 from concurrent.futures import ThreadPoolExecutor
+
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DAT_FILE = os.path.join(BASE_DIR, "ipasn-v4.dat")
@@ -133,6 +138,232 @@ def _ping_cmd(ip, ttl, timeout):
     return ["ping", family, "-n", "-c", "1", "-t", str(ttl), "-W", str(int(timeout)), ip]
 
 
+def _win_ip_token(tok):
+    if ":" in tok:
+        parts = tok.split(":")
+        return all(p == "" or all(c in "0123456789abcdefABCDEF" for c in p)
+                   for p in parts)
+    return bool(re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", tok))
+
+
+def _probe_hops_windows(ip, max_hops=18, timeout=1.5):
+    """Windows 下改用 tracert 拿全部逐跳。
+
+    原因: Windows ping 对 IPv6 的 TTL 超时回复只显示"TTL 传输超时",
+    不回显跳点地址, 导致解析不到任何一跳, 全部误判为超时。
+    """
+    w_ms = int(max(0.4, min(timeout, 0.5)) * 1000)
+    cmd = ["tracert", "-6", "-d", "-w", str(w_ms), "-h", str(max_hops), ip]
+    try:
+        r = subprocess.run(cmd, capture_output=True,
+                           timeout=w_ms * max_hops * 3 // 1000 + 20,
+                           creationflags=_NO_WINDOW)
+    except FileNotFoundError:
+        raise PingProbeError("系统缺少 tracert 命令")
+    except Exception as e:
+        raise PingProbeError("tracert 执行失败: %s" % e)
+    out = (r.stdout + r.stderr).decode("gbk", errors="replace")
+    log, timeouts, reached = [], 0, False
+    for line in out.splitlines():
+        m = re.match(r"\s*(\d{1,3})\s+(\S.*)$", line)
+        if not m:
+            continue
+        n = int(m.group(1))
+        if reached or n == 0:
+            continue
+        body = m.group(2).split()
+        hop_ip = next((t for t in reversed(body) if _win_ip_token(t)), None)
+        tm = re.search(r"(\d+)\s*ms", line)
+        time_ms = round(float(tm.group(1)), 1) if tm else None
+        if hop_ip is None:
+            timeouts += 1
+            log.append({"n": n, "ip": None, "time": None, "target": False})
+            continue
+        target = (hop_ip == ip)
+        log.append({"n": n, "ip": hop_ip, "time": time_ms, "target": target})
+        if target:
+            reached = True
+    return log, timeouts, reached
+
+
+class _RawUnavailable(Exception):
+    """原生 ICMP 套接字不可用(权限不足等), 需回退系统命令"""
+
+
+_RAW_STATE = {}
+
+
+def _raw_available(family):
+    """缓存原始套接字可用性 (Win 需管理员, Linux 需 root/cap_net_raw)"""
+    st = _RAW_STATE.get(family)
+    if st is None:
+        af = socket.AF_INET6 if family == 6 else socket.AF_INET
+        proto = socket.IPPROTO_ICMPV6 if family == 6 else socket.IPPROTO_ICMP
+        try:
+            socket.socket(af, socket.SOCK_RAW, proto).close()
+            st = True
+        except OSError:
+            st = False
+        _RAW_STATE[family] = st
+    return st
+
+
+def _raw6_available():
+    return _raw_available(6)
+
+
+def _icmp_cksum(data):
+    if len(data) % 2:
+        data += b"\x00"
+    total = 0
+    for i in range(0, len(data), 2):
+        total += (data[i] << 8) | data[i + 1]
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return struct.pack("!H", (~total) & 0xFFFF)
+
+
+_PROBE_PAYLOAD = b"cfopt"
+
+
+def _build_echo(fam, src_packed, dst_packed, ident, seq):
+    hdr = struct.pack("!BBHHH", 128 if fam == 6 else 8, 0, 0, ident, seq) \
+        + _PROBE_PAYLOAD
+    ck = _icmp6_cksum(src_packed, dst_packed, hdr) if fam == 6 \
+        else _icmp_cksum(hdr)
+    return hdr[:2] + ck + hdr[4:]
+
+
+def _techo_seq(fam, icmp, dst_packed, ident):
+    """校验 Time Exceeded 内嵌的原始 Echo, 匹配返回其 seq 否则 None"""
+    if fam == 6:
+        if len(icmp) < 56 or icmp[48] != 128 or icmp[32:48] != dst_packed:
+            return None
+        rid, rseq = struct.unpack("!HH", icmp[52:56])
+        return rseq if rid == ident else None
+    if len(icmp) < 36:
+        return None
+    base = 8  # TE 固定头(8字节)之后才是内嵌的原始 IP 头
+    ihl2 = (icmp[base] & 0x0F) * 4
+    if len(icmp) < base + ihl2 + 8 or icmp[base + ihl2] != 8:
+        return None
+    if icmp[base + 9] != 1 or icmp[base + 16:base + 20] != dst_packed:
+        return None
+    rid, rseq = struct.unpack("!HH",
+                              icmp[base + ihl2 + 4:base + ihl2 + 8])
+    return rseq if rid == ident else None
+
+
+def _icmp6_cksum(src_packed, dst_packed, data):
+    buf = src_packed + dst_packed + len(data).to_bytes(4, "big") \
+        + b"\x00\x00\x00\x3a" + data
+    if len(buf) % 2:
+        buf += b"\x00"
+    total = 0
+    for i in range(0, len(buf), 2):
+        total += (buf[i] << 8) | buf[i + 1]
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return struct.pack("!H", (~total) & 0xFFFF)
+
+
+def _probe_hops_raw(ip, max_hops=18, timeout=1.5):
+    """原生 ICMP 并行 traceroute (IPv4/IPv6 通用, 需管理员/root 权限)。
+
+    以递增 hop limit/TTL 并行发全部 Echo Request, 原始套接字收
+    Time Exceeded 取中间跳地址, Echo Reply 判定到达目标。
+    """
+    fam = 6 if ":" in ip else 4
+    if fam == 6 and not hasattr(socket, "IPV6_UNICAST_HOPS"):
+        raise _RawUnavailable("缺少 IPV6_UNICAST_HOPS 支持")
+    af = socket.AF_INET6 if fam == 6 else socket.AF_INET
+    proto = socket.IPPROTO_ICMPV6 if fam == 6 else socket.IPPROTO_ICMP
+    rep_t, te_t = (129, 3) if fam == 6 else (0, 11)
+    try:
+        s = socket.socket(af, socket.SOCK_RAW, proto)
+    except OSError as e:
+        raise _RawUnavailable(str(e))
+    with s:
+        u = socket.socket(af, socket.SOCK_DGRAM)
+        try:
+            u.connect((ip, 0))
+            src_packed = socket.inet_pton(af, u.getsockname()[0].split("%")[0])
+        finally:
+            u.close()
+        dst_packed = socket.inet_pton(af, ip)
+        ident = ((os.getpid() ^ threading.get_ident()) & 0xFFFF) or 1
+        t0 = time.time()
+        hard_dl = t0 + timeout * 1.5 + 0.05 * max_hops
+        dl = hard_dl
+        results = {}
+        reached_seq = None
+        for ttl in range(1, max_hops + 1):
+            pkt = _build_echo(fam, src_packed, dst_packed, ident, ttl)
+            if fam == 6:
+                s.setsockopt(socket.IPPROTO_IPV6,
+                             socket.IPV6_UNICAST_HOPS, ttl)
+            else:
+                s.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, ttl)
+            s.sendto(pkt, (ip, 0))
+        while time.time() < dl:
+            s.settimeout(max(0.01, min(dl - time.time(), 0.4)))
+            try:
+                data, addr = s.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            rtt = round((time.time() - t0) * 1000, 1)
+            if fam == 6:
+                if len(data) < 8:
+                    continue
+                typ, code, icmp = data[0], data[1], data
+                hop_ip = addr[0].split("%")[0]
+            else:
+                if len(data) < 21:
+                    continue
+                ihl = (data[0] & 0x0F) * 4
+                if len(data) < ihl + 8:
+                    continue
+                typ, code, icmp = data[ihl], data[ihl + 1], data[ihl:]
+                hop_ip = socket.inet_ntoa(data[12:16])
+            if typ == rep_t and len(icmp) >= 8:
+                if hop_ip != ip:  # Echo Reply 只可能来自目标本身, 过滤噪声
+                    continue
+                rid, rseq = struct.unpack("!HH", icmp[4:8])
+                if rid != ident:
+                    continue
+                results[rseq] = {"ip": hop_ip, "time": rtt, "target": True}
+                if reached_seq is None or rseq < reached_seq:
+                    reached_seq = rseq
+                    results = {k: v for k, v in results.items()
+                               if k <= reached_seq}
+                    dl = min(hard_dl, time.time() + 0.7)  # 收尾宽限
+            elif typ == te_t and code == 0 and \
+                    len(icmp) >= (56 if fam == 6 else 29):
+                rseq = _techo_seq(fam, icmp, dst_packed, ident)
+                if rseq is not None:
+                    results.setdefault(rseq, {"ip": hop_ip, "time": rtt,
+                                              "target": False})
+        limit = reached_seq or max_hops
+        log, timeouts, hit = [], 0, False
+        for n in range(1, limit + 1):
+            r = results.get(n)
+            if r is None:
+                timeouts += 1
+                log.append({"n": n, "ip": None, "time": None, "target": False})
+                continue
+            log.append({"n": n, "ip": r["ip"], "time": r["time"],
+                        "target": r["target"]})
+            if r["target"]:
+                hit = True
+                break
+        if not any(h["ip"] for h in log):
+            raise _RawUnavailable(
+                "原始套接字无任何回包(防火墙拦截或权限变化), 回退系统命令")
+        return log, timeouts, hit
+
+
 def probe_hops(ip, max_hops=18, timeout=1.5):
     """TTL 递增轻量 traceroute (各TTL并行发包, 资源有上限)。
 
@@ -142,11 +373,20 @@ def probe_hops(ip, max_hops=18, timeout=1.5):
       timeouts 无响应(相当于 *) 的跳数
       reached  是否收到目标回包
     """
+    if _raw_available(6 if ":" in ip else 4):
+        try:
+            return _probe_hops_raw(ip, max_hops=max_hops, timeout=timeout)
+        except _RawUnavailable:
+            pass
+    if sys.platform.startswith("win") and ":" in ip:
+        return _probe_hops_windows(ip, max_hops=max_hops, timeout=timeout)
+
     def _run(ttl):
         try:
             r = subprocess.run(
                 _ping_cmd(ip, ttl, timeout),
-                capture_output=True, text=True, timeout=timeout + 1)
+                capture_output=True, text=True, timeout=timeout + 1,
+                creationflags=_NO_WINDOW)
             return r.stdout + r.stderr
         except FileNotFoundError:
             raise PingProbeError("系统缺少 ping 命令")
@@ -207,7 +447,8 @@ def check_route_capability():
         return _ROUTE_DIAG
     try:
         r = subprocess.run(_ping_cmd("1.1.1.1", 1, 1),
-                           capture_output=True, text=True, timeout=4)
+                           capture_output=True, text=True, timeout=4,
+                           creationflags=_NO_WINDOW)
         out = r.stdout + r.stderr
     except FileNotFoundError:
         _ROUTE_DIAG = {"ok": False,

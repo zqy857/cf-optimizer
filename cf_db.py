@@ -111,6 +111,11 @@ CREATE TABLE IF NOT EXISTS ips(
 );
 CREATE INDEX IF NOT EXISTS idx_ips_score ON ips(latency_ms, verified_at, bandwidth_mbps);
 CREATE INDEX IF NOT EXISTS idx_ips_tested ON ips(tested_at);
+CREATE INDEX IF NOT EXISTS idx_ips_dead ON ips(tested_at) WHERE ok_count = 0;
+CREATE TABLE IF NOT EXISTS graveyard(
+  ip TEXT PRIMARY KEY,
+  buried_at REAL
+);
 """
 
 ROUTE_INDEX_SQL = "CREATE INDEX IF NOT EXISTS idx_ips_route_class ON ips(route_class)"
@@ -169,7 +174,12 @@ def open_db(path):
 
 def load_known(conn):
     rows = conn.execute("SELECT ip, tested_at FROM ips").fetchall()
-    return {r[0]: r[1] or 0 for r in rows}
+    known = {r[0]: r[1] or 0 for r in rows}
+    try:
+        known.update(conn.execute("SELECT ip, buried_at FROM graveyard"))
+    except Exception:
+        pass
+    return known
 
 
 async def fetch(url, timeout=10):
@@ -256,6 +266,77 @@ def upsert(conn, rec):
             rec.get("route_error"),
         ),
     )
+
+
+PRUNE_SCORE_SQL = (
+    "(CASE WHEN ok_count > 0 THEN 200 ELSE 0 END)"          # 活的基础分
+    "+ (CASE WHEN route_class = 'premium' THEN 300 ELSE 0 END)"  # 精品加分
+    "+ (CASE WHEN verified_at IS NOT NULL THEN 60 ELSE 0 END)"
+    "+ MAX(0, 120 - fail_count * 30)"                        # 连续失败越多越先删
+    "+ COALESCE(MIN(MAX(COALESCE(bw_last_mbps, 0), 0), 600), 0)"         # 带宽主导: 1Mbps=1分, 上限600
+    "+ MAX(0, ROUND((1000 - MIN(COALESCE(latency_ms, 9999), 1000)) * 0.4))"  # 延迟主导: 满分400
+    "+ MAX(-60, CAST((tested_at - :now) / 86400.0 AS INTEGER) * 2)"      # 越久没测到越先删
+)
+
+
+GRAVE_DAYS = 7           # 死IP墓碑静默期(天): 期间抽样自动跳过
+GRAVE_EXPIRE_DAYS = 30   # 墓碑过期天数
+GRAVE_MAX_ROWS = 200000  # 墓碑行数硬上限
+
+
+def _grave_ts(now):
+    """使墓碑在 known 冷却判断下恰好静默 GRAVE_DAYS 天"""
+    return now + GRAVE_DAYS * 86400 - 3600
+
+
+def prune_ips(conn, max_ips):
+    """库内超过 max_ips 时按质量评分从低到高剔除, 返回剔除数量. max_ips<=0 不限.
+
+    被淘汰的"从未成功"的死IP写入 graveyard 墓碑, 静默期内不再被抽中,
+    避免反复浪费探测预算; 墓碑过期自动清理且总量封顶.
+    """
+    if not max_ips or int(max_ips) <= 0:
+        return 0
+    now = time.time()
+    try:
+        conn.execute("DELETE FROM graveyard WHERE buried_at < ?",
+                     (now - GRAVE_EXPIRE_DAYS * 86400,))
+        conn.execute("DELETE FROM graveyard WHERE rowid NOT IN "
+                     "(SELECT rowid FROM graveyard "
+                     "ORDER BY buried_at DESC LIMIT ?)", (GRAVE_MAX_ROWS,))
+    except Exception:
+        pass
+
+    def _purge_dead():
+        cond = ("ok_count = 0 AND fail_count >= 3 AND tested_at < :cut "
+                "LIMIT 50000")
+        conn.execute("INSERT OR REPLACE INTO graveyard(ip, buried_at) "
+                     f"SELECT ip, :ts FROM ips WHERE {cond}",
+                     {"ts": _grave_ts(now), "cut": now - 7 * 86400})
+        conn.execute(f"DELETE FROM ips WHERE ip IN (SELECT ip FROM ips WHERE {cond})",
+                     {"cut": now - 7 * 86400})
+
+    _purge_dead()
+    total = conn.execute("SELECT COUNT(*) FROM ips").fetchone()[0]
+    excess = total - int(max_ips)
+    if excess > 0:
+        conn.execute("CREATE TEMP TABLE IF NOT EXISTS victims"
+                     "(ip TEXT PRIMARY KEY)")
+        conn.execute("DELETE FROM victims")
+        conn.execute(f"INSERT INTO victims(ip) SELECT ip FROM ips "
+                     f"ORDER BY {PRUNE_SCORE_SQL} LIMIT :n",
+                     {"now": now, "n": int(excess)})
+        conn.execute("INSERT OR REPLACE INTO graveyard(ip, buried_at) "
+                     "SELECT v.ip, :ts FROM victims v JOIN ips i "
+                     "ON i.ip = v.ip WHERE i.ok_count = 0",
+                     {"ts": _grave_ts(now)})
+        conn.execute("DELETE FROM ips WHERE ip IN (SELECT ip FROM victims)")
+    remaining = conn.execute("SELECT COUNT(*) FROM ips").fetchone()[0]
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception:
+        pass
+    return total - remaining
 
 
 # ------------------------------------------------------------ 路由线路检测
@@ -1053,6 +1134,8 @@ def main():
     ap.add_argument("--bench-timeout", type=float, default=12)
     ap.add_argument("--bench-parallel", type=int, default=4)
     ap.add_argument("--cycles", type=int, default=0, help="扫描轮数限制, 0=无限")
+    ap.add_argument("--max-ips", type=int, default=0,
+                    help="库内IP数量上限, 每轮结束超出部分按质量从低到高剔除, 0=不限制")
     ap.add_argument("--gap", type=float, default=5, help="轮间间隔秒(默认5)")
     ap.add_argument("--once", action="store_true", help="只扫描一轮(发现+验证预算)后退出")
     ap.add_argument("--reverify", type=int, metavar="N", default=0,
@@ -1149,6 +1232,15 @@ def main():
                 conn.commit()
                 pend = 0
                 print(banner(), f"| 本轮达标 {rec['ok']}", flush=True)
+                if getattr(args, "max_ips", 0):
+                    try:
+                        npruned = prune_ips(conn, args.max_ips)
+                        conn.commit()
+                        if npruned:
+                            print(f"库内超限清理: 剔除 {npruned} 个低质量IP",
+                                  flush=True)
+                    except Exception as e:
+                        print(f"库清理失败: {e}", flush=True)
             elif rec["type"] == "done":
                 conn.commit()
                 print(banner(), flush=True)

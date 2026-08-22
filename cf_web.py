@@ -75,7 +75,8 @@ COLO_COUNTRY = {
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cf_settings.json")
 SETTINGS_KEYS = ["operator", "ports", "count", "concurrency", "verify", "bench",
                  "bench_parallel", "backfill", "recheck", "exploit", "max_latency", "tls_check",
-                 "bench_host", "route_check", "route_budget", "route_stale_hours", "ipv6"]
+                 "bench_host", "route_check", "route_budget", "route_stale_hours", "ipv6",
+                 "max_ips"]
 
 
 def load_settings():
@@ -233,7 +234,19 @@ def build_order(q):
     return "(CASE WHEN bw_last_mbps IS NULL THEN -1 ELSE bw_last_mbps END) DESC, latency_ms ASC"
 
 
+_STATS_CACHE = {"at": 0.0, "data": None}
+STATS_TTL = 30
+
+
 def api_stats(db):
+    if (_STATS_CACHE["data"] is None
+            or time.time() - _STATS_CACHE["at"] >= STATS_TTL):
+        _STATS_CACHE["at"] = time.time()
+        _STATS_CACHE["data"] = _compute_stats(db)
+    return _STATS_CACHE["data"]
+
+
+def _compute_stats(db):
     now = time.time()
     total = q_one(db, "SELECT COUNT(*) FROM ips")
     total = total[0] if total else 0
@@ -529,6 +542,7 @@ def scan_args(params, db):
         tls_check=str(params.get("tls_check", "1")) not in ("0", "false", ""),
         exploit=min(1.0, max(0.0, num("exploit", 0.6))),
         cooldown=max(1, num("cooldown", 3600)),
+        max_ips=max(0, int(num("max_ips", 0, int))),
         bench_size=int(max(1_000_000, min(num("bench_size", 30_000_000, int), 80_000_000))),
         bench_timeout=max(1, num("bench_timeout", 10)),
         bench_parallel=max(1, int(num("bench_parallel", 6, int))),
@@ -581,6 +595,17 @@ def scanner_worker(args):
                 set_state(stage="probe", total=rec.get("total", 0), probed=0, ok_now=0)
             elif t == "cycle_end":
                 flush()
+                try:
+                    _n = cf_db.prune_ips(conn, getattr(args, "max_ips", 0))
+                    if _n:
+                        conn.commit()
+                        log_event(f"库内超限清理: 已剔除 {_n} 个低质量IP")
+                except Exception as e:
+                    log_event(f"库清理失败: {e}")
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
                 rnd = get_state()["round"] + 1
                 try:
                     ver = conn.execute("SELECT COUNT(*) FROM ips WHERE verified_at IS NOT NULL").fetchone()[0]
@@ -1044,7 +1069,8 @@ font-family:ui-monospace,Consolas,monospace;font-size:12.5px;padding:10px;margin
     <div class="f"><label>线路检测/轮<span class="tip">?<span class="pop">每轮做线路分类的IP上限. 新发现的IP优先测, 已有带宽的IP会在超时后重测, 已测且新鲜的自动跳过不占额度. 精品线路占比极低, 想提高命中率请调大(默认100). 每个IP约1-2秒(并行发包)</span></span></label><input id="route_budget" type="number" value="100"></div>
     <div class="f"><label>线路重测周期(时)<span class="tip">?<span class="pop">已测过线路的IP, 若超过该小时数且本轮IP有带宽数据才重测; 新发现的IP始终测. 避免每轮重复探测消耗资源</span></span></label><input id="route_stale_hours" type="number" value="6"></div>
     <div class="f"><label>优质C段比例<span class="tip">?<span class="pop">抽样时0-1比例的IP从历史优质C段(邻居表现好)里选. 0.6=6成优质邻域+4成随机</span></span></label><input id="exploit" type="number" step="0.1" value="0.6"></div>
-    <div class="f"><label>最大延迟ms<span class="tip">?<span class="pop">延迟超过该值的IP不算"达标", 不会被送去验证和测速</span></span></label><input id="max_latency" type="number" value="2000"></div>
+    <div class="f"><label>最大延迟ms<span class="tip">?<span class="pop">延迟超过该值的IP不算"达标", 不会被送去做验证和测速</span></span></label><input id="max_latency" type="number" value="2000"></div>
+    <div class="f"><label>库上限(个)<span class="tip">?<span class="pop">每轮结束若库内IP超过该值, 自动按质量评分从低到高剔除: 彻底失联的先删, 精品线路/已验证地区/高带宽/低延迟的保留. 0=不限制. NAS等弱盘建议设5万~20万, 可控制库体积与内存占用</span></span></label><input id="max_ips" type="number" value="0"></div>
     <div class="chk"><input type="checkbox" id="tls_check" checked><label for="tls_check">TLS二次确认<span class="tip">?<span class="pop">TCP能连后还要TLS握手(SNI=cloudflare.com)成功才算存活, 过滤假IP. 首次验证的新IP才做(能滤掉约1/4假IP), 复核已达标IP只做TCP不重复握手, 省CPU</span></span></label></div>
     <div class="chk"><input type="checkbox" id="route_check" checked><label for="route_check">线路分类检测<span class="tip">?<span class="pop">对达标IP做路由线路分类: 只识别去程方向(CN2-GIA/9929/CMIN2为精品, 163/169/9808为普通), 需系统有ping命令</span></span></label></div>
     <div class="chk"><input type="checkbox" id="ipv6"><label for="ipv6">同时扫描IPv6<span class="tip">?<span class="pop">IPv6 池 = 公开优选 v6 列表(优先测, 命中率高) + CF官方大段(随机发现新地址). 本机需有IPv6网络. IPv6 同样支持线路分类(ASN 判定同 v4), 仅需首次联网下载 ip2asn v6 数据</span></span></label></div>
@@ -1623,7 +1649,7 @@ function saveSet(){
     backfill:$("backfill").value,recheck:$("recheck").value,exploit:$("exploit").value,
     max_latency:$("max_latency").value,bench_parallel:$("bench_parallel").value,
     bench_host:$("bench_host").value,route_budget:$("route_budget").value,
-    route_stale_hours:$("route_stale_hours").value,
+    route_stale_hours:$("route_stale_hours").value,max_ips:$("max_ips").value,
     route_check:$("route_check").checked?"1":"0",
     tls_check:$("tls_check").checked?"1":"0",
     ipv6:$("ipv6").checked?"1":"0"};
@@ -1637,7 +1663,8 @@ function loadSet(){
     if(!d||!Object.keys(d).length)return;
     if(d.operator!==undefined)$("operator").value=d.operator||"";
     ["ports","count","concurrency","verify","bench","bench_parallel","bench_host",
-     "backfill","recheck","exploit","max_latency","route_budget","route_stale_hours"].forEach(k=>{
+     "backfill","recheck","exploit","max_latency","route_budget","route_stale_hours",
+     "max_ips"].forEach(k=>{
        const v=d[k];
        if(v!==undefined&&v!==null&&v!=="")$(k).value=v;
     });
@@ -1919,6 +1946,15 @@ DEFAULT_LOGFILE = os.path.join(BASE, "cf_web.log")
 
 
 def pid_alive(pid):
+    if sys.platform == "win32":
+        import ctypes
+
+        SYNCHRONIZE = 0x00100000
+        handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1951,7 +1987,12 @@ def daemon_main(args):
     cmd = [sys.executable, os.path.abspath(__file__),
            "--db", args.db, "--host", args.host, "--port", str(args.port),
            "--log", args.log, "--pidfile", args.pidfile, "--no-browser", "--child"]
-    proc = subprocess.Popen(cmd, start_new_session=True, stdout=log, stderr=log, stdin=subprocess.DEVNULL)
+    popen_kwargs = {}
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL, **popen_kwargs)
     time.sleep(1.5)
     if proc.poll() is not None:
         print("后台启动失败, 最近日志:")
@@ -1977,7 +2018,10 @@ def daemon_stop(pidfile):
         print("没有正在运行的服务")
         return
     try:
-        os.kill(pid, 2 if sys.platform != "win32" else 0)  # SIGINT 优雅退出
+        if sys.platform == "win32":
+            os.kill(pid, 9)  # Windows 无 SIGINT 可投递, 直接结束进程
+        else:
+            os.kill(pid, 2)  # SIGINT 优雅退出
     except ProcessLookupError:
         pass
     for _ in range(50):  # 最多等 ~5s
@@ -2056,7 +2100,8 @@ def ensure_cert():
             ["openssl", "req", "-x509", "-newkey", "rsa:2048",
              "-keyout", KEY_FILE, "-out", CERT_FILE, "-days", "3650",
              "-nodes", "-subj", "/CN=cf-optimizer", "-sha256"],
-            check=True, capture_output=True, timeout=90)
+            check=True, capture_output=True, timeout=90,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         os.chmod(KEY_FILE, 0o600)
         return CERT_FILE
     except Exception as e:
@@ -2089,6 +2134,13 @@ def serve_forever(args, host, port):
         try:
             class V6Server(ThreadingHTTPServer):
                 address_family = socket.AF_INET6
+
+                def server_bind(self):
+                    try:
+                        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                    except OSError:
+                        pass
+                    super().server_bind()
             probe = V6Server(("::", port), Handler)
             probe.server_close()
             server_cls = V6Server
@@ -2129,6 +2181,23 @@ def serve_forever(args, host, port):
     for ip in lan_ips():
         disp = "[%s]" % ip if ":" in ip else ip
         print(f"  局域网: {scheme}://{disp}:{port}/", flush=True)
+    try:
+        _ok4 = route_probe._raw_available(4)
+        _ok6 = route_probe._raw_available(6)
+    except Exception:
+        _ok4 = _ok6 = True
+    if not (_ok4 and _ok6):
+        if sys.platform == "win32":
+            _tip = ("未以管理员身份运行, 线路检测退回系统命令(慢)。"
+                    "以管理员启动可全速(约1秒/IP), 见 README")
+        else:
+            _tip = ("非 root 运行, 线路检测走系统 ping。"
+                    "sudo 启动、或 sudo setcap cap_net_raw+ep $(which python) "
+                    "后可全速(约1秒/IP), 见 README")
+        _miss = "IPv4" if not _ok4 else ""
+        if not _ok6:
+            _miss += ("/" if _miss else "") + "IPv6"
+        print(f"  提示: {_tip} [当前无极速模式: {_miss}]", flush=True)
     if not args.no_browser:
         webbrowser.open(f"{scheme}://{local}:{port}/")
     try:
@@ -2195,8 +2264,17 @@ def main():
     if args.daemon:
         daemon_main(args)
         return
-    if not serve_forever(args, args.host, args.port):
-        sys.exit(1)
+    try:
+        with open(args.pidfile, "w") as fh:
+            fh.write(str(os.getpid()))
+        if not serve_forever(args, args.host, args.port):
+            sys.exit(1)
+    finally:
+        try:
+            if str(os.getpid()) == str(get_pid(args.pidfile)):
+                os.remove(args.pidfile)
+        except OSError:
+            pass
 
 
 DB = None

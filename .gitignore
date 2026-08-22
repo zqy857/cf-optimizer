@@ -2,6 +2,8 @@
 *.db
 *.db-shm
 *.db-wal
+ip2asn-v4.tsv.gz
+ip2asn-v6.tsv.gz
 
 # 日志
 *.log
@@ -15,6 +17,12 @@ __pycache__/
 
 # 环境配置
 .env
+
+# 登录凭据(含密码, 严禁提交)
+cf_secret.json
+
+# 本地运行配置
+cf_settings.json
 
 # IDE
 .vscode/

@@ -872,6 +872,13 @@ def _record_fail(ip):
         LOGIN_FAILS.pop(ip, None)
 
 
+def _login_page(err="", user=""):
+    def esc(s):
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
+    return (LOGIN_PAGE.replace("__MSG__", esc(err))
+                      .replace("__USER__", esc(user)))
+
+
 # -------------------------------------------------------------------- HTTP
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
@@ -945,7 +952,7 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         db = get_state()["db"] or DB or "cf_ips.db"
         if path == "/login":
-            self._send(200, LOGIN_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+            self._send(200, _login_page().encode("utf-8"), "text/html; charset=utf-8")
             return
         if path == "/logout":
             self.send_response(302)
@@ -1015,35 +1022,62 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/login":
             ip = self.client_address[0]
             rem = _lock_remaining(ip)
+            ctype = (self.headers.get("Content-Type") or "").lower()
+            is_json = "application/json" in ctype
             if rem:
-                self._send(423, json.dumps({"ok": False, "error": f"尝试次数过多, 请约{rem}分钟后再试"}).encode())
+                msg = f"尝试次数过多, 请约{rem}分钟后再试"
+                if is_json:
+                    self._send(423, json.dumps({"ok": False, "error": msg}, ensure_ascii=False).encode("utf-8"))
+                else:
+                    self._send(200, self._login_page(msg, "").encode("utf-8"), "text/html; charset=utf-8")
                 return
-            params = self._read_json()
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+            if is_json:
+                try:
+                    pj = json.loads(raw or "{}")
+                    u_, p_ = str(pj.get("user") or ""), str(pj.get("pass") or "")
+                except Exception:
+                    u_ = p_ = ""
+            else:
+                fs = parse_qs(raw)
+                u_ = (fs.get("user") or [""])[0]
+                p_ = (fs.get("pass") or [""])[0]
             sec = SECRET
             if not sec:
                 self._send(200, b'{"ok":true}')
                 return
-            u_ = str(params.get("user") or "")
-            p_ = str(params.get("pass") or "")
-            if hmac.compare_digest(u_, sec["user"]) and hmac.compare_digest(p_, sec["pass"]):
+            okc = (hmac.compare_digest(u_, sec["user"])
+                   and hmac.compare_digest(p_, sec["pass"]))
+            if okc:
                 LOGIN_FAILS.pop(ip, None)
                 tok = _session_token()
                 secure = "; Secure" if SECRET.get("https") else ""
-                body = b'{"ok":true}'
-                self.send_response(200)
-                self.send_header("Set-Cookie", f"s={tok}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL}{secure}")
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                if is_json:
+                    body = b'{"ok":true}'
+                    self.send_response(200)
+                    self.send_header("Set-Cookie", f"s={tok}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL}{secure}")
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(302)
+                    self.send_header("Location", "/")
+                    self.send_header("Set-Cookie", f"s={tok}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL}{secure}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
             else:
                 _record_fail(ip)
-                body = json.dumps({"ok": False, "error": "用户名或密码错误"}, ensure_ascii=False).encode("utf-8")
-                self.send_response(401)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                if is_json:
+                    body = json.dumps({"ok": False, "error": "用户名或密码错误"}, ensure_ascii=False).encode("utf-8")
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self._send(200, _login_page("用户名或密码错误", u_).encode("utf-8"), "text/html; charset=utf-8")
             return
         params = self._read_json()
         if not self._gate():
@@ -2730,7 +2764,7 @@ body::before{content:"";position:fixed;inset:0;background:rgba(6,10,20,.45);back
   -webkit-backdrop-filter:blur(24px) saturate(170%);
   border:1px solid rgba(255,255,255,.35);box-shadow:0 24px 70px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.25)}
 .logo{width:44px;height:44px;border-radius:13px;display:grid;place-items:center;margin:0 auto 14px;
-  background:linear-gradient(135deg,#4f8dff,#38d3f8);color:#fff;font-size:21px;font-weight:800;
+  background:linear-gradient(135deg,#4f8dff,#38d3f8);color:#fff;
   box-shadow:0 6px 20px rgba(79,141,255,.45)}
 h1{font-size:17px;text-align:center;font-weight:750;letter-spacing:.5px;margin-bottom:4px}
 .sub{font-size:12.5px;text-align:center;color:var(--dim);margin-bottom:22px}
@@ -2740,10 +2774,8 @@ input{width:100%;background:rgba(8,12,24,.55);border:1px solid rgba(255,255,255,
 input:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(96,165,250,.25)}
 button{width:100%;margin-top:18px;background:linear-gradient(120deg,#4f8dff,#38d3f8);color:#fff;
   border:0;border-radius:9px;padding:12px;font-size:14.5px;font-weight:700;cursor:pointer;letter-spacing:.4px;
-  box-shadow:0 6px 18px rgba(79,141,255,.4);transition:filter .2s,transform .15s}
+  box-shadow:0 6px 18px rgba(79,141,255,.4);transition:filter .2s}
 button:hover{filter:brightness(1.1)}
-button:active{transform:scale(.98)}
-button:disabled{opacity:.55;cursor:not-allowed;transform:none}
 #msg{min-height:18px;margin-top:12px;font-size:12.5px;color:var(--err);text-align:center;line-height:1.5}
 .tip{margin-top:14px;padding-top:12px;border-top:1px solid rgba(255,255,255,.10);
   font-size:11.5px;color:var(--dim);text-align:center;line-height:1.6}
@@ -2752,37 +2784,20 @@ button:disabled{opacity:.55;cursor:not-allowed;transform:none}
 </head>
 <body>
 <div class="card">
-  <div class="logo"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1.8l2.55 8.05L22.6 12.4l-8.05 2.55L12 23l-2.55-8.05L1.4 12.4l8.05-2.55z"/></svg></div>
+  <div class="logo"><svg width="20" height="20" viewBox="0 0 24 24" fill="#fff"><path d="M12 1.8l2.55 8.05L22.6 12.4l-8.05 2.55L12 23l-2.55-8.05L1.4 12.4l8.05-2.55z"/></svg></div>
   <h1>CF 优选台</h1>
   <div class="sub">请登录以继续</div>
-  <form onsubmit="return doLogin()">
-    <label>用户名</label><input id="u" autocomplete="username" required>
-    <label>密码</label><input id="p" type="password" autocomplete="current-password" required>
-    <button id="btn" type="submit">登 录</button>
-    <div id="msg"></div>
+  <form method="post" action="/api/login">
+    <label>用户名</label><input id="u" name="user" value="__USER__" autocomplete="username" required>
+    <label>密码</label><input id="p" name="pass" type="password" autocomplete="current-password" required>
+    <button type="submit">登 录</button>
+    <div id="msg">__MSG__</div>
   </form>
   <div class="tip">会话有效期 7 天 · 连续失败 5 次将锁定 15 分钟<br>命令行可用 curl -u 免弹窗访问 API</div>
 </div>
-<script>
-function doLogin(){
-  const b=document.getElementById("btn"),m=document.getElementById("msg");
-  b.disabled=true;b.textContent="登录中...";m.textContent="";
-  fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({user:document.getElementById("u").value.trim(),
-                         pass:document.getElementById("p").value})})
-  .then(async r=>{
-    let d={};try{d=await r.json()}catch(e){}
-    if(r.ok&&d.ok){location.href="/";return}
-    m.textContent=d.error||("登录失败 ("+r.status+")");
-    b.disabled=false;b.textContent="登 录";
-  })
-  .catch(e=>{m.textContent="网络错误: "+e;b.disabled=false;b.textContent="登 录"});
-  return false;
-}
-document.getElementById("u").focus();
-</script>
 </body>
 </html>"""
+
 
 
 

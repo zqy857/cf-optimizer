@@ -1602,7 +1602,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
 <div class="scrim" id="scrim"></div>
 <aside class="side" id="side">
   <div class="brand">
-    <span class="logo">✦</span><span class="brand-t">CF 优选台</span>
+    <span class="logo"><svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1.8l2.55 8.05L22.6 12.4l-8.05 2.55L12 23l-2.55-8.05L1.4 12.4l8.05-2.55z"/></svg></span><span class="brand-t">CF 优选台</span>
     <button class="sbtn collapse-btn" id="sideBtn" title="折叠/展开侧栏">«</button>
   </div>
   <nav class="nav">
@@ -1613,8 +1613,8 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <a class="nv" data-v="fx"><i>✨</i><span>点击特效</span></a>
   </nav>
   <div class="side-foot">
-    <button class="sbtn theme-btn" id="themeBtn" title="主题: 自动(跟随设备) → 浅色 → 深色">🌓</button>
-    <button class="sbtn" id="logoutBtn" title="退出登录" onclick="location.href='/logout'">⏻</button>
+    <button class="sbtn theme-btn" id="themeBtn" title="主题: 自动(跟随设备) → 浅色 → 深色"></button>
+    <button class="sbtn" id="logoutBtn" title="退出登录" onclick="location.href='/logout'"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18.36 6.64a9 9 0 1 1-12.72 0"/><line x1="12" y1="2" x2="12" y2="11"/></svg></button>
   </div>
 </aside>
 
@@ -2557,8 +2557,13 @@ function applyThemeNow(){
   const mode=localStorage.getItem("theme")||"auto";
   const dark=mode==="dark"||(mode==="auto"&&_mq.matches);
   document.documentElement.dataset.theme=dark?"dark":"light";
+  const SVGS={
+    auto:'<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="8.4"/><path d="M5.8 5.8l12.4 12.4"/></svg>',
+    light:'<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4.4"/><path d="M12 2v2.4M12 19.6V22M2 12h2.4M19.6 12H22M4.8 4.8l1.7 1.7M17.5 17.5l1.7 1.7M19.2 4.8l-1.7 1.7M6.5 17.5l-1.7 1.7"/></svg>',
+    dark:'<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z"/></svg>'
+  };
+  $("themeBtn").innerHTML=SVGS[mode]||SVGS.auto;
   document.dispatchEvent(new CustomEvent("themechange",{detail:"#60a5fa"}));
-  $("themeBtn").textContent={auto:"🌓",light:"☀️",dark:"🌙"}[mode];
   setTimeout(redrawCharts,80);
 }
 function applyTheme(){
@@ -2747,7 +2752,7 @@ button:disabled{opacity:.55;cursor:not-allowed;transform:none}
 </head>
 <body>
 <div class="card">
-  <div class="logo">✦</div>
+  <div class="logo"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1.8l2.55 8.05L22.6 12.4l-8.05 2.55L12 23l-2.55-8.05L1.4 12.4l8.05-2.55z"/></svg></div>
   <h1>CF 优选台</h1>
   <div class="sub">请登录以继续</div>
   <form onsubmit="return doLogin()">

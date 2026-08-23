@@ -711,6 +711,7 @@ def refresh_wallpaper(force=False):
     if now - WP_STATE.get("try", 0) < 300 and has_cache:
         return False
     WP_STATE["try"] = now
+    print(f"[WP] start force={force} today={today}", flush=True)
     key = "DEMO_KEY"
     try:
         key = (load_settings() or {}).get("nasa_api_key") or key
@@ -727,8 +728,10 @@ def refresh_wallpaper(force=False):
                 j = json.loads(r.read().decode("utf-8", "replace"))
             if j.get("media_type") == "image" and j.get("url"):
                 url = j["url"]
+                print(f"[WP] resolved d-{delta}: {url[:70]}", flush=True)
                 break
-        except Exception:
+        except Exception as e:
+            print(f"[WP] api fail d-{delta}: {type(e).__name__} {e}", flush=True)
             break
     used_fallback = url is None
     if not url:
@@ -737,16 +740,18 @@ def refresh_wallpaper(force=False):
         data = urllib.request.urlopen(
             urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}),
             timeout=30).read()
+        print(f"[WP] downloaded {len(data)}B from {url[:70]}", flush=True)
         if len(data) > 100_000:
             tmp = WP_CACHE + ".tmp"
             with open(tmp, "wb") as fh:
                 fh.write(data)
             os.replace(tmp, WP_CACHE)
+            print(f"[WP] cached OK fallback={used_fallback}", flush=True)
             WP_STATE["date"] = today
             WP_STATE["fallback"] = used_fallback
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WP] download fail: {type(e).__name__} {e}", flush=True)
     return False
 
 

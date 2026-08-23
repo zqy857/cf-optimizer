@@ -697,8 +697,15 @@ def _bg_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "bing_bg.jpg")
 
 
+def _custom_bg_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "bg_custom.jpg")
+
+
 def refresh_bing_bg(max_age=6 * 3600):
-    """抓取 Bing 每日壁纸缓存为 bing_bg.jpg (6小时新鲜期); 失败静默保留旧图"""
+    """抓取 Bing 每日壁纸缓存为 bing_bg.jpg (6小时新鲜期); 失败静默保留旧图.
+    若存在 bg_custom.jpg 则完全使用自定义壁纸, 不再抓取."""
+    if os.path.exists(_custom_bg_path()):
+        return True
     p = _bg_path()
     try:
         if os.path.exists(p) and time.time() - os.path.getmtime(p) < max_age:
@@ -841,7 +848,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/":
                 self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
             elif path == "/bg.jpg":
-                p = _bg_path()
+                p = _custom_bg_path() if os.path.exists(_custom_bg_path()) else _bg_path()
                 if os.path.exists(p):
                     with open(p, "rb") as fh:
                         self._send(200, fh.read(), "image/jpeg")
@@ -944,7 +951,7 @@ PAGE = r"""<!DOCTYPE html>
   --edge:rgba(255,255,255,.09);
   --gloss:.09;
   --shadow-a:.30;
-  --rim:inset 2px -2px 1px -1px rgba(255,255,255,.30),inset -2px 2px 1px -1px rgba(255,255,255,.30),inset 6px -6px 1px -6px rgba(255,255,255,.16),inset -6px 6px 1px -6px rgba(255,255,255,.16),inset 0 0 2px rgba(0,0,0,.5);
+  --rim:inset 0 0 0 1px rgba(255,255,255,.05);
 }
 html[data-theme="light"]{
   --bg:#f5f5f7;
@@ -1099,7 +1106,7 @@ body.side-mini .collapse-btn{transform:rotate(180deg)}
 .content{flex:1;padding:18px clamp(14px,2.5vw,28px) 8px;max-width:1560px;width:100%;margin:0 auto}
 .view{display:none}
 .view.on{display:block;animation:vIn .38s cubic-bezier(.2,.7,.3,1)}
-@keyframes vIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+@keyframes vIn{from{opacity:0}to{opacity:1}}
 .page-sub{margin:0 0 12px}
 
 /* 折叠模式(桌面) */
@@ -1205,12 +1212,12 @@ button{
   position:relative;
   background:var(--grad);color:#fff;border:0;border-radius:8px;padding:10px 20px;font-size:13.5px;
   cursor:pointer;font-weight:700;letter-spacing:.3px;
-  box-shadow:inset 1px -1px 1px -1px rgba(255,255,255,.65),inset -1px 1px 1px -1px rgba(255,255,255,.5),0 3px 10px rgba(37,99,235,.28);
+  box-shadow:0 3px 10px rgba(37,99,235,.28);
   transition:transform .18s cubic-bezier(.2,.7,.3,1.2),box-shadow .18s ease,filter .18s ease;
 }
 button:hover{filter:brightness(1.12);transform:translateY(-1px)}
 button:active{transform:translateY(0) scale(.97)}
-button.stop{background:linear-gradient(135deg,#fb7185,#e11d48);box-shadow:inset 1px -1px 1px -1px rgba(255,255,255,.6),0 3px 10px rgba(225,29,72,.30)}
+button.stop{background:linear-gradient(135deg,#fb7185,#e11d48);box-shadow:0 3px 10px rgba(225,29,72,.30)}
 button.stop:hover{box-shadow:0 8px 26px rgba(244,63,94,.5)}
 button.ghost{background:var(--panel2);border:1px solid var(--line);color:var(--txt);box-shadow:none;font-weight:600}
 button.ghost:hover{border-color:var(--acc);color:var(--acc);box-shadow:0 0 14px rgba(96,165,250,.25)}

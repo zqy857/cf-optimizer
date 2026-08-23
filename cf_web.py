@@ -1660,6 +1660,8 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
         <div class="fr"><label>点击速度</label><input type="range" id="fxCSpeed" min="0.3" max="2" step="0.05" value="1"><output id="oCs">1.00</output></div>
         <div class="fr"><label>自定义颜色</label><input type="color" id="fxColor" value="#60a5fa">
           <span class="sub">关闭「跟随主题」后生效</span></div>
+        <div class="h" style="margin-top:14px">高级参数<span class="sub">实时生效</span></div>
+        <div id="fxAdv"></div>
         <button class="ghost mini" onclick="fxReset()">恢复默认设置</button>
       </div>
     </section>
@@ -2450,6 +2452,46 @@ $("themeBtn").onclick=()=>{
 if(_mq.addEventListener)_mq.addEventListener("change",applyTheme);else if(_mq.addListener)_mq.addListener(applyTheme);
 
 /* ---- 特效设置面板 ---- */
+const FXADV=[
+  ["trail.width","拖尾宽度",.5,4,.05],
+  ["rings.count","溶解环数量",1,6,1],
+  ["disk.radius","光盘半径",.2,2,.02],
+  ["flare.radius","光斑半径",.2,2,.02],
+  ["hit.radius","命中半径",.2,2,.02],
+  ["shards.roundness","碎片圆度",0,1,.01],
+  ["bloom.intensity","Bloom强度",0,3,.05],
+  ["bloom.threshold","Bloom阈值",0,1,.01],
+  ["bloom.diffusion","Bloom扩散",.3,3,.05],
+];
+function fxCfg(){try{return JSON.parse(localStorage.getItem("fxcfg")||"{}")}catch(e){return {}}}
+function fxSave(c){localStorage.setItem("fxcfg",JSON.stringify(c))}
+function fxDefault(path){
+  let v=window.__fxDefaults;
+  for(const k of path.split("."))v=v&&v[k];
+  return v;
+}
+function fxCurrent(path){
+  const ov=(fxCfg().fx)||{};
+  if(ov[path]!==undefined)return ov[path];
+  return fxDefault(path);
+}
+function fxSetParam(path,val){
+  const c=fxCfg();c.fx=c.fx||{};c.fx[path]=val;fxSave(c);
+  if(window.__baFx){try{__baFx.setFxParams({[path]:val})}catch(e){}}
+}
+function fxBuildAdv(){
+  const box=$("fxAdv");if(!box)return;
+  box.innerHTML="";
+  for(const[path,label,mn,mx,st]of FXADV){
+    const row=document.createElement("div");row.className="fr";
+    const val=Number(fxCurrent(path));
+    row.innerHTML=`<label>${label}</label><input type="range" min="${mn}" max="${mx}" step="${st}" value="${isNaN(val)?mn:val}"><output>${isNaN(val)?"-":(+val).toFixed(2)}</output>`;
+    const inp=row.querySelector("input"),out=row.querySelector("output");
+    inp.addEventListener("input",()=>{out.textContent=(+inp.value).toFixed(2);fxSetParam(path,+inp.value)});
+    box.appendChild(row);
+  }
+}
+document.addEventListener("fxready",fxBuildAdv);
 function fxCfg(){try{return JSON.parse(localStorage.getItem("fxcfg")||"{}")}catch(e){return {}}}
 function fxSave(c){localStorage.setItem("fxcfg",JSON.stringify(c))}
 function fxSync(){
@@ -2463,6 +2505,7 @@ function fxSync(){
   $("fxCSpeed").value=c.clickTimeScale??1;$("oCs").textContent=(c.clickTimeScale??1).toFixed(2);
   $("fxAutoColor").checked=!c.colorOverride;
   $("fxColor").value=c.color||"#60a5fa";
+  fxBuildAdv();
 }
 fxSync();
 function fxApply(part){
@@ -2506,7 +2549,7 @@ applyTheme();
 </script>
 <!-- 点击特效: ba-click-fx (MIT) https://github.com/CialloKing/ba-click-fx -->
 <script type="module">
-if(matchMedia("(pointer:fine)").matches && !matchMedia("(prefers-reduced-motion: reduce)").matches){
+{
   try{
     const {BAClickFX}=await import("/vendor/ba-click-fx.js");
     const col=()=>"#60a5fa";
@@ -2519,6 +2562,12 @@ if(matchMedia("(pointer:fine)").matches && !matchMedia("(prefers-reduced-motion:
     if(typeof saved.trailAlways==="boolean")opt.trailAlways=saved.trailAlways;
     else opt.trailAlways=true;
     window.__baFx=new BAClickFX(opt);
+    try{
+      window.__fxDefaults=__baFx.getFxConfig();
+      const fo=(JSON.parse(localStorage.getItem("fxcfg")||"{}").fx)||{};
+      if(Object.keys(fo).length)__baFx.setFxParams(fo);
+    }catch(err){}
+    document.dispatchEvent(new CustomEvent("fxready"));
     document.addEventListener("themechange",e=>{
       let s={};try{s=JSON.parse(localStorage.getItem("fxcfg")||"{}")}catch(err){}
       if(!s.colorOverride&&window.__baFx)window.__baFx.updateConfig({themeColor:e.detail});

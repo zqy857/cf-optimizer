@@ -1289,6 +1289,19 @@ tr.just-tested{outline:2px solid rgba(47,214,163,.65);outline-offset:-2px;backgr
 }
 @media (min-width:921px){ .scrim{display:none} }
 
+/* 浅色主题下的弹窗与横幅 */
+html[data-theme="light"] .modal{
+  background:linear-gradient(175deg,rgba(255,255,255,.97),rgba(248,250,255,.94));
+  box-shadow:0 24px 70px rgba(51,65,105,.22);
+}
+html[data-theme="light"] .modal h2{color:var(--txt)}
+html[data-theme="light"] .route-hint{background:rgba(124,108,246,.06)}
+html[data-theme="light"] #routeDiag{color:#be123c;background:rgba(225,29,99,.07)}
+html[data-theme="light"] #routeDiag b{color:#9f1239}
+html[data-theme="light"] #routeDiag code{background:rgba(15,23,42,.08)}
+html[data-theme="light"] .pin-bar{color:#0f766e;background:rgba(14,164,114,.09)}
+html[data-theme="light"] tr.just-tested{outline-color:rgba(14,164,114,.6)}
+
 /* 浅色主题下的悬停详情弹层 */
 html[data-theme="light"] .f .tip .pop{background:rgba(255,255,255,.98);border-color:var(--line2);
   box-shadow:0 12px 32px rgba(51,65,105,.18)}

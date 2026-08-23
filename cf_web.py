@@ -887,7 +887,7 @@ PAGE = r"""<!DOCTYPE html>
   --grad-v:#93c5fd;
   --shadow:0 1px 3px rgba(0,0,0,.4);
   --glow:0 6px 18px rgba(37,99,235,.16);
-  --tb-bg:rgba(15,15,15,.74);
+  --tb-bg:rgba(13,15,19,.66);
   --thead-bg:rgba(22,22,24,.95);
   --input-bg:#131316;
   --log-bg:#101114;
@@ -895,6 +895,13 @@ PAGE = r"""<!DOCTYPE html>
   --c-label:#9ba1ad;
   --c-txt:#e8e8ec;
   --c-emph:#ffffff;
+  --grid:rgba(255,255,255,.045);
+  --glass-fill:rgba(32,38,47,.46);
+  --glass-side:rgba(17,20,26,.68);
+  --edge:rgba(255,255,255,.09);
+  --gloss:.09;
+  --shadow-a:.30;
+  --rim:inset 2px -2px 1px -1px rgba(255,255,255,.30),inset -2px 2px 1px -1px rgba(255,255,255,.30),inset 6px -6px 1px -6px rgba(255,255,255,.16),inset -6px 6px 1px -6px rgba(255,255,255,.16),inset 0 0 2px rgba(0,0,0,.5);
 }
 html[data-theme="light"]{
   --bg:#f5f5f7;
@@ -915,7 +922,7 @@ html[data-theme="light"]{
   --grad-v:#2563eb;
   --shadow:0 1px 3px rgba(31,41,55,.08);
   --glow:0 6px 18px rgba(37,99,235,.12);
-  --tb-bg:rgba(255,255,255,.78);
+  --tb-bg:rgba(247,248,250,.70);
   --thead-bg:rgba(247,248,250,.96);
   --input-bg:#ffffff;
   --log-bg:#f7f8fa;
@@ -923,17 +930,23 @@ html[data-theme="light"]{
   --c-label:#6b7484;
   --c-txt:#1d2129;
   --c-emph:#0f172a;
+  --grid:#e2e5e9;
+  --glass-fill:rgba(255,255,255,.46);
+  --glass-side:rgba(250,251,252,.64);
+  --edge:rgba(51,51,51,.10);
+  --gloss:.32;
+  --shadow-a:.12;
+  --rim:inset 2px -2px 1px -1px rgba(255,255,255,.85),inset -2px 2px 1px -1px rgba(255,255,255,.85),inset 6px -6px 1px -6px rgba(255,255,255,.48),inset -6px 6px 1px -6px rgba(255,255,255,.48),inset 0 0 2px rgba(0,0,0,.22);
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html{color-scheme:dark}
 html[data-theme="light"]{color-scheme:light}
 body{
-  background:
-    radial-gradient(1100px 520px at 10% -10%, rgba(56,189,248,.09), transparent 58%),
-    radial-gradient(1000px 560px at 98% -6%, rgba(96,165,250,.16), transparent 55%),
-    radial-gradient(900px 620px at 50% 118%, rgba(56,211,248,.10), transparent 58%),
-    var(--bg);
-  background-attachment:fixed;
+  background-color:var(--bg);
+  background-image:
+    linear-gradient(0deg,transparent 24%,var(--grid) 25%,var(--grid) 26%,transparent 27%,transparent 74%,var(--grid) 75%,var(--grid) 76%,transparent 77%),
+    linear-gradient(90deg,transparent 24%,var(--grid) 25%,var(--grid) 26%,transparent 27%,transparent 74%,var(--grid) 75%,var(--grid) 76%,transparent 77%);
+  background-size:52px 52px;
   color:var(--txt);
   font-family:"Inter","HarmonyOS Sans SC","PingFang SC","Segoe UI","Microsoft YaHei",system-ui,sans-serif;
   font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;
@@ -983,13 +996,14 @@ html[data-theme="light"] .blobs i:nth-child(4){background:radial-gradient(circle
 .side{
   position:fixed;left:0;top:0;bottom:0;width:236px;z-index:70;
   display:flex;flex-direction:column;
-  background:rgba(15,15,15,.80);
+  background:var(--glass-side);
+  box-shadow:inset -1px 0 0 var(--edge);
   backdrop-filter:blur(20px) saturate(1.4);-webkit-backdrop-filter:blur(20px) saturate(1.4);
   border-right:1px solid var(--line);
   transition:width .3s cubic-bezier(.2,.7,.3,1),transform .32s cubic-bezier(.2,.7,.3,1);
 }
 html[data-theme="light"] .side{
-  background:rgba(255,255,255,.72);
+  background:var(--glass-side);
   box-shadow:6px 0 30px rgba(51,65,105,.06);
 }
 .brand{position:relative;display:flex;align-items:center;gap:11px;padding:18px 16px 14px;border-bottom:1px solid var(--line)}
@@ -1065,12 +1079,16 @@ body.side-mini .collapse-btn{transform:rotate(180deg)}
 /* ---------- 玻璃卡片 ---------- */
 .card{
   position:relative;
-  background:var(--panel);
-  backdrop-filter:blur(20px) saturate(1.4);-webkit-backdrop-filter:blur(20px) saturate(1.4);
-  border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:16px;
-  transition:border-color .2s ease,box-shadow .2s ease;
+  background:var(--glass-fill);
+  backdrop-filter:blur(14px) saturate(150%);-webkit-backdrop-filter:blur(14px) saturate(150%);
+  border:1px solid var(--edge);border-radius:12px;padding:18px;margin-bottom:16px;
+  box-shadow:var(--rim), 0 4px 12px rgba(0,0,0,var(--shadow-a));
+  transition:border-color .2s ease,box-shadow .25s ease,transform .25s ease;
 }
-.card:hover{border-color:var(--line2)}
+.card:hover{transform:translateY(-1px);box-shadow:var(--rim), 0 8px 22px rgba(0,0,0,calc(var(--shadow-a)*1.7))}
+.card::after{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;
+  filter:blur(2px);
+  background:linear-gradient(135deg,rgba(255,255,255,var(--gloss)) 0%,transparent 26%,transparent 74%,rgba(255,255,255,var(--gloss)) 100%);}
 
 /* ---------- 状态药丸 ---------- */
 .pill{
@@ -1087,15 +1105,17 @@ body.side-mini .collapse-btn{transform:rotate(180deg)}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:11px}
 .stat{
   position:relative;overflow:hidden;cursor:default;
-  background:var(--panel2);
-  border:1px solid var(--line);border-radius:10px;padding:14px 14px 12px;
-  transition:transform .18s ease,border-color .18s ease;
+  background:var(--glass-fill);
+  border:1px solid var(--edge);border-radius:10px;padding:14px 14px 12px;
+  box-shadow:var(--rim);
+  backdrop-filter:blur(10px) saturate(150%);-webkit-backdrop-filter:blur(10px) saturate(150%);
+  transition:transform .18s ease,box-shadow .18s ease;
 }
 
 .stat::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;
   background:var(--grad);opacity:0;transition:opacity .22s ease}
-.stat:hover{transform:translateY(-2px);border-color:var(--line2);
-  box-shadow:0 8px 22px rgba(2,6,18,.28), var(--glow)}
+.stat:hover{transform:translateY(-2px);
+  box-shadow:var(--rim), 0 10px 24px rgba(0,0,0,calc(var(--shadow-a)*1.8))}
 .stat:hover::before{opacity:1}
 .stat:has(.v.g)::before{background:linear-gradient(var(--acc2),transparent)}
 .stat:has(.v.w)::before{background:linear-gradient(var(--warn),transparent)}
@@ -1147,12 +1167,12 @@ button{
   position:relative;
   background:var(--grad);color:#fff;border:0;border-radius:8px;padding:10px 20px;font-size:13.5px;
   cursor:pointer;font-weight:700;letter-spacing:.3px;
-  box-shadow:none;
+  box-shadow:inset 1px -1px 1px -1px rgba(255,255,255,.65),inset -1px 1px 1px -1px rgba(255,255,255,.5),0 3px 10px rgba(37,99,235,.28);
   transition:transform .18s cubic-bezier(.2,.7,.3,1.2),box-shadow .18s ease,filter .18s ease;
 }
 button:hover{filter:brightness(1.12);transform:translateY(-1px)}
 button:active{transform:translateY(0) scale(.97)}
-button.stop{background:linear-gradient(135deg,#fb7185,#f43f5e);box-shadow:0 4px 18px rgba(244,63,94,.35), inset 0 1px 0 rgba(255,255,255,.22)}
+button.stop{background:linear-gradient(135deg,#fb7185,#e11d48);box-shadow:inset 1px -1px 1px -1px rgba(255,255,255,.6),0 3px 10px rgba(225,29,72,.30)}
 button.stop:hover{box-shadow:0 8px 26px rgba(244,63,94,.5)}
 button.ghost{background:var(--panel2);border:1px solid var(--line);color:var(--txt);box-shadow:none;font-weight:600}
 button.ghost:hover{border-color:var(--acc);color:var(--acc);box-shadow:0 0 14px rgba(96,165,250,.25)}
@@ -1189,7 +1209,8 @@ footer .link{color:var(--cyan);cursor:pointer;text-decoration:underline;text-und
 
 /* ---------- 图表 ---------- */
 .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:15px}
-.chart{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px}
+.chart{background:var(--glass-fill);border:1px solid var(--edge);border-radius:10px;padding:12px;
+  box-shadow:var(--rim);backdrop-filter:blur(10px) saturate(150%);-webkit-backdrop-filter:blur(10px) saturate(150%)}
 
 .chart h3{font-size:13px;color:var(--dim);margin-bottom:8px;font-weight:600;letter-spacing:.3px}
 canvas{width:100%;height:250px}

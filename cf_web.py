@@ -999,8 +999,7 @@ html{color-scheme:dark}
 html[data-theme="light"]{color-scheme:light}
 body{
   background-color:var(--bg);
-  background-image:url("/bg.jpg");
-  background-position:center;background-size:cover;background-repeat:no-repeat;background-attachment:fixed;
+  position:relative;
 }
 body::before{content:"";position:fixed;inset:0;z-index:-1;background:var(--scrim);pointer-events:none}
   color:var(--txt);
@@ -1018,6 +1017,10 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;background:var(--scrim
 .h .sub{font-weight:400;margin:0}
 
 /* ================= 背景漂移光团(液态玻璃的折射源) ================= */
+.wallpaper{position:fixed;inset:-3.5%;z-index:-2;pointer-events:none;
+  background:url("/bg.jpg") center/cover no-repeat;
+  animation:kenburns 48s ease-in-out infinite alternate}
+@keyframes kenburns{from{transform:scale(1)}to{transform:scale(1.075) translate(.7%,-.9%)}}
 .blobs{display:none !important}
 .blobs i{position:absolute;border-radius:50%;will-change:transform}
 .blobs i:nth-child(1){width:46vmax;height:46vmax;left:-14vmax;top:-16vmax;
@@ -1040,7 +1043,12 @@ html[data-theme="light"] .blobs i:nth-child(4){background:radial-gradient(circle
 @keyframes drift2{from{transform:translate(0,0) scale(1.05)}to{transform:translate(-9vw,10vh) scale(.92)}}
 @keyframes drift3{from{transform:translate(0,0) scale(.95)}to{transform:translate(12vw,-8vh) scale(1.12)}}
 @keyframes drift4{from{transform:translate(0,0) scale(1)}to{transform:translate(-8vw,-6vh) scale(1.2)}}
-@media (prefers-reduced-motion:reduce){.blobs i{animation:none !important}}
+@media (prefers-reduced-motion:reduce){
+  .blobs i{animation:none !important}
+  .wallpaper{animation:none !important}
+  .view.on .card,tbody tr.rowIn,.logline{animation:none !important}
+  button::after{display:none}
+}
 
 /* ================= 侧边栏 ================= */
 .side{
@@ -1109,7 +1117,13 @@ body.side-mini .collapse-btn{transform:rotate(180deg)}
 .burger{display:none}
 .content{flex:1;padding:18px clamp(14px,2.5vw,28px) 8px;max-width:1560px;width:100%;margin:0 auto}
 .view{display:none}
-.view.on{display:block;animation:vIn .38s cubic-bezier(.2,.7,.3,1)}
+.view.on{display:block;animation:vIn .32s ease}
+.view.on .card{animation:cardIn .55s cubic-bezier(.2,.7,.3,1) backwards}
+.view.on .card:nth-of-type(1){animation-delay:.03s}
+.view.on .card:nth-of-type(2){animation-delay:.11s}
+.view.on .card:nth-of-type(3){animation-delay:.19s}
+.view.on .card:nth-of-type(4){animation-delay:.27s}
+@keyframes cardIn{from{opacity:0;transform:translateY(16px) scale(.99)}to{opacity:1;transform:none}}
 @keyframes vIn{from{opacity:0}to{opacity:1}}
 .page-sub{margin:0 0 12px}
 
@@ -1217,6 +1231,10 @@ button{
   box-shadow:0 3px 10px rgba(37,99,235,.28);
   transition:transform .18s cubic-bezier(.2,.7,.3,1.2),box-shadow .18s ease,filter .18s ease;
 }
+button::after{content:"";position:absolute;top:-10%;bottom:-10%;left:-75%;width:45%;
+  background:linear-gradient(105deg,transparent,rgba(255,255,255,.22),transparent);
+  transform:skewX(-18deg);transition:left .55s ease;pointer-events:none}
+button:hover::after{left:125%}
 button:hover{filter:brightness(1.12);transform:translateY(-1px)}
 button:active{transform:translateY(0) scale(.97)}
 button.stop{background:linear-gradient(135deg,#fb7185,#e11d48);box-shadow:0 3px 10px rgba(225,29,72,.30)}
@@ -1286,6 +1304,8 @@ th:hover{color:var(--acc)}
 tr:hover td{background:color-mix(in srgb,var(--acc) 6%,transparent)}
 tbody td{position:relative}
 tbody tr{transition:transform .18s cubic-bezier(.2,.7,.3,1.2),box-shadow .18s ease}
+tbody tr.rowIn{animation:rowIn .34s ease backwards}
+@keyframes rowIn{from{opacity:0;transform:translateX(-10px)}to{opacity:1}}
 tbody tr:hover{transform:scale(1.012);box-shadow:0 2px 16px rgba(2,6,18,.45);z-index:5}
 #tabWrap.scrolling tbody tr{transition:none !important}
 #tabWrap.scrolling tbody tr:hover{transform:none;box-shadow:none}
@@ -1341,7 +1361,8 @@ tr.just-tested{outline:2px solid rgba(47,214,163,.65);outline-offset:-2px;backgr
   background:rgba(15,21,38,.95);color:#fff;padding:10px 22px;border-radius:8px;
   font-size:13px;opacity:0;pointer-events:none;transition:opacity .25s ease,transform .25s ease;z-index:999;
   border:1px solid var(--line2);box-shadow:0 12px 34px rgba(0,0,0,.5)}
-#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0) scale(1);transition:opacity .22s ease,transform .38s cubic-bezier(.34,1.56,.64,1)}
+#toast:not(.show){transform:translateX(-50%) translateY(16px) scale(.94)}
 #toast.ok{background:linear-gradient(135deg,rgba(6,44,33,.95),rgba(13,64,48,.95));border:1px solid rgba(47,214,163,.6)}
 #toast.err{background:linear-gradient(135deg,rgba(74,17,26,.95),rgba(101,22,32,.95));border:1px solid rgba(251,113,133,.6)}
 
@@ -1358,7 +1379,8 @@ tr.just-tested{outline:2px solid rgba(47,214,163,.65);outline-offset:-2px;backgr
 .logbox{background:var(--log-bg);border:1px solid rgba(148,163,184,.12);border-radius:11px;height:190px;
   overflow-y:auto;font-family:ui-monospace,"Cascadia Code",Consolas,monospace;font-size:12.5px;
   padding:11px;margin-top:9px;line-height:1.68;color:var(--log-txt)}
-.logline{white-space:pre-wrap;word-break:break-all}
+.logline{white-space:pre-wrap;word-break:break-all;animation:logIn .3s ease}
+@keyframes logIn{from{opacity:0;transform:translateX(-8px)}}
 .logline .t{color:#4d5a72;margin-right:9px}
 .logline.err .m{color:var(--err)}
 .logline.ok .m{color:var(--acc2)}
@@ -2046,6 +2068,8 @@ function renderTable(data){
       `<td class="colo">${esc(r.colo)}</td><td>${esc(r.country)}</td><td>${routeCell}</td><td>${tt}</td>`+
       `<td>${fmt(r.ok)}/<span style="color:var(--err)">${r.fail}</span></td>`+
       `<td>${latBtn}${bwBtn}${rtBtn}</td>`;
+    tr.classList.add("rowIn");
+    tr.style.animationDelay=Math.min(i*20,420)+"ms";
     tb.appendChild(tr);
   });
   const ca=$("ckAll");
@@ -2374,12 +2398,20 @@ document.querySelector(".main").addEventListener("transitionend",(e)=>{if(e.prop
 
 /* ---- 主题: 自动(跟随设备) -> 浅色 -> 深色 循环 ---- */
 const _mq=window.matchMedia("(prefers-color-scheme: dark)");
-function applyTheme(){
+function applyThemeNow(){
   const mode=localStorage.getItem("theme")||"auto";
   const dark=mode==="dark"||(mode==="auto"&&_mq.matches);
   document.documentElement.dataset.theme=dark?"dark":"light";
   $("themeBtn").textContent={auto:"🌓",light:"☀️",dark:"🌙"}[mode];
   setTimeout(redrawCharts,80);
+}
+function applyTheme(){
+  if(document.startViewTransition){
+    const r=$("themeBtn").getBoundingClientRect();
+    document.documentElement.style.setProperty("--tx",(r.left+r.width/2)+"px");
+    document.documentElement.style.setProperty("--ty",(r.top+r.height/2)+"px");
+    document.startViewTransition(applyThemeNow);
+  }else applyThemeNow();
 }
 $("themeBtn").onclick=()=>{
   const order=["auto","light","dark"];

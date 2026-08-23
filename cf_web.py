@@ -895,9 +895,9 @@ PAGE = r"""<!DOCTYPE html>
   --c-label:#9ba1ad;
   --c-txt:#e8e8ec;
   --c-emph:#ffffff;
-  --grid:rgba(255,255,255,.045);
-  --glass-fill:rgba(32,38,47,.46);
-  --glass-side:rgba(17,20,26,.68);
+  --grid:rgba(255,255,255,.065);
+  --glass-fill:rgba(30,36,45,.34);
+  --glass-side:rgba(15,18,23,.55);
   --edge:rgba(255,255,255,.09);
   --gloss:.09;
   --shadow-a:.30;
@@ -930,9 +930,9 @@ html[data-theme="light"]{
   --c-label:#6b7484;
   --c-txt:#1d2129;
   --c-emph:#0f172a;
-  --grid:#e2e5e9;
-  --glass-fill:rgba(255,255,255,.46);
-  --glass-side:rgba(250,251,252,.64);
+  --grid:#d9dde2;
+  --glass-fill:rgba(255,255,255,.38);
+  --glass-side:rgba(250,251,252,.52);
   --edge:rgba(51,51,51,.10);
   --gloss:.32;
   --shadow-a:.12;
@@ -950,12 +950,6 @@ body{
   color:var(--txt);
   font-family:"Inter","HarmonyOS Sans SC","PingFang SC","Segoe UI","Microsoft YaHei",system-ui,sans-serif;
   font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;
-}
-html[data-theme="light"] body{
-  background:
-    radial-gradient(1100px 520px at 10% -10%, rgba(56,189,248,.07), transparent 58%),
-    radial-gradient(1000px 560px at 98% -6%, rgba(96,165,250,.08), transparent 55%),
-    var(--bg);
 }
 ::selection{background:rgba(99,148,255,.30)}
 ::-webkit-scrollbar{width:9px;height:9px}
@@ -998,7 +992,7 @@ html[data-theme="light"] .blobs i:nth-child(4){background:radial-gradient(circle
   display:flex;flex-direction:column;
   background:var(--glass-side);
   box-shadow:inset -1px 0 0 var(--edge);
-  backdrop-filter:blur(20px) saturate(1.4);-webkit-backdrop-filter:blur(20px) saturate(1.4);
+  backdrop-filter:blur(12px) saturate(1.4);-webkit-backdrop-filter:blur(12px) saturate(1.4);
   border-right:1px solid var(--line);
   transition:width .3s cubic-bezier(.2,.7,.3,1),transform .32s cubic-bezier(.2,.7,.3,1);
 }
@@ -1080,7 +1074,7 @@ body.side-mini .collapse-btn{transform:rotate(180deg)}
 .card{
   position:relative;
   background:var(--glass-fill);
-  backdrop-filter:blur(14px) saturate(150%);-webkit-backdrop-filter:blur(14px) saturate(150%);
+  backdrop-filter:blur(7px) saturate(140%);-webkit-backdrop-filter:blur(7px) saturate(140%);
   border:1px solid var(--edge);border-radius:12px;padding:18px;margin-bottom:16px;
   box-shadow:var(--rim), 0 4px 12px rgba(0,0,0,var(--shadow-a));
   transition:border-color .2s ease,box-shadow .25s ease,transform .25s ease;
@@ -1108,7 +1102,7 @@ body.side-mini .collapse-btn{transform:rotate(180deg)}
   background:var(--glass-fill);
   border:1px solid var(--edge);border-radius:10px;padding:14px 14px 12px;
   box-shadow:var(--rim);
-  backdrop-filter:blur(10px) saturate(150%);-webkit-backdrop-filter:blur(10px) saturate(150%);
+  backdrop-filter:blur(6px) saturate(140%);-webkit-backdrop-filter:blur(6px) saturate(140%);
   transition:transform .18s ease,box-shadow .18s ease;
 }
 

@@ -34,7 +34,6 @@ import types
 import webbrowser
 import base64
 import hmac
-import urllib.request
 import secrets
 import string
 import subprocess
@@ -693,52 +692,6 @@ def stop_scan():
     return {"ok": True}
 
 
-def _bg_path():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "bing_bg.jpg")
-
-
-def _custom_bg_path():
-    base = os.path.dirname(os.path.abspath(__file__))
-    for name in ("bg_custom.jpg", "bg_custom.png", "bg_custom.webp"):
-        p = os.path.join(base, name)
-        if os.path.exists(p):
-            return p
-    return os.path.join(base, "bg_custom.jpg")
-
-
-def refresh_bing_bg(max_age=6 * 3600):
-    """抓取 Bing 每日壁纸缓存为 bing_bg.jpg (6小时新鲜期); 失败静默保留旧图.
-    若存在 bg_custom.jpg 则完全使用自定义壁纸, 不再抓取."""
-    if os.path.exists(_custom_bg_path()):
-        return True
-    p = _bg_path()
-    try:
-        if os.path.exists(p) and time.time() - os.path.getmtime(p) < max_age:
-            return True
-        req = urllib.request.Request(
-            "https://cn.bing.com/HPImageArchive.aspx?format=js&idx=0&n=1",
-            headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            u = json.loads(r.read().decode("utf-8", "replace"))["images"][0]["url"]
-        if u.startswith("/"):
-            u = "https://cn.bing.com" + u
-        data = urllib.request.urlopen(
-            urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"}), timeout=20).read()
-        tmp = p + ".tmp"
-        with open(tmp, "wb") as fh:
-            fh.write(data)
-        os.replace(tmp, p)
-        return True
-    except Exception:
-        return False
-
-
-def _bg_loop():
-    while True:
-        refresh_bing_bg()
-        time.sleep(3600)
-
-
 def test_ip(db, params):
     ip = (params.get("ip") or "").strip()
     act = params.get("action") or "lat"
@@ -852,13 +805,6 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/":
                 self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
-            elif path == "/bg.jpg":
-                p = _custom_bg_path() if os.path.exists(_custom_bg_path()) else _bg_path()
-                if os.path.exists(p):
-                    with open(p, "rb") as fh:
-                        self._send(200, fh.read(), "image/jpeg")
-                else:
-                    self._send(404, b"", "text/plain")
             elif path == "/api/status":
                 st = get_state()
                 st["db"] = os.path.abspath(db)
@@ -1018,7 +964,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;background:var(--scrim
 
 /* ================= 背景漂移光团(液态玻璃的折射源) ================= */
 .wallpaper{position:fixed;inset:-3.5%;z-index:-2;pointer-events:none;
-  background:url("/bg.jpg") center/cover no-repeat;
+  background:url("https://www.nasa.gov/wp-content/uploads/2026/03/over-the-horizon-%E2%80%93-desktop-%E2%80%93-image-only.png") center/cover no-repeat;
   animation:kenburns 48s ease-in-out infinite alternate}
 @keyframes kenburns{from{transform:scale(1)}to{transform:scale(1.075) translate(.7%,-.9%)}}
 .blobs{display:none !important}
@@ -2784,7 +2730,6 @@ def main():
         cf_db.open_db(args.db).close()
     except Exception:
         pass
-    threading.Thread(target=_bg_loop, daemon=True).start()
     init_secret()
     if args.child:
         child_main(args)

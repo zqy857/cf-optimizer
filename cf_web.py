@@ -1658,7 +1658,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
         <div class="fr"><label>不透明度</label><input type="range" id="fxOpacity" min="0.15" max="1" step="0.05" value="1"><output id="oOp">1.00</output></div>
         <div class="fr"><label>拖尾速度</label><input type="range" id="fxTSpeed" min="0.3" max="2" step="0.05" value="1"><output id="oTs">1.00</output></div>
         <div class="fr"><label>点击速度</label><input type="range" id="fxCSpeed" min="0.3" max="2" step="0.05" value="1"><output id="oCs">1.00</output></div>
-        <div class="fr"><label>自定义颜色</label><input type="color" id="fxColor" value="#2563eb">
+        <div class="fr"><label>自定义颜色</label><input type="color" id="fxColor" value="#60a5fa">
           <span class="sub">关闭「跟随主题」后生效</span></div>
         <button class="ghost mini" onclick="fxReset()">恢复默认设置</button>
       </div>
@@ -2429,7 +2429,7 @@ function applyThemeNow(){
   const mode=localStorage.getItem("theme")||"auto";
   const dark=mode==="dark"||(mode==="auto"&&_mq.matches);
   document.documentElement.dataset.theme=dark?"dark":"light";
-  document.dispatchEvent(new CustomEvent("themechange",{detail:dark?"#60a5fa":"#2563eb"}));
+  document.dispatchEvent(new CustomEvent("themechange",{detail:"#60a5fa"}));
   $("themeBtn").textContent={auto:"🌓",light:"☀️",dark:"🌙"}[mode];
   setTimeout(redrawCharts,80);
 }
@@ -2462,7 +2462,7 @@ function fxSync(){
   $("fxTSpeed").value=c.trailTimeScale??1;$("oTs").textContent=(c.trailTimeScale??1).toFixed(2);
   $("fxCSpeed").value=c.clickTimeScale??1;$("oCs").textContent=(c.clickTimeScale??1).toFixed(2);
   $("fxAutoColor").checked=!c.colorOverride;
-  $("fxColor").value=c.color||"#2563eb";
+  $("fxColor").value=c.color||"#60a5fa";
 }
 fxSync();
 function fxApply(part){
@@ -2492,8 +2492,7 @@ function fxOnAuto(){
   const auto=$("fxAutoColor").checked;
   const c=fxCfg();
   if(auto){delete c.colorOverride;fxSave(c);
-    const dark=document.documentElement.dataset.theme!=="light";
-    if(window.__baFx)__baFx.updateConfig({themeColor:dark?"#60a5fa":"#2563eb"});
+    if(window.__baFx)__baFx.updateConfig({themeColor:"#60a5fa"});
   }else{fxSave({...c,colorOverride:true});}
 }
 function fxReset(){
@@ -2510,7 +2509,7 @@ applyTheme();
 if(matchMedia("(pointer:fine)").matches && !matchMedia("(prefers-reduced-motion: reduce)").matches){
   try{
     const {BAClickFX}=await import("/vendor/ba-click-fx.js");
-    const col=()=>document.documentElement.dataset.theme==="light"?"#2563eb":"#60a5fa";
+    const col=()=>"#60a5fa";
     let saved={};
     try{saved=JSON.parse(localStorage.getItem("fxcfg")||"{}")}catch(e){}
     const opt={themeColor:saved.colorOverride&&saved.color?saved.color:col(),

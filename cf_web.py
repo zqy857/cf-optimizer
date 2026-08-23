@@ -2431,7 +2431,7 @@ if(matchMedia("(pointer:fine)").matches && !matchMedia("(prefers-reduced-motion:
   addEventListener("mousedown",()=>{halo.style.transition="none";halo.style.width="300px";halo.style.height="300px";
     requestAnimationFrame(()=>{halo.style.transition="";halo.style.width="360px";halo.style.height="360px"})});
   (function loop(){
-    hx+=(tx-hx)*.11;hy+=(ty-hy)*.11;
+    hx+=(tx-hx)*.28;hy+=(ty-hy)*.28;
     halo.style.transform=`translate(calc(${hx.toFixed(1)}px - 50%),calc(${hy.toFixed(1)}px - 50%))`;
     requestAnimationFrame(loop);
   })();

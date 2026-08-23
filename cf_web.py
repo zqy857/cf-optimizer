@@ -34,6 +34,7 @@ import types
 import webbrowser
 import base64
 import hmac
+import urllib.request
 import secrets
 import string
 import subprocess
@@ -692,6 +693,43 @@ def stop_scan():
     return {"ok": True}
 
 
+WP = {"url": "https://www.nasa.gov/wp-content/uploads/2026/03/over-the-horizon-%E2%80%93-desktop-%E2%80%93-image-only.png",
+      "ts": 0}
+
+
+def _wp_refresh():
+    """解析 NASA 每日一图(APOD)的图片直链; 仅请求JSON元数据,
+    壁纸本体由浏览器直连 NASA, 服务器不下载任何图片.
+    当日若是视频则逐天回退取最近一个图片日; 全部失败15分钟后重试."""
+    for delta in range(0, 4):
+        d = time.strftime("%Y-%m-%d", time.gmtime(time.time() - delta * 86400))
+        try:
+            req = urllib.request.Request(
+                f"https://api.nasa.gov/planetary/apod?api_key=DEMO_KEY&date={d}",
+                headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                j = json.loads(r.read().decode("utf-8", "replace"))
+            if j.get("media_type") == "image" and j.get("url"):
+                WP["url"] = j["url"]
+                WP["ts"] = time.time()
+                return
+        except Exception:
+            break
+    WP["ts"] = time.time() - 6 * 3600 + 900
+
+
+def _wp_loop():
+    while True:
+        if time.time() - WP["ts"] >= 6 * 3600:
+            _wp_refresh()
+        time.sleep(1800)
+
+
+def _wp_resolve_once():
+    WP["ts"] = 0
+    _wp_refresh()
+
+
 def test_ip(db, params):
     ip = (params.get("ip") or "").strip()
     act = params.get("action") or "lat"
@@ -805,6 +843,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/":
                 self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
+            elif path == "/wallpaper":
+                if time.time() - WP["ts"] >= 6 * 3600:
+                    threading.Thread(target=_wp_resolve_once, daemon=True).start()
+                self.send_response(302)
+                self.send_header("Location", WP["url"])
+                self.send_header("Content-Length", "0")
+                self.end_headers()
             elif path == "/api/status":
                 st = get_state()
                 st["db"] = os.path.abspath(db)
@@ -964,7 +1009,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;background:var(--scrim
 
 /* ================= 背景漂移光团(液态玻璃的折射源) ================= */
 .wallpaper{position:fixed;inset:-3.5%;z-index:-2;pointer-events:none;
-  background:url("https://www.nasa.gov/wp-content/uploads/2026/03/over-the-horizon-%E2%80%93-desktop-%E2%80%93-image-only.png") center/cover no-repeat;
+  background:url("/wallpaper") center/cover no-repeat;
   animation:kenburns 48s ease-in-out infinite alternate}
 @keyframes kenburns{from{transform:scale(1)}to{transform:scale(1.075) translate(.7%,-.9%)}}
 .blobs{display:none !important}
@@ -2730,6 +2775,7 @@ def main():
         cf_db.open_db(args.db).close()
     except Exception:
         pass
+    threading.Thread(target=_wp_loop, daemon=True).start()
     init_secret()
     if args.child:
         child_main(args)

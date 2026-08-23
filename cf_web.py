@@ -698,7 +698,12 @@ def _bg_path():
 
 
 def _custom_bg_path():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "bg_custom.jpg")
+    base = os.path.dirname(os.path.abspath(__file__))
+    for name in ("bg_custom.jpg", "bg_custom.png", "bg_custom.webp"):
+        p = os.path.join(base, name)
+        if os.path.exists(p):
+            return p
+    return os.path.join(base, "bg_custom.jpg")
 
 
 def refresh_bing_bg(max_age=6 * 3600):
@@ -936,7 +941,7 @@ PAGE = r"""<!DOCTYPE html>
   --grad-v:#93c5fd;
   --shadow:0 1px 3px rgba(0,0,0,.4);
   --glow:0 6px 18px rgba(37,99,235,.16);
-  --tb-bg:rgba(10,13,19,.55);
+  --tb-bg:rgba(10,13,19,.62);
   --thead-bg:rgba(22,22,24,.95);
   --input-bg:#131316;
   --log-bg:#101114;
@@ -946,8 +951,8 @@ PAGE = r"""<!DOCTYPE html>
   --c-emph:#ffffff;
   --scrim:rgba(6,9,15,.52);
   --grid:rgba(255,255,255,.065);
-  --glass-fill:rgba(18,22,30,.50);
-  --glass-side:rgba(14,17,23,.58);
+  --glass-fill:rgba(16,20,28,.62);
+  --glass-side:rgba(13,16,22,.66);
   --edge:rgba(255,255,255,.09);
   --gloss:.09;
   --shadow-a:.30;
@@ -972,7 +977,7 @@ html[data-theme="light"]{
   --grad-v:#2563eb;
   --shadow:0 1px 3px rgba(31,41,55,.08);
   --glow:0 6px 18px rgba(37,99,235,.12);
-  --tb-bg:rgba(255,255,255,.55);
+  --tb-bg:rgba(255,255,255,.62);
   --thead-bg:rgba(247,248,250,.96);
   --input-bg:#ffffff;
   --log-bg:#f7f8fa;
@@ -982,8 +987,8 @@ html[data-theme="light"]{
   --c-emph:#0f172a;
   --scrim:rgba(246,247,250,.44);
   --grid:#d9dde2;
-  --glass-fill:rgba(255,255,255,.55);
-  --glass-side:rgba(255,255,255,.60);
+  --glass-fill:rgba(255,255,255,.68);
+  --glass-side:rgba(255,255,255,.74);
   --edge:rgba(51,51,51,.10);
   --gloss:.32;
   --shadow-a:.12;
@@ -1042,8 +1047,7 @@ html[data-theme="light"] .blobs i:nth-child(4){background:radial-gradient(circle
   position:fixed;left:0;top:0;bottom:0;width:236px;z-index:70;
   display:flex;flex-direction:column;
   background:var(--glass-side);
-  box-shadow:inset -1px 0 0 var(--edge);
-  backdrop-filter:blur(22px) saturate(1.5);-webkit-backdrop-filter:blur(22px) saturate(1.5);
+  box-shadow:inset -1px 0 0 var(--edge);-webkit-
   border-right:1px solid var(--line);
   transition:width .3s cubic-bezier(.2,.7,.3,1),transform .32s cubic-bezier(.2,.7,.3,1);
 }
@@ -1098,7 +1102,7 @@ body.side-mini .collapse-btn{transform:rotate(180deg)}
 .topbar{
   position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:12px;
   padding:12px clamp(14px,2.5vw,26px);
-  background:var(--tb-bg);backdrop-filter:blur(20px) saturate(1.4);-webkit-backdrop-filter:blur(20px) saturate(1.4);
+  background:var(--tb-bg);-webkit-
   border-bottom:1px solid var(--line);
 }
 .crumb{font-size:16px;font-weight:750;letter-spacing:.3px}
@@ -1124,8 +1128,7 @@ body.side-mini .collapse-btn{transform:rotate(180deg)}
 /* ---------- 玻璃卡片 ---------- */
 .card{
   position:relative;
-  background:var(--glass-fill);
-  backdrop-filter:blur(22px) saturate(170%);-webkit-backdrop-filter:blur(22px) saturate(170%);
+  background:var(--glass-fill);-webkit-
   border:1px solid var(--edge);border-radius:12px;padding:18px;margin-bottom:16px;
   box-shadow:var(--rim), 0 4px 12px rgba(0,0,0,var(--shadow-a));
   transition:border-color .2s ease,box-shadow .25s ease,transform .25s ease;
@@ -1152,8 +1155,7 @@ body.side-mini .collapse-btn{transform:rotate(180deg)}
   position:relative;overflow:hidden;cursor:default;
   background:var(--glass-fill);
   border:1px solid var(--edge);border-radius:10px;padding:14px 14px 12px;
-  box-shadow:var(--rim);
-  backdrop-filter:blur(16px) saturate(160%);-webkit-backdrop-filter:blur(16px) saturate(160%);
+  box-shadow:var(--rim);-webkit-
   transition:transform .18s ease,box-shadow .18s ease;
 }
 
@@ -1192,7 +1194,7 @@ body.side-mini .collapse-btn{transform:rotate(180deg)}
 .f .tip:hover{background:rgba(96,165,250,.25);box-shadow:0 0 8px rgba(96,165,250,.4)}
 .f .tip .pop{
   visibility:hidden;opacity:0;position:absolute;bottom:135%;left:50%;transform:translateX(-50%) translateY(4px);
-  background:rgba(13,18,33,.94);backdrop-filter:blur(14px);border:1px solid var(--line2);color:var(--txt);
+  background:rgba(13,18,33,.94);border:1px solid var(--line2);color:var(--txt);
   padding:9px 11px;border-radius:9px;width:232px;font-size:12px;font-weight:400;line-height:1.55;z-index:80;
   transition:opacity .18s ease,transform .18s ease;text-align:left;box-shadow:0 12px 32px rgba(0,0,0,.55);
 }
@@ -1240,8 +1242,7 @@ footer .link{color:var(--cyan);cursor:pointer;text-decoration:underline;text-und
   display:none;align-items:center;justify-content:center;z-index:99}
 .modal-mask.open{display:flex}
 .modal{
-  background:linear-gradient(175deg,rgba(23,30,52,.93),rgba(13,18,33,.95));
-  backdrop-filter:blur(22px);border:1px solid var(--line2);border-radius:12px;padding:20px 22px;
+  background:linear-gradient(175deg,rgba(23,30,52,.93),rgba(13,18,33,.95));border:1px solid var(--line2);border-radius:12px;padding:20px 22px;
   max-width:600px;width:92%;max-height:82vh;overflow:auto;font-size:13px;line-height:1.75;
   box-shadow:0 24px 70px rgba(0,0,0,.6);animation:mIn .28s cubic-bezier(.2,.7,.3,1.1)}
 @keyframes mIn{from{opacity:0;transform:translateY(16px) scale(.97)}to{opacity:1;transform:none}}
@@ -1255,7 +1256,7 @@ footer .link{color:var(--cyan);cursor:pointer;text-decoration:underline;text-und
 /* ---------- 图表 ---------- */
 .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:15px}
 .chart{background:var(--glass-fill);border:1px solid var(--edge);border-radius:10px;padding:12px;
-  box-shadow:var(--rim);backdrop-filter:blur(10px) saturate(150%);-webkit-backdrop-filter:blur(10px) saturate(150%)}
+  box-shadow:var(--rim);}
 
 .chart h3{font-size:13px;color:var(--dim);margin-bottom:8px;font-weight:600;letter-spacing:.3px}
 canvas{width:100%;height:250px}
@@ -1280,7 +1281,7 @@ canvas{width:100%;height:250px}
 table{width:100%;border-collapse:collapse;font-size:14px}
 th,td{padding:8px 12px;text-align:left;border-bottom:1px solid rgba(148,163,184,.10);white-space:nowrap}
 th{color:var(--dim);font-weight:600;cursor:pointer;user-select:none;
-  background:var(--thead-bg);backdrop-filter:blur(10px);position:sticky;top:0;z-index:4}
+  background:var(--thead-bg);position:sticky;top:0;z-index:4}
 th:hover{color:var(--acc)}
 tr:hover td{background:color-mix(in srgb,var(--acc) 6%,transparent)}
 tbody td{position:relative}
@@ -1337,7 +1338,7 @@ footer{margin-top:auto;padding:14px;color:var(--dim);font-size:12px;text-align:c
 .pin-bar b{font-family:ui-monospace,Menlo,Consolas,monospace}
 tr.just-tested{outline:2px solid rgba(47,214,163,.65);outline-offset:-2px;background:rgba(47,214,163,.08)}
 #toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%) translateY(16px);
-  background:rgba(15,21,38,.95);backdrop-filter:blur(10px);color:#fff;padding:10px 22px;border-radius:8px;
+  background:rgba(15,21,38,.95);color:#fff;padding:10px 22px;border-radius:8px;
   font-size:13px;opacity:0;pointer-events:none;transition:opacity .25s ease,transform .25s ease;z-index:999;
   border:1px solid var(--line2);box-shadow:0 12px 34px rgba(0,0,0,.5)}
 #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}

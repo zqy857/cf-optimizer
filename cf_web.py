@@ -1647,7 +1647,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     </section>
     <section class="view" id="v-fx">
       <div class="card">
-        <div class="h">✨ 点击特效设置<span class="sub">蔚蓝档案风格点击特效与光标拖尾 · 调整即时生效并自动保存(仅桌面端鼠标可见)</span></div>
+        <div class="h">✨ 点击特效设置<span class="sub">蔚蓝档案风格点击特效与光标拖尾 · 调整即时生效并自动保存 · 手机触屏同样支持</span></div>
         <div class="row">
           <div class="chk"><input type="checkbox" id="fxClick" checked><label for="fxClick">点击特效</label></div>
           <div class="chk"><input type="checkbox" id="fxTrail" checked><label for="fxTrail">光标拖尾</label></div>

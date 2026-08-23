@@ -734,6 +734,11 @@ def refresh_wallpaper(force=False):
             print(f"[WP] api fail d-{delta}: {type(e).__name__} {e}", flush=True)
             break
     used_fallback = url is None
+    if used_fallback and os.path.exists(WP_CACHE):
+        print("[WP] api不可用, 保留现有缓存图", flush=True)
+        WP_STATE["date"] = today
+        WP_STATE["fallback"] = True
+        return True
     if not url:
         url = WP_FALLBACK
     try:
@@ -748,6 +753,7 @@ def refresh_wallpaper(force=False):
             os.replace(tmp, WP_CACHE)
             print(f"[WP] cached OK fallback={used_fallback}", flush=True)
             WP_STATE["date"] = today
+            WP_STATE["fallback"] = used_fallback
             WP_STATE["fallback"] = used_fallback
             return True
     except Exception as e:

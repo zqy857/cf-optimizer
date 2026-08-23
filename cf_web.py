@@ -1225,7 +1225,7 @@ body.side-mini .collapse-btn{transform:rotate(180deg)}
 
 /* ---------- 按钮 ---------- */
 button{
-  position:relative;
+  position:relative;overflow:hidden;
   background:var(--grad);color:#fff;border:0;border-radius:8px;padding:10px 20px;font-size:13.5px;
   cursor:pointer;font-weight:700;letter-spacing:.3px;
   box-shadow:0 3px 10px rgba(37,99,235,.28);
@@ -1464,6 +1464,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
 }
 </style>
 <body>
+<div class="wallpaper" aria-hidden="true"></div>
 <div class="blobs" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
 <div class="scrim" id="scrim"></div>
 <aside class="side" id="side">

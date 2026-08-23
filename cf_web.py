@@ -1614,7 +1614,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
   </nav>
   <div class="side-foot">
     <button class="sbtn theme-btn" id="themeBtn" title="主题: 自动(跟随设备) → 浅色 → 深色">🌓</button>
-    
+    <button class="sbtn" id="logoutBtn" title="退出登录" onclick="location.href='/logout'">⏻</button>
   </div>
 </aside>
 
@@ -1625,7 +1625,6 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <span style="flex:1"></span>
     <span id="dbpath" class="sub" style="margin:0;font-size:12px"></span>
     <span id="pill" class="pill idle">待命</span>
-    <button class="ghost mini" onclick="location.href='/logout'" title="退出登录" style="padding:5px 10px">⏻</button>
   </header>
   <div class="content">
     <section class="view on" id="v-overview">

@@ -850,6 +850,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Location", WP["url"])
                 self.send_header("Content-Length", "0")
                 self.end_headers()
+            elif path == "/vendor/ba-click-fx.js":
+                p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor", "ba-click-fx.js")
+                if os.path.exists(p):
+                    with open(p, "rb") as fh:
+                        self._send(200, fh.read(), "text/javascript; charset=utf-8")
+                else:
+                    self._send(404, b"", "text/plain")
             elif path == "/api/status":
                 st = get_state()
                 st["db"] = os.path.abspath(db)
@@ -940,7 +947,6 @@ PAGE = r"""<!DOCTYPE html>
   --c-label:#9ba1ad;
   --c-txt:#e8e8ec;
   --c-emph:#ffffff;
-  --halo:rgba(96,165,250,.075);
   --scrim:rgba(6,9,15,.52);
   --grid:rgba(255,255,255,.065);
   --glass-fill:rgba(16,20,28,.62);
@@ -977,7 +983,6 @@ html[data-theme="light"]{
   --c-label:#6b7484;
   --c-txt:#1d2129;
   --c-emph:#0f172a;
-  --halo:rgba(37,99,235,.065);
   --scrim:rgba(246,247,250,.44);
   --grid:#d9dde2;
   --glass-fill:rgba(255,255,255,.68);
@@ -1009,10 +1014,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;background:var(--scrim
 .h{font-size:15px;font-weight:700;margin-bottom:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .h .sub{font-weight:400;margin:0}
 
-/* ================= 鼠标光晕 ================= */
-#cur-halo{position:fixed;top:0;left:0;width:360px;height:360px;z-index:1;
-  pointer-events:none;border-radius:50%;opacity:0;transition:opacity .45s ease;
-  background:radial-gradient(circle,var(--halo) 0%,transparent 62%)}
+/* ================= 点击特效: ba-click-fx (MIT) ================= */
 
 /* ================= 背景漂移光团(液态玻璃的折射源) ================= */
 .wallpaper{position:fixed;inset:-3.5%;z-index:-2;pointer-events:none;
@@ -1046,8 +1048,7 @@ html[data-theme="light"] .blobs i:nth-child(4){background:radial-gradient(circle
   .wallpaper{animation:none !important}
   .view.on .card,tbody tr.rowIn,.logline{animation:none !important}
   button::after{display:none}
-  #cur-halo{display:none !important}
-}
+  }
 
 /* ================= 侧边栏 ================= */
 .side{
@@ -2402,6 +2403,7 @@ function applyThemeNow(){
   const mode=localStorage.getItem("theme")||"auto";
   const dark=mode==="dark"||(mode==="auto"&&_mq.matches);
   document.documentElement.dataset.theme=dark?"dark":"light";
+  document.dispatchEvent(new CustomEvent("themechange",{detail:dark?"#60a5fa":"#2563eb"}));
   $("themeBtn").textContent={auto:"🌓",light:"☀️",dark:"🌙"}[mode];
   setTimeout(redrawCharts,80);
 }
@@ -2421,26 +2423,26 @@ $("themeBtn").onclick=()=>{
 };
 if(_mq.addEventListener)_mq.addEventListener("change",applyTheme);else if(_mq.addListener)_mq.addListener(applyTheme);
 
-if(matchMedia("(pointer:fine)").matches && !matchMedia("(prefers-reduced-motion: reduce)").matches){
-  const halo=document.createElement("div");halo.id="cur-halo";document.body.appendChild(halo);
-  let hx=innerWidth/2,hy=innerHeight/2,tx=hx,ty=hy,lit=false;
-  addEventListener("mousemove",e=>{tx=e.clientX;ty=e.clientY;
-    if(!lit){lit=true;hx=tx;hy=ty;halo.style.opacity=1}});
-  document.documentElement.addEventListener("mouseleave",()=>{lit=false;halo.style.opacity=0});
-  document.documentElement.addEventListener("mouseenter",()=>{if(tx||ty){lit=true;halo.style.opacity=1}});
-  addEventListener("mousedown",()=>{halo.style.transition="none";halo.style.width="300px";halo.style.height="300px";
-    requestAnimationFrame(()=>{halo.style.transition="";halo.style.width="360px";halo.style.height="360px"})});
-  (function loop(){
-    hx+=(tx-hx)*.42;hy+=(ty-hy)*.42;
-    halo.style.transform=`translate(calc(${hx.toFixed(1)}px - 50%),calc(${hy.toFixed(1)}px - 50%))`;
-    requestAnimationFrame(loop);
-  })();
-}
-
 showView(localStorage.getItem("view")||"overview");
 applyTheme();
 
 </script>
+<!-- 点击特效: ba-click-fx (MIT) https://github.com/CialloKing/ba-click-fx -->
+<script type="module">
+if(matchMedia("(pointer:fine)").matches && !matchMedia("(prefers-reduced-motion: reduce)").matches){
+  try{
+    const {BAClickFX}=await import("/vendor/ba-click-fx.js");
+    const col=()=>document.documentElement.dataset.theme==="light"?"#2563eb":"#60a5fa";
+    window.__baFx=new BAClickFX({
+      themeColor:col(),
+      trailAlways:true,
+      maxDpr:1.5,
+    });
+    document.addEventListener("themechange",e=>window.__baFx&&window.__baFx.updateConfig({themeColor:e.detail}));
+  }catch(e){console.warn("点击特效初始化失败:",e)}
+}
+</script>
+
 <div id="toast"></div>
 </body>
 </html>

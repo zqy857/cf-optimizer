@@ -1016,6 +1016,26 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;background:var(--scrim
 
 /* ================= 点击特效: ba-click-fx (MIT) ================= */
 
+/* ================= 特效设置面板 ================= */
+#fxGear{position:fixed;right:18px;bottom:18px;z-index:60;width:42px;height:42px;border-radius:12px;
+  background:var(--glass-fill);border:1px solid var(--line2);color:var(--txt);font-size:19px;
+  box-shadow:0 4px 16px rgba(0,0,0,.25)}
+#fxGear:hover{border-color:var(--acc);transform:translateY(-2px)}
+#fxPanel{position:fixed;right:18px;bottom:70px;z-index:61;width:262px;display:none;
+  background:var(--glass-fill);backdrop-filter:blur(20px) saturate(1.5);
+  border:1px solid var(--line2);border-radius:14px;padding:14px 16px;
+  box-shadow:0 14px 40px rgba(0,0,0,.35)}
+#fxPanel.open{display:block;animation:mIn .25s cubic-bezier(.2,.7,.3,1.1)}
+#fxPanel h4{font-size:13.5px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center}
+#fxPanel h4 .mclose{cursor:pointer;color:var(--dim);font-weight:700}
+#fxPanel .fr{display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:12.5px}
+#fxPanel .fr label:first-child{flex:0 0 74px;color:var(--dim)}
+#fxPanel .fr output{flex:0 0 38px;text-align:right;font-variant-numeric:tabular-nums;color:var(--txt);font-size:12px}
+#fxPanel input[type=range]{flex:1;accent-color:var(--acc)}
+#fxPanel input[type=color]{width:34px;height:24px;border:1px solid var(--line);border-radius:6px;background:none;padding:0}
+#fxPanel .chk{margin-bottom:6px;padding:0;font-size:12.5px}
+#fxPanel button.mini{width:100%;margin-top:6px}
+
 /* ================= 背景漂移光团(液态玻璃的折射源) ================= */
 .wallpaper{position:fixed;inset:-3.5%;z-index:-2;pointer-events:none;
   background:url("/wallpaper") center/cover no-repeat;
@@ -1640,6 +1660,20 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
   </div>
   <footer>数据来源: <span id="srcHost">speed.cloudflare.com</span> 实测带宽 &amp; /cdn-cgi/trace 地区识别 &nbsp;|&nbsp; 服务端 v<span id="ver">?</span> &nbsp;|&nbsp; <span class="link" onclick="openAbout()">关于</span></footer>
 </main>
+<button id="fxGear" title="点击特效设置" onclick="toggleFxPanel()">✨</button>
+<div id="fxPanel">
+  <h4>✨ 特效设置<span class="mclose" onclick="toggleFxPanel(false)">×</span></h4>
+  <div class="chk"><input type="checkbox" id="fxClick" checked><label for="fxClick">点击特效</label></div>
+  <div class="chk"><input type="checkbox" id="fxTrail" checked><label for="fxTrail">光标拖尾</label></div>
+  <div class="chk"><input type="checkbox" id="fxAlways"><label for="fxAlways">移动即显示拖尾</label></div>
+  <div class="fr"><label>特效大小</label><input type="range" id="fxScale" min="0.4" max="2" step="0.05" value="1"><output id="oScale">1.00</output></div>
+  <div class="fr"><label>不透明度</label><input type="range" id="fxOpacity" min="0.15" max="1" step="0.05" value="1"><output id="oOp">1.00</output></div>
+  <div class="fr"><label>拖尾速度</label><input type="range" id="fxTSpeed" min="0.3" max="2" step="0.05" value="1"><output id="oTs">1.00</output></div>
+  <div class="fr"><label>点击速度</label><input type="range" id="fxCSpeed" min="0.3" max="2" step="0.05" value="1"><output id="oCs">1.00</output></div>
+  <div class="chk"><input type="checkbox" id="fxAutoColor" checked onchange="fxOnAuto()"><label for="fxAutoColor">颜色跟随明暗主题</label></div>
+  <div class="fr"><label>自定义颜色</label><input type="color" id="fxColor" value="#2563eb"></div>
+  <button class="mini ghost" onclick="fxReset()">恢复默认</button>
+</div>
 <div id="chartTip"><div class="t-title"></div><div class="t-body"></div></div>
 
 <div class="modal-mask" id="aboutMask" onclick="if(event.target===this)closeAbout()">
@@ -2423,6 +2457,61 @@ $("themeBtn").onclick=()=>{
 };
 if(_mq.addEventListener)_mq.addEventListener("change",applyTheme);else if(_mq.addListener)_mq.addListener(applyTheme);
 
+/* ---- 特效设置面板 ---- */
+function fxCfg(){try{return JSON.parse(localStorage.getItem("fxcfg")||"{}")}catch(e){return {}}}
+function fxSave(c){localStorage.setItem("fxcfg",JSON.stringify(c))}
+function toggleFxPanel(force){
+  const p=$("fxPanel");const show=force!==undefined?force:!p.classList.contains("open");
+  p.classList.toggle("open",show);
+  if(show){
+    const c=fxCfg();
+    $("fxClick").checked=c.clickEnabled!==false;
+    $("fxTrail").checked=c.trailEnabled!==false;
+    $("fxAlways").checked=!!c.trailAlways||c.trailAlways===undefined;
+    $("fxScale").value=c.scale??1;$("oScale").textContent=(c.scale??1).toFixed(2);
+    $("fxOpacity").value=c.opacity??1;$("oOp").textContent=(c.opacity??1).toFixed(2);
+    $("fxTSpeed").value=c.trailTimeScale??1;$("oTs").textContent=(c.trailTimeScale??1).toFixed(2);
+    $("fxCSpeed").value=c.clickTimeScale??1;$("oCs").textContent=(c.clickTimeScale??1).toFixed(2);
+    $("fxAutoColor").checked=!c.colorOverride;
+    $("fxColor").value=c.color||"#2563eb";
+  }
+}
+function fxApply(part){
+  const c=fxCfg();Object.assign(c,part);fxSave(c);
+  if(window.__baFx)window.__baFx.updateConfig(part);
+}
+function fxBind(id,key,out,fmt){
+  $(id).addEventListener("input",e=>{
+    const v=parseFloat(e.target.value);
+    if(out)$(out).textContent=v.toFixed(2);
+    fxApply({[key]:v});
+  });
+}
+fxBind("fxScale","scale","oScale");
+fxBind("fxOpacity","opacity","oOp");
+fxBind("fxTSpeed","trailTimeScale","oTs");
+fxBind("fxCSpeed","clickTimeScale","oCs");
+$("fxClick").addEventListener("change",e=>fxApply({clickEnabled:e.target.checked}));
+$("fxTrail").addEventListener("change",e=>fxApply({trailEnabled:e.target.checked}));
+$("fxAlways").addEventListener("change",e=>fxApply({trailAlways:e.target.checked}));
+$("fxAutoColor").addEventListener("change",fxOnAuto);
+$("fxColor").addEventListener("input",e=>{
+  fxSave({...fxCfg(),colorOverride:true,color:e.target.value});
+  if(window.__baFx)__baFx.updateConfig({themeColor:e.target.value});
+});
+function fxOnAuto(){
+  const auto=$("fxAutoColor").checked;
+  const c=fxCfg();
+  if(auto){delete c.colorOverride;fxSave(c);
+    const dark=document.documentElement.dataset.theme!=="light";
+    if(window.__baFx)__baFx.updateConfig({themeColor:dark?"#60a5fa":"#2563eb"});
+  }else{fxSave({...c,colorOverride:true});}
+}
+function fxReset(){
+  localStorage.removeItem("fxcfg");
+  location.reload();
+}
+
 showView(localStorage.getItem("view")||"overview");
 applyTheme();
 
@@ -2433,12 +2522,19 @@ if(matchMedia("(pointer:fine)").matches && !matchMedia("(prefers-reduced-motion:
   try{
     const {BAClickFX}=await import("/vendor/ba-click-fx.js");
     const col=()=>document.documentElement.dataset.theme==="light"?"#2563eb":"#60a5fa";
-    window.__baFx=new BAClickFX({
-      themeColor:col(),
-      trailAlways:true,
-      maxDpr:1.5,
+    let saved={};
+    try{saved=JSON.parse(localStorage.getItem("fxcfg")||"{}")}catch(e){}
+    const opt={themeColor:saved.colorOverride&&saved.color?saved.color:col(),
+      trailAlways:true,maxDpr:1.5};
+    ["scale","opacity","trailTimeScale","clickTimeScale"].forEach(k=>{if(typeof saved[k]==="number")opt[k]=saved[k]});
+    ["trailEnabled","clickEnabled"].forEach(k=>{if(typeof saved[k]==="boolean")opt[k]=saved[k]});
+    if(typeof saved.trailAlways==="boolean")opt.trailAlways=saved.trailAlways;
+    else opt.trailAlways=true;
+    window.__baFx=new BAClickFX(opt);
+    document.addEventListener("themechange",e=>{
+      let s={};try{s=JSON.parse(localStorage.getItem("fxcfg")||"{}")}catch(err){}
+      if(!s.colorOverride&&window.__baFx)window.__baFx.updateConfig({themeColor:e.detail});
     });
-    document.addEventListener("themechange",e=>window.__baFx&&window.__baFx.updateConfig({themeColor:e.detail}));
   }catch(e){console.warn("点击特效初始化失败:",e)}
 }
 </script>

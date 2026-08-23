@@ -531,18 +531,25 @@ def export_body(db, q, fmt):
 
 # ---------------------------------------------------------------- scanner
 def scan_args(params, db):
+    # 参数优先级: 本次请求 > 已保存设置 > 代码默认值
+    # 保证任何启动路径(界面/API/脚本)缺键时都回退到用户保存过的配置(如 max_ips)
+    flat = dict(load_settings())
+    for k, v in params.items():
+        if v is not None and v != "":
+            flat[k] = v
+
     def num(k, d, t=float):
         try:
-            return t(params.get(k, d))
+            return t(flat.get(k, d))
         except (ValueError, TypeError):
             return d
 
-    ports = [int(x) for x in str(params.get("ports", "")).split(",") if x.strip().isdigit()]
+    ports = [int(x) for x in str(flat.get("ports", "")).split(",") if x.strip().isdigit()]
     if not ports:
         ports = list(cf_db.PORTS_DEFAULT)
     return types.SimpleNamespace(
         db=db,
-        operator=(params.get("operator") or None),
+        operator=(flat.get("operator") or None),
         count=max(1, int(num("count", 5000, int))),
         verify=max(0, int(num("verify", 400, int))),
         bench=max(0, int(num("bench", 20, int))),
@@ -553,18 +560,18 @@ def scan_args(params, db):
         max_latency=max(1, num("max_latency", 2000)),
         port=int(num("port", 443, int)),
         ports=tuple(ports),
-        tls_check=str(params.get("tls_check", "1")) not in ("0", "false", ""),
+        tls_check=str(flat.get("tls_check", "1")) not in ("0", "false", ""),
         exploit=min(1.0, max(0.0, num("exploit", 0.6))),
         cooldown=max(1, num("cooldown", 3600)),
         max_ips=max(0, int(num("max_ips", 0, int))),
         bench_size=int(max(1_000_000, min(num("bench_size", 30_000_000, int), 80_000_000))),
         bench_timeout=max(1, num("bench_timeout", 10)),
         bench_parallel=max(1, int(num("bench_parallel", 6, int))),
-        bench_host=str(params.get("bench_host", "")).strip() or cf_db.SPEED_HOST,
-        route_check=str(params.get("route_check", "1")) not in ("0", "false", ""),
+        bench_host=str(flat.get("bench_host", "")).strip() or cf_db.SPEED_HOST,
+        route_check=str(flat.get("route_check", "1")) not in ("0", "false", ""),
         route_budget=max(0, int(num("route_budget", 100, int))),
         route_stale_hours=max(1, num("route_stale_hours", 6)),
-        ipv6=str(params.get("ipv6", "0")) not in ("0", "false", ""),
+        ipv6=str(flat.get("ipv6", "0")) not in ("0", "false", ""),
         cycles=0, gap=max(1, num("gap", 5)), once=False, reverify=0,
     )
 

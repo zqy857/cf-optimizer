@@ -63,7 +63,6 @@ from concurrent.futures import ThreadPoolExecutor
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DAT_FILE = os.path.join(BASE_DIR, "ipasn-v4.dat")
 TSV_GZ = os.path.join(BASE_DIR, "ip2asn-v4.tsv.gz")
 IPASN_URL = "https://iptoasn.com/data/ip2asn-v4.tsv.gz"
 TSV_GZ6 = os.path.join(BASE_DIR, "ip2asn-v6.tsv.gz")

@@ -981,11 +981,9 @@ PAGE = r"""<!DOCTYPE html>
   --err:#fb7185;
   --purp:#c4b5fd;
   --cyan:#67e8f9;
-  --pink:#60a5fa;
   --grad:#2563eb;
   --grad-v:#93c5fd;
   --shadow:0 1px 3px rgba(0,0,0,.4);
-  --glow:0 6px 18px rgba(37,99,235,.16);
   --tb-bg:rgba(10,13,19,.62);
   --thead-bg:rgba(22,22,24,.95);
   --input-bg:#131316;
@@ -995,7 +993,6 @@ PAGE = r"""<!DOCTYPE html>
   --c-txt:#e8e8ec;
   --c-emph:#ffffff;
   --scrim:rgba(6,9,15,.52);
-  --grid:rgba(255,255,255,.065);
   --glass-fill:rgba(16,20,28,.62);
   --glass-side:rgba(13,16,22,.66);
   --edge:rgba(255,255,255,.09);
@@ -1017,11 +1014,9 @@ html[data-theme="light"]{
   --err:#dc2626;
   --purp:#7c3aed;
   --cyan:#0891b2;
-  --pink:#2563eb;
   --grad:#2563eb;
   --grad-v:#2563eb;
   --shadow:0 1px 3px rgba(31,41,55,.08);
-  --glow:0 6px 18px rgba(37,99,235,.12);
   --tb-bg:rgba(255,255,255,.62);
   --thead-bg:rgba(247,248,250,.96);
   --input-bg:#ffffff;
@@ -1031,7 +1026,6 @@ html[data-theme="light"]{
   --c-txt:#1d2129;
   --c-emph:#0f172a;
   --scrim:rgba(246,247,250,.44);
-  --grid:#d9dde2;
   --glass-fill:rgba(255,255,255,.68);
   --glass-side:rgba(255,255,255,.74);
   --edge:rgba(51,51,51,.10);
@@ -1070,35 +1064,12 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;background:var(--scrim
 #v-fx input[type=range]{flex:1;accent-color:var(--acc);max-width:340px}
 #v-fx input[type=color]{width:42px;height:26px;border:1px solid var(--line);border-radius:6px;background:none;padding:0;cursor:pointer}
 
-/* ================= 背景漂移光团(液态玻璃的折射源) ================= */
+/* ================= 壁纸(Ken Burns 缓慢呼吸) ================= */
 .wallpaper{position:fixed;inset:-3.5%;z-index:-2;pointer-events:none;
   background:url("/wallpaper") center/cover no-repeat;
   animation:kenburns 48s ease-in-out infinite alternate}
 @keyframes kenburns{from{transform:scale(1)}to{transform:scale(1.075) translate(.7%,-.9%)}}
-.blobs{display:none !important}
-.blobs i{position:absolute;border-radius:50%;will-change:transform}
-.blobs i:nth-child(1){width:46vmax;height:46vmax;left:-14vmax;top:-16vmax;
-  background:radial-gradient(circle at 40% 40%,rgba(79,141,255,.32),transparent 64%);
-  animation:drift1 44s ease-in-out infinite alternate}
-.blobs i:nth-child(2){width:42vmax;height:42vmax;right:-15vmax;top:4vmax;
-  background:radial-gradient(circle at 58% 42%,rgba(56,211,248,.27),transparent 64%);
-  animation:drift2 37s ease-in-out infinite alternate}
-.blobs i:nth-child(3){width:54vmax;height:54vmax;left:20vw;bottom:-26vmax;
-  background:radial-gradient(circle at 50% 45%,rgba(96,165,250,.26),transparent 64%);
-  animation:drift3 51s ease-in-out infinite alternate}
-.blobs i:nth-child(4){width:30vmax;height:30vmax;right:20vw;bottom:-12vmax;
-  background:radial-gradient(circle at 50% 50%,rgba(47,214,163,.15),transparent 66%);
-  animation:drift4 31s ease-in-out infinite alternate}
-html[data-theme="light"] .blobs i:nth-child(1){background:radial-gradient(circle at 40% 40%,rgba(79,141,255,.30),transparent 62%)}
-html[data-theme="light"] .blobs i:nth-child(2){background:radial-gradient(circle at 58% 42%,rgba(56,211,248,.30),transparent 62%)}
-html[data-theme="light"] .blobs i:nth-child(3){background:radial-gradient(circle at 50% 45%,rgba(96,165,250,.24),transparent 62%)}
-html[data-theme="light"] .blobs i:nth-child(4){background:radial-gradient(circle at 50% 50%,rgba(47,214,163,.18),transparent 64%)}
-@keyframes drift1{from{transform:translate(0,0) scale(1)}to{transform:translate(10vw,8vh) scale(1.18)}}
-@keyframes drift2{from{transform:translate(0,0) scale(1.05)}to{transform:translate(-9vw,10vh) scale(.92)}}
-@keyframes drift3{from{transform:translate(0,0) scale(.95)}to{transform:translate(12vw,-8vh) scale(1.12)}}
-@keyframes drift4{from{transform:translate(0,0) scale(1)}to{transform:translate(-8vw,-6vh) scale(1.2)}}
 @media (prefers-reduced-motion:reduce){
-  .blobs i{animation:none !important}
   .wallpaper{animation:none !important}
   .view.on .card,tbody tr.rowIn,.logline{animation:none !important}
   button::after{display:none}
@@ -1147,7 +1118,6 @@ html[data-theme="light"] .side{
 .nv.on::before{content:"";position:absolute;left:-10px;top:22%;bottom:22%;width:3px;border-radius:3px;
   background:var(--acc)}
 .side-foot{padding:12px 14px;border-top:1px solid var(--line);display:flex;align-items:center;gap:9px}
-.side-tip{font-size:11px;color:var(--dim);white-space:nowrap;letter-spacing:.5px}
 .sbtn{
   background:var(--panel2);border:1px solid var(--line);color:var(--dim);border-radius:8px;
   width:30px;height:30px;display:inline-flex;align-items:center;justify-content:center;
@@ -1186,7 +1156,7 @@ body.side-mini .collapse-btn{transform:rotate(180deg)}
   body.side-mini .side{width:70px}
   body.side-mini .main{margin-left:70px}
   body.side-mini .brand{justify-content:center;padding-left:8px;padding-right:8px}
-  body.side-mini .brand-t,body.side-mini .nv span,body.side-mini .side-tip{display:none}
+  body.side-mini .brand-t,body.side-mini .nv span{display:none}
   body.side-mini .nv{display:block;text-align:center;padding:12px 0;margin:4px 13px;line-height:1}
   body.side-mini .nv i{font-size:19px}
   body.side-mini .side-foot{justify-content:center;flex-wrap:wrap;row-gap:8px;padding:12px 8px}
@@ -1301,10 +1271,6 @@ button:disabled{opacity:.38;cursor:not-allowed;filter:none;transform:none;box-sh
 .chk input{accent-color:var(--acc);width:16px;height:16px;cursor:pointer}
 #f_premium:checked+label,#f_hasbw:checked+label,#f_v6:checked+label,
 #opt_premium:checked+label,#opt_hasbw:checked+label,#opt_v6:checked+label{color:var(--acc2);font-weight:700}
-
-.optbox{white-space:pre;font-family:ui-monospace,Consolas,monospace;font-size:12px;
-  background:var(--log-bg);border:1px solid var(--line);border-radius:8px;padding:9px;
-  max-height:220px;overflow:auto;line-height:1.6;color:var(--txt);user-select:text}
 .pin{color:var(--acc2);font-size:13px;font-weight:700;cursor:pointer;user-select:none}
 .pin:hover{text-decoration:underline}
 footer .link{color:var(--cyan);cursor:pointer;text-decoration:underline;text-underline-offset:3px}
@@ -1519,7 +1485,6 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
 </style>
 <body>
 <div class="wallpaper" aria-hidden="true"></div>
-<div class="blobs" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
 <div class="scrim" id="scrim"></div>
 <aside class="side" id="side">
   <div class="brand">

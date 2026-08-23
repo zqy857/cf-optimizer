@@ -40,11 +40,9 @@ import json
 import os
 import queue
 import random
-import re
 import socket
 import sqlite3
 import ssl
-import sys
 import threading
 import time
 import types

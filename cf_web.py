@@ -33,6 +33,7 @@ import time
 import types
 import webbrowser
 import base64
+import hashlib
 import hmac
 import urllib.request
 import secrets
@@ -828,14 +829,60 @@ def upsert_test(db, ip, port, latency=None, bandwidth=None, route_class=None,
         pass
 
 
+# -------------------------------------------------------------------- 会话与登录
+SESSION_TTL = 7 * 86400
+LOGIN_FAILS = {}   # ip -> [连续失败次数, 最近一次时间]
+LOCK_UNTIL = {}    # ip -> 解锁时间戳
+
+
+def _session_token():
+    """无状态会话令牌: 过期时间 + HMAC(pass). 改密码即全体失效."""
+    exp = str(int(time.time()) + SESSION_TTL)
+    sig = hmac.new(SECRET["pass"].encode(), exp.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{exp}.{sig}"
+
+
+def _session_ok(token):
+    try:
+        exp, sig = token.split(".")
+        if int(float(exp)) < time.time():
+            return False
+        want = hmac.new(SECRET["pass"].encode(), exp.encode(), hashlib.sha256).hexdigest()[:32]
+        return hmac.compare_digest(sig, want)
+    except Exception:
+        return False
+
+
+def _lock_remaining(ip):
+    t = LOCK_UNTIL.get(ip, 0)
+    if time.time() < t:
+        return int(t - time.time()) // 60 + 1
+    f = LOGIN_FAILS.get(ip)
+    if f and time.time() - f[1] > 600:
+        LOGIN_FAILS.pop(ip, None)
+    return 0
+
+
+def _record_fail(ip):
+    f = LOGIN_FAILS.setdefault(ip, [0, time.time()])
+    f[0] += 1
+    f[1] = time.time()
+    if f[0] >= 5:
+        LOCK_UNTIL[ip] = time.time() + 900
+        LOGIN_FAILS.pop(ip, None)
+
+
 # -------------------------------------------------------------------- HTTP
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
-    def _auth_ok(self):
+    def _cred_ok(self):
         sec = SECRET
         if not sec:
+            return True
+        m = re.search(r"(?:^|;\s*)s=([^;]+)", self.headers.get("Cookie", ""))
+        if m and _session_ok(m.group(1)):
             return True
         h = self.headers.get("Authorization", "")
         if h.startswith("Basic "):
@@ -847,10 +894,31 @@ class Handler(BaseHTTPRequestHandler):
                     return True
             except Exception:
                 pass
+        return False
+
+    def _deny(self, www_auth=True):
         self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="cf-optimizer"')
-        self.send_header("Content-Length", "0")
+        if www_auth:
+            self.send_header("WWW-Authenticate", 'Basic realm="cf-optimizer"')
+        self._send(401, b'{"error":"unauthorized"}') if False else None
+        body = b'{"error":"unauthorized"}'
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
+        self.wfile.write(body)
+
+    def _gate(self, human_redirect=False):
+        """返回 True=已放行. 未授权时: 浏览器访问主页重定向登录页, 其余回401."""
+        if self._cred_ok():
+            return True
+        has_basic = "authorization" in (k.lower() for k in self.headers.keys())
+        if human_redirect and not has_basic:
+            self.send_response(302)
+            self.send_header("Location", "/login")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            self._deny()
         return False
 
     def _send(self, code, body, ctype="application/json; charset=utf-8", fname=None):
@@ -872,38 +940,51 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length).decode("utf-8"))
 
     def do_GET(self):
-        if not self._auth_ok():
-            return
         u = urlparse(self.path)
         path = u.path
         q = parse_qs(u.query)
         db = get_state()["db"] or DB or "cf_ips.db"
+        if path == "/login":
+            self._send(200, LOGIN_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+            return
+        if path == "/logout":
+            self.send_response(302)
+            self.send_header("Location", "/login")
+            self.send_header("Set-Cookie", "s=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/wallpaper":
+            p = WP_CACHE
+            if os.path.exists(p):
+                with open(p, "rb") as fh:
+                    head = fh.read(8)
+                    data = head + fh.read()
+                ctype = ("image/png" if head.startswith(b"\x89PNG")
+                         else "image/webp" if head[:4] == b"RIFF" else "image/jpeg")
+                self._send(200, data, ctype)
+            else:
+                threading.Thread(target=lambda: refresh_wallpaper(True), daemon=True).start()
+                self.send_response(302)
+                self.send_header("Location", WP_FALLBACK)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            return
+        human = path == "/"
+        if not self._cred_ok():
+            has_basic = any(k.lower() == "authorization" for k in self.headers.keys())
+            if human and not has_basic:
+                self.send_response(302)
+                self.send_header("Location", "/login")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self._deny()
+            return
         try:
             if path == "/":
                 self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
-            elif path == "/wallpaper":
-                p = WP_CACHE
-                if os.path.exists(p):
-                    with open(p, "rb") as fh:
-                        head = fh.read(8)
-                        data = head + fh.read()
-                    ctype = ("image/png" if head.startswith(b"\x89PNG")
-                             else "image/webp" if head[:4] == b"RIFF" else "image/jpeg")
-                    self._send(200, data, ctype)
-                else:
-                    threading.Thread(target=lambda: refresh_wallpaper(True), daemon=True).start()
-                    self.send_response(302)
-                    self.send_header("Location", WP_FALLBACK)
-                    self.send_header("Cache-Control", "no-store")
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
-            elif path == "/vendor/ba-click-fx.js":
-                p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor", "ba-click-fx.js")
-                if os.path.exists(p):
-                    with open(p, "rb") as fh:
-                        self._send(200, fh.read(), "text/javascript; charset=utf-8")
-                else:
-                    self._send(404, b"", "text/plain")
             elif path == "/api/status":
                 st = get_state()
                 st["db"] = os.path.abspath(db)
@@ -930,10 +1011,43 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, json.dumps({"error": str(e)}).encode("utf-8"))
 
     def do_POST(self):
-        if not self._auth_ok():
-            return
         path = urlparse(self.path).path
+        if path == "/api/login":
+            ip = self.client_address[0]
+            rem = _lock_remaining(ip)
+            if rem:
+                self._send(423, json.dumps({"ok": False, "error": f"尝试次数过多, 请约{rem}分钟后再试"}).encode())
+                return
+            params = self._read_json()
+            sec = SECRET
+            if not sec:
+                self._send(200, b'{"ok":true}')
+                return
+            u_ = str(params.get("user") or "")
+            p_ = str(params.get("pass") or "")
+            if hmac.compare_digest(u_, sec["user"]) and hmac.compare_digest(p_, sec["pass"]):
+                LOGIN_FAILS.pop(ip, None)
+                tok = _session_token()
+                secure = "; Secure" if SECRET.get("https") else ""
+                body = b'{"ok":true}'
+                self.send_response(200)
+                self.send_header("Set-Cookie", f"s={tok}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL}{secure}")
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                _record_fail(ip)
+                body = json.dumps({"ok": False, "error": "用户名或密码错误"}, ensure_ascii=False).encode("utf-8")
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            return
         params = self._read_json()
+        if not self._gate():
+            return
         db = get_state()["db"] or DB or "cf_ips.db"
         try:
             if path == "/api/control":
@@ -1511,6 +1625,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <span style="flex:1"></span>
     <span id="dbpath" class="sub" style="margin:0;font-size:12px"></span>
     <span id="pill" class="pill idle">待命</span>
+    <button class="ghost mini" onclick="location.href='/logout'" title="退出登录" style="padding:5px 10px">⏻</button>
   </header>
   <div class="content">
     <section class="view on" id="v-overview">
@@ -2592,6 +2707,79 @@ applyTheme();
 </body>
 </html>
 """
+
+LOGIN_PAGE = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 · CF 优选台</title>
+<style>
+:root{--txt:#eef2fa;--dim:#c7d0e0;--err:#ffb4c0;--acc:#60a5fa}
+*{box-sizing:border-box;margin:0;padding:0}
+body{min-height:100vh;display:flex;align-items:center;justify-content:center;
+  background:#0b1020 url("/wallpaper") center/cover no-repeat fixed;
+  font-family:"Inter","HarmonyOS Sans SC","PingFang SC","Segoe UI",system-ui,sans-serif;color:var(--txt)}
+body::before{content:"";position:fixed;inset:0;background:rgba(6,10,20,.45);backdrop-filter:saturate(1.2)}
+.card{position:relative;width:min(360px,90vw);padding:34px 30px 28px;border-radius:18px;
+  background:rgba(16,22,38,.55);backdrop-filter:blur(24px) saturate(170%);
+  -webkit-backdrop-filter:blur(24px) saturate(170%);
+  border:1px solid rgba(255,255,255,.35);box-shadow:0 24px 70px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.25)}
+.logo{width:44px;height:44px;border-radius:13px;display:grid;place-items:center;margin:0 auto 14px;
+  background:linear-gradient(135deg,#4f8dff,#38d3f8);color:#fff;font-size:21px;font-weight:800;
+  box-shadow:0 6px 20px rgba(79,141,255,.45)}
+h1{font-size:17px;text-align:center;font-weight:750;letter-spacing:.5px;margin-bottom:4px}
+.sub{font-size:12.5px;text-align:center;color:var(--dim);margin-bottom:22px}
+label{display:block;font-size:12px;color:var(--dim);margin:12px 0 5px}
+input{width:100%;background:rgba(8,12,24,.55);border:1px solid rgba(255,255,255,.14);color:var(--txt);
+  border-radius:9px;padding:11px 12px;font-size:14px;outline:none;transition:border-color .2s,box-shadow .2s}
+input:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(96,165,250,.25)}
+button{width:100%;margin-top:18px;background:linear-gradient(120deg,#4f8dff,#38d3f8);color:#fff;
+  border:0;border-radius:9px;padding:12px;font-size:14.5px;font-weight:700;cursor:pointer;letter-spacing:.4px;
+  box-shadow:0 6px 18px rgba(79,141,255,.4);transition:filter .2s,transform .15s}
+button:hover{filter:brightness(1.1)}
+button:active{transform:scale(.98)}
+button:disabled{opacity:.55;cursor:not-allowed;transform:none}
+#msg{min-height:18px;margin-top:12px;font-size:12.5px;color:var(--err);text-align:center;line-height:1.5}
+.tip{margin-top:14px;padding-top:12px;border-top:1px solid rgba(255,255,255,.10);
+  font-size:11.5px;color:var(--dim);text-align:center;line-height:1.6}
+@media (max-width:480px){.card{padding:26px 22px 22px}}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">✦</div>
+  <h1>CF 优选台</h1>
+  <div class="sub">请登录以继续</div>
+  <form onsubmit="return doLogin()">
+    <label>用户名</label><input id="u" autocomplete="username" required>
+    <label>密码</label><input id="p" type="password" autocomplete="current-password" required>
+    <button id="btn" type="submit">登 录</button>
+    <div id="msg"></div>
+  </form>
+  <div class="tip">会话有效期 7 天 · 连续失败 5 次将锁定 15 分钟<br>命令行可用 curl -u 免弹窗访问 API</div>
+</div>
+<script>
+function doLogin(){
+  const b=document.getElementById("btn"),m=document.getElementById("msg");
+  b.disabled=true;b.textContent="登录中...";m.textContent="";
+  fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({user:document.getElementById("u").value.trim(),
+                         pass:document.getElementById("p").value})})
+  .then(async r=>{
+    let d={};try{d=await r.json()}catch(e){}
+    if(r.ok&&d.ok){location.href="/";return}
+    m.textContent=d.error||("登录失败 ("+r.status+")");
+    b.disabled=false;b.textContent="登 录";
+  })
+  .catch(e=>{m.textContent="网络错误: "+e;b.disabled=false;b.textContent="登 录"});
+  return false;
+}
+document.getElementById("u").focus();
+</script>
+</body>
+</html>"""
+
 
 
 def lan_ips():

@@ -693,24 +693,30 @@ def stop_scan():
     return {"ok": True}
 
 
-WP = {"url": "https://www.nasa.gov/wp-content/uploads/2026/03/over-the-horizon-%E2%80%93-desktop-%E2%80%93-image-only.png",
-      "ts": 0}
+WP_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "apod_bg.img")
+WP_FALLBACK = ("https://www.nasa.gov/wp-content/uploads/2026/03/"
+               "over-the-horizon-%E2%80%93-desktop-%E2%80%93-image-only.png")
+WP_STATE = {"date": None, "try": 0}
 
 
-def _wp_refresh():
-    """解析 NASA 每日一图(APOD)的图片直链; 仅请求JSON元数据,
-    壁纸本体由浏览器直连 NASA, 服务器不下载任何图片.
-    当日若是视频则逐天回退取最近一个图片日; 失败30分钟后重试.
-    可在 cf_settings.json 加 "nasa_api_key" 使用个人Key(DEMO_KEY限额50次/天)."""
+def refresh_wallpaper(force=False):
+    """每日一次: 解析 APOD 直链并下载缓存到本地 apod_bg.img.
+    当日为视频则逐天回退取最近图片日; 失败5分钟后重试, 期间沿用旧图."""
     now = time.time()
-    if now - WP.get("try", 0) < 60:
-        return
-    WP["try"] = now
+    today = time.strftime("%Y-%m-%d", time.gmtime(now))
+    has_cache = os.path.exists(WP_CACHE)
+    if (not force and WP_STATE.get("date") == today and has_cache
+            and not WP_STATE.get("fallback")):
+        return True
+    if now - WP_STATE.get("try", 0) < 300 and has_cache:
+        return False
+    WP_STATE["try"] = now
     key = "DEMO_KEY"
     try:
         key = (load_settings() or {}).get("nasa_api_key") or key
     except Exception:
         pass
+    url = None
     for delta in range(0, 4):
         d = time.strftime("%Y-%m-%d", time.gmtime(now - delta * 86400))
         try:
@@ -720,24 +726,35 @@ def _wp_refresh():
             with urllib.request.urlopen(req, timeout=10) as r:
                 j = json.loads(r.read().decode("utf-8", "replace"))
             if j.get("media_type") == "image" and j.get("url"):
-                WP["url"] = j["url"]
-                WP["ts"] = time.time()
-                return
+                url = j["url"]
+                break
         except Exception:
             break
-    WP["ts"] = now - 6 * 3600 + 1800
+    used_fallback = url is None
+    if not url:
+        url = WP_FALLBACK
+    try:
+        data = urllib.request.urlopen(
+            urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}),
+            timeout=30).read()
+        if len(data) > 100_000:
+            tmp = WP_CACHE + ".tmp"
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp, WP_CACHE)
+            WP_STATE["date"] = today
+            WP_STATE["fallback"] = used_fallback
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _wp_loop():
+    refresh_wallpaper()
     while True:
-        if time.time() - WP["ts"] >= 6 * 3600:
-            _wp_refresh()
         time.sleep(1800)
-
-
-def _wp_resolve_once():
-    WP["ts"] = 0
-    _wp_refresh()
+        refresh_wallpaper()
 
 
 def test_ip(db, params):
@@ -854,13 +871,21 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/":
                 self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
             elif path == "/wallpaper":
-                if time.time() - WP["ts"] >= 6 * 3600:
-                    threading.Thread(target=_wp_resolve_once, daemon=True).start()
-                self.send_response(302)
-                self.send_header("Location", WP["url"])
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Content-Length", "0")
-                self.end_headers()
+                p = WP_CACHE
+                if os.path.exists(p):
+                    with open(p, "rb") as fh:
+                        head = fh.read(8)
+                        data = head + fh.read()
+                    ctype = ("image/png" if head.startswith(b"\x89PNG")
+                             else "image/webp" if head[:4] == b"RIFF" else "image/jpeg")
+                    self._send(200, data, ctype)
+                else:
+                    threading.Thread(target=lambda: refresh_wallpaper(True), daemon=True).start()
+                    self.send_response(302)
+                    self.send_header("Location", WP_FALLBACK)
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
             elif path == "/vendor/ba-click-fx.js":
                 p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor", "ba-click-fx.js")
                 if os.path.exists(p):

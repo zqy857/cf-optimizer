@@ -249,16 +249,20 @@ def upsert(conn, rec):
                         route_as_list,route_class,route_hops,route_at,route_error)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(ip) DO UPDATE SET
-          port=CASE WHEN excluded.latency_ms IS NOT NULL THEN excluded.port ELSE port END,
-          latency_ms=CASE WHEN excluded.latency_ms IS NOT NULL THEN excluded.latency_ms ELSE latency_ms END,
-          tested_at=excluded.tested_at,
+          port=CASE WHEN excluded.latency_ms IS NOT NULL AND excluded.tested_at>=ips.tested_at
+                    THEN excluded.port ELSE port END,
+          latency_ms=CASE WHEN excluded.latency_ms IS NOT NULL AND excluded.tested_at>=ips.tested_at
+                    THEN excluded.latency_ms ELSE latency_ms END,
+          tested_at=CASE WHEN excluded.tested_at>ips.tested_at THEN excluded.tested_at ELSE ips.tested_at END,
           colo=COALESCE(excluded.colo,colo),
           loc=COALESCE(excluded.loc,loc),
           verified_at=COALESCE(excluded.verified_at,verified_at),
           bandwidth_mbps=CASE WHEN excluded.bandwidth_mbps IS NOT NULL AND (bandwidth_mbps IS NULL OR excluded.bandwidth_mbps > bandwidth_mbps)
                               THEN excluded.bandwidth_mbps ELSE bandwidth_mbps END,
-          bw_last_mbps=CASE WHEN excluded.bw_last_mbps IS NOT NULL THEN excluded.bw_last_mbps ELSE bw_last_mbps END,
-          bw_last_at=CASE WHEN excluded.bw_last_at IS NOT NULL THEN excluded.bw_last_at ELSE bw_last_at END,
+          bw_last_mbps=CASE WHEN excluded.bw_last_mbps IS NOT NULL AND excluded.tested_at>=ips.tested_at
+                       THEN excluded.bw_last_mbps ELSE bw_last_mbps END,
+          bw_last_at=CASE WHEN excluded.bw_last_mbps IS NOT NULL AND excluded.tested_at>=ips.tested_at
+                     THEN excluded.bw_last_at ELSE bw_last_at END,
           ok_count=ok_count+excluded.ok_count,
           fail_count=fail_count+excluded.fail_count,
           route_as_list=CASE WHEN excluded.route_as_list IS NOT NULL THEN excluded.route_as_list ELSE route_as_list END,

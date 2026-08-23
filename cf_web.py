@@ -2882,6 +2882,8 @@ def serve_forever(args, host, port):
         if not _ok6:
             _miss += ("/" if _miss else "") + "IPv6"
         print(f"  提示: {_tip} [当前无极速模式: {_miss}]", flush=True)
+    else:
+        print("  线路检测: 原生ICMP极速模式(约1秒/IP)", flush=True)
     if not args.no_browser:
         webbrowser.open(f"{scheme}://{local}:{port}/")
     try:

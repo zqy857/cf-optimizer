@@ -992,6 +992,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/":
                 self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
+            elif path == "/vendor/ba-click-fx.js":
+                vp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor", "ba-click-fx.js")
+                if os.path.exists(vp):
+                    with open(vp, "rb") as fh:
+                        self._send(200, fh.read(), "text/javascript; charset=utf-8")
+                else:
+                    self._send(404, b"", "text/plain")
             elif path == "/api/status":
                 st = get_state()
                 st["db"] = os.path.abspath(db)

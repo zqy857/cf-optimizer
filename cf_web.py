@@ -250,11 +250,18 @@ def _compute_stats(db):
     now = time.time()
     total = q_one(db, "SELECT COUNT(*) FROM ips")
     total = total[0] if total else 0
-    tested_all = q_one(db, "SELECT value FROM meta WHERE key='tested_total'")
+    tested_all = None
+    try:
+        tested_all = q_one(db, "SELECT value FROM meta WHERE key='tested_total'")
+    except Exception:
+        tested_all = None
     if tested_all and tested_all[0]:
         tested_all = tested_all[0]
     else:
-        g = q_one(db, "SELECT COUNT(*) FROM graveyard")
+        try:
+            g = q_one(db, "SELECT COUNT(*) FROM graveyard")
+        except Exception:
+            g = None
         tested_all = total + (g[0] if g else 0)
     alive = q_one(db, "SELECT COUNT(*) FROM ips WHERE ok_count>0")
     alive = alive[0] if alive else 0
@@ -2264,6 +2271,11 @@ def main():
     if args.status:
         daemon_status(args.pidfile)
         return
+    try:
+        import cf_db
+        cf_db.open_db(args.db).close()
+    except Exception:
+        pass
     init_secret()
     if args.child:
         child_main(args)

@@ -116,6 +116,10 @@ CREATE TABLE IF NOT EXISTS graveyard(
   ip TEXT PRIMARY KEY,
   buried_at REAL
 );
+CREATE TABLE IF NOT EXISTS meta(
+  key TEXT PRIMARY KEY,
+  value INTEGER NOT NULL DEFAULT 0
+);
 """
 
 ROUTE_INDEX_SQL = "CREATE INDEX IF NOT EXISTS idx_ips_route_class ON ips(route_class)"
@@ -168,7 +172,15 @@ def open_db(path):
         conn.execute(ROUTE_INDEX_SQL)
     except Exception:
         pass
-    conn.commit()
+    # 累计测试计数器: 首次使用时以 库内+墓碑 为基数播种, 之后由 upsert 对新IP累加, 剪枝不扣减
+    try:
+        conn.execute(
+            "INSERT INTO meta(key,value) "
+            "SELECT 'tested_total',(SELECT COUNT(*) FROM ips)+(SELECT COUNT(*) FROM graveyard) "
+            "WHERE NOT EXISTS(SELECT 1 FROM meta WHERE key='tested_total')")
+        conn.commit()
+    except Exception:
+        pass
     return conn
 
 
@@ -227,6 +239,8 @@ def upsert(conn, rec):
         return
     ok = 1 if rec.get("ok") else 0
     fail = 0 if ok else 1
+    is_new = conn.execute("SELECT 1 FROM ips WHERE ip=? LIMIT 1",
+                          (rec["ip"],)).fetchone() is None
     conn.execute(
         """
         INSERT INTO ips(ip,port,colo,loc,latency_ms,bandwidth_mbps,
@@ -266,6 +280,13 @@ def upsert(conn, rec):
             rec.get("route_error"),
         ),
     )
+    if is_new:
+        try:
+            conn.execute(
+                "INSERT INTO meta(key,value) VALUES('tested_total',1) "
+                "ON CONFLICT(key) DO UPDATE SET value=value+1")
+        except Exception:
+            pass
 
 
 PRUNE_SCORE_SQL = (

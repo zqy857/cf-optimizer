@@ -250,6 +250,12 @@ def _compute_stats(db):
     now = time.time()
     total = q_one(db, "SELECT COUNT(*) FROM ips")
     total = total[0] if total else 0
+    tested_all = q_one(db, "SELECT value FROM meta WHERE key='tested_total'")
+    if tested_all and tested_all[0]:
+        tested_all = tested_all[0]
+    else:
+        g = q_one(db, "SELECT COUNT(*) FROM graveyard")
+        tested_all = total + (g[0] if g else 0)
     alive = q_one(db, "SELECT COUNT(*) FROM ips WHERE ok_count>0")
     alive = alive[0] if alive else 0
     verified = q_one(db, "SELECT COUNT(*) FROM ips WHERE verified_at IS NOT NULL")
@@ -322,6 +328,7 @@ def _compute_stats(db):
                        key=lambda x: x["count"], reverse=True)[:12]
     return {
         "total": total, "alive": alive, "verified": verified, "withbw": withbw,
+        "tested_all": tested_all,
         "avglat": avglat, "maxbw": maxbw, "bwbest": bwbest, "minlat": minlat,
         "coverage": round(total / COV_TOTAL * 100, 3) if COV_TOTAL else 0,
         "route_done": route_done, "premium": premium,
@@ -1732,7 +1739,7 @@ async function poll(){
     renderLog(st.log||[]);
     const s=await (await fetch("/api/stats")).json();
     STATS=s;
-    countTo("st_total",s.total,true);
+    countTo("st_total",s.tested_all??s.total,true);
     countTo("st_alive",s.alive,true);
     countTo("st_verified",s.verified,true);
     countTo("st_bw",s.withbw,true);
@@ -1774,10 +1781,10 @@ const CNT={};function countTo(id,val,fmtK,sfx){
 let STATS=null;
 function statTipSetup(){
   const map={
-    st_total:{t:"已测试IP",c:"var(--acc)",rows:s=>[["总发现",s.total,"#fff"],["覆盖率",s.coverage+"%","#22c55e"]]},
+    st_total:{t:"已测试IP",c:"var(--acc)",rows:s=>[["累计测试",s.tested_all??s.total,"#fff"],["库内保留",s.total,"#22c55e"],["覆盖率",s.coverage+"%","#22c55e"]]},
     st_alive:{t:"存活IP",c:"var(--acc2)",rows:s=>{const dead=s.total-s.alive;return [["当前存活",s.alive,"#22c55e"],["不可用",dead,"#ef4444"],["存活率",s.total?Math.round(s.alive/s.total*100)+"%":"-","#fff"]]}},
-    st_verified:{t:"已验证地区",c:"var(--purp)",rows:s=>[["已验证",s.verified,"#8b5cf6"],["已测试",s.total,"#fff"]]},
-    st_bw:{t:"有带宽数据",c:"var(--acc)",rows:s=>[["有带宽",s.withbw,"#22c55e"],["已测试",s.total,"#fff"],["占比",s.total?Math.round(s.withbw/s.total*100)+"%":"-","#fff"]]},
+    st_verified:{t:"已验证地区",c:"var(--purp)",rows:s=>[["已验证",s.verified,"#8b5cf6"],["累计测试",s.tested_all??s.total,"#fff"]]},
+    st_bw:{t:"有带宽数据",c:"var(--acc)",rows:s=>[["有带宽",s.withbw,"#22c55e"],["累计测试",s.tested_all??s.total,"#fff"],["占比",s.tested_all?Math.round(s.withbw/s.tested_all*100)+"%":"-","#fff"]]},
     st_avglat:{t:"平均延迟",c:"var(--warn)",rows:s=>[["平均值",s.avglat??"-","#f59e0b"],["最低",s.minlat??"-","#fff"]]},
     st_maxbw:{t:"最高带宽",c:"var(--acc)",rows:s=>[["最近最高",s.maxbw??"-","#fff"],["历史最高",s.bwbest??"-","#22c55e"]]},
     st_minlat:{t:"最低延迟",c:"var(--warn)",rows:s=>[["最低",s.minlat??"-","#fff"],["平均",s.avglat??"-","#f59e0b"]]},

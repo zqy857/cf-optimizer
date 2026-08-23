@@ -940,8 +940,7 @@ PAGE = r"""<!DOCTYPE html>
   --c-label:#9ba1ad;
   --c-txt:#e8e8ec;
   --c-emph:#ffffff;
-  --cur-c1:#7dd3fc;
-  --cur-c2:#8b9dff;
+  --halo:rgba(96,165,250,.075);
   --scrim:rgba(6,9,15,.52);
   --grid:rgba(255,255,255,.065);
   --glass-fill:rgba(16,20,28,.62);
@@ -978,8 +977,7 @@ html[data-theme="light"]{
   --c-label:#6b7484;
   --c-txt:#1d2129;
   --c-emph:#0f172a;
-  --cur-c1:#2563eb;
-  --cur-c2:#7c3aed;
+  --halo:rgba(37,99,235,.065);
   --scrim:rgba(246,247,250,.44);
   --grid:#d9dde2;
   --glass-fill:rgba(255,255,255,.68);
@@ -1011,14 +1009,10 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;background:var(--scrim
 .h{font-size:15px;font-weight:700;margin-bottom:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .h .sub{font-weight:400;margin:0}
 
-/* ================= 鼠标光效 ================= */
-#fx-canvas{position:fixed;inset:0;z-index:900;pointer-events:none}
-#cur-dot,#cur-ring{position:fixed;top:0;left:0;z-index:901;pointer-events:none;border-radius:50%;opacity:0}
-#cur-dot{width:6px;height:6px;background:var(--cur-c1);box-shadow:0 0 12px var(--cur-c1)}
-#cur-ring{width:30px;height:30px;border:1.5px solid var(--cur-c2);opacity:.75;
-  transition:width .18s ease,height .18s ease,border-color .18s ease,opacity .25s ease}
-body.cur-fx, body.cur-fx *{cursor:none !important}
-body.cur-fx input, body.cur-fx select, body.cur-fx textarea{cursor:text !important}
+/* ================= 鼠标光晕 ================= */
+#cur-halo{position:fixed;top:0;left:0;width:360px;height:360px;z-index:1;
+  pointer-events:none;border-radius:50%;opacity:0;transition:opacity .45s ease;
+  background:radial-gradient(circle,var(--halo) 0%,transparent 62%)}
 
 /* ================= 背景漂移光团(液态玻璃的折射源) ================= */
 .wallpaper{position:fixed;inset:-3.5%;z-index:-2;pointer-events:none;
@@ -1052,7 +1046,7 @@ html[data-theme="light"] .blobs i:nth-child(4){background:radial-gradient(circle
   .wallpaper{animation:none !important}
   .view.on .card,tbody tr.rowIn,.logline{animation:none !important}
   button::after{display:none}
-  #fx-canvas,#cur-dot,#cur-ring{display:none !important}
+  #cur-halo{display:none !important}
 }
 
 /* ================= 侧边栏 ================= */
@@ -2427,60 +2421,18 @@ $("themeBtn").onclick=()=>{
 };
 if(_mq.addEventListener)_mq.addEventListener("change",applyTheme);else if(_mq.addListener)_mq.addListener(applyTheme);
 
-/* ================= 鼠标光效引擎(仅精确指针设备) ================= */
 if(matchMedia("(pointer:fine)").matches && !matchMedia("(prefers-reduced-motion: reduce)").matches){
-  document.body.classList.add("cur-fx");
-  const cv=document.createElement("canvas");cv.id="fx-canvas";document.body.appendChild(cv);
-  const dot=document.createElement("div");dot.id="cur-dot";document.body.appendChild(dot);
-  const ring=document.createElement("div");ring.id="cur-ring";document.body.appendChild(ring);
-  const cx=cv.getContext("2d");
-  let FW,FH;const fit=()=>{FW=cv.width=innerWidth;FH=cv.height=innerHeight};
-  fit();addEventListener("resize",fit);
-  const cvar=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
-  const rgbc={};
-  const rgb=h=>{if(!h||h[0]!=="#")return [125,211,252];if(rgbc[h])return rgbc[h];
-    let s=h.slice(1);if(s.length===3)s=[...s].map(c=>c+c).join("");
-    const n=parseInt(s,16);return rgbc[h]=[(n>>16)&255,(n>>8)&255,n&255]};
-  let mx=innerWidth/2,my=innerHeight/2,rx=mx,ry=my,lx=mx,ly=my,seen=false,lastSpawn=0;
-  const parts=[];
-  addEventListener("mousemove",e=>{
-    mx=e.clientX;my=e.clientY;
-    if(!seen){seen=true;rx=mx;ry=my;dot.style.opacity=1;ring.style.opacity=.75}
-    dot.style.transform=`translate(calc(${mx}px - 50%),calc(${my}px - 50%))`;
-    const d=Math.hypot(mx-lx,my-ly);lx=mx;ly=my;
-    const now=performance.now();
-    if(d>5&&now-lastSpawn>34&&parts.length<60){lastSpawn=now;
-      parts.push({x:mx+(Math.random()*16-8),y:my+(Math.random()*16-8),
-        vx:(Math.random()-.5)*.8,vy:.3+Math.random()*.55,
-        life:1,decay:.018+Math.random()*.02,size:d>24?2.4:1.7,
-        star:Math.random()<.26,c:cvar("--cur-c1")})}
-  });
-  document.documentElement.addEventListener("mouseleave",()=>{seen=false;dot.style.opacity=0;ring.style.opacity=0});
-  document.documentElement.addEventListener("mouseenter",()=>{if(mx||my){seen=true;dot.style.opacity=1;ring.style.opacity=.75}});
-  addEventListener("mouseover",e=>{
-    const hot=e.target.closest("button,a,.nv,input,select,label,th,[onclick]");
-    ring.style.width=hot?"44px":"30px";ring.style.height=hot?"44px":"30px";
-    ring.style.borderColor=hot?cvar("--cur-c1"):"";
-  });
-  addEventListener("mousedown",e=>{
-    for(let k=0;k<10;k++){const a=Math.PI*2*k/10+Math.random()*.5,v=1.7+Math.random()*1.3;
-      parts.push({x:e.clientX,y:e.clientY,vx:Math.cos(a)*v,vy:Math.sin(a)*v,
-        life:1,decay:.03,size:1.9,star:false,c:cvar("--cur-c2")})}
-  });
+  const halo=document.createElement("div");halo.id="cur-halo";document.body.appendChild(halo);
+  let hx=innerWidth/2,hy=innerHeight/2,tx=hx,ty=hy,lit=false;
+  addEventListener("mousemove",e=>{tx=e.clientX;ty=e.clientY;
+    if(!lit){lit=true;hx=tx;hy=ty;halo.style.opacity=1}});
+  document.documentElement.addEventListener("mouseleave",()=>{lit=false;halo.style.opacity=0});
+  document.documentElement.addEventListener("mouseenter",()=>{if(tx||ty){lit=true;halo.style.opacity=1}});
+  addEventListener("mousedown",()=>{halo.style.transition="none";halo.style.width="300px";halo.style.height="300px";
+    requestAnimationFrame(()=>{halo.style.transition="";halo.style.width="360px";halo.style.height="360px"})});
   (function loop(){
-    rx+=(mx-rx)*.16;ry+=(my-ry)*.16;
-    ring.style.transform=`translate(calc(${rx}px - 50%),calc(${ry}px - 50%))`;
-    cx.clearRect(0,0,FW,FH);
-    for(let i=parts.length-1;i>=0;i--){const p=parts[i];
-      p.x+=p.vx;p.y+=p.vy;p.vy+=.015;p.life-=p.decay;
-      if(p.life<=0){parts.splice(i,1);continue}
-      const[r,g,b]=rgb(p.c);
-      cx.fillStyle=`rgba(${r},${g},${b},${(p.life*.92).toFixed(3)})`;
-      if(p.star){cx.save();cx.translate(p.x,p.y);cx.rotate(Math.PI/4);
-        cx.fillRect(-p.size*1.5,-p.size*.33,p.size*3,p.size*.66);
-        cx.rotate(Math.PI/2);cx.fillRect(-p.size*1.5,-p.size*.33,p.size*3,p.size*.66);cx.restore()}
-      else{cx.beginPath();cx.arc(p.x,p.y,Math.max(.4,p.size*p.life),0,7);cx.fill()}
-    }
+    hx+=(tx-hx)*.11;hy+=(ty-hy)*.11;
+    halo.style.transform=`translate(calc(${hx.toFixed(1)}px - 50%),calc(${hy.toFixed(1)}px - 50%))`;
     requestAnimationFrame(loop);
   })();
 }

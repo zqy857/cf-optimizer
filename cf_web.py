@@ -870,12 +870,12 @@ PAGE = r"""<!DOCTYPE html>
    ============================================================ */
 :root{
   --bg:#080a18;
-  --panel:rgba(148,163,184,.055);
+  --panel:rgba(148,163,184,.075);
   --panel2:rgba(148,163,184,.10);
-  --line:rgba(148,163,184,.16);
+  --line:rgba(148,163,184,.21);
   --line2:rgba(148,163,184,.30);
-  --txt:#e9eef7;
-  --dim:#8b97ab;
+  --txt:#f0f4fb;
+  --dim:#96a2b6;
   --acc:#8b7bff;
   --acc2:#2fd6a3;
   --warn:#fbbf24;
@@ -896,13 +896,13 @@ PAGE = r"""<!DOCTYPE html>
   --c-emph:#ffffff;
 }
 html[data-theme="light"]{
-  --bg:#f2f4fc;
-  --panel:rgba(255,255,255,.66);
-  --panel2:rgba(255,255,255,.92);
-  --line:rgba(15,23,42,.10);
-  --line2:rgba(15,23,42,.22);
-  --txt:#232c40;
-  --dim:#64748b;
+  --bg:#eef1f8;
+  --panel:#ffffff;
+  --panel2:#ffffff;
+  --line:rgba(15,23,42,.15);
+  --line2:rgba(15,23,42,.30);
+  --txt:#1b2434;
+  --dim:#4d5c75;
   --acc:#7c6cf6;
   --acc2:#0ea472;
   --warn:#d97706;
@@ -938,9 +938,8 @@ body{
 }
 html[data-theme="light"] body{
   background:
-    radial-gradient(1100px 520px at 10% -10%, rgba(56,189,248,.10), transparent 58%),
-    radial-gradient(1000px 560px at 98% -6%, rgba(139,123,255,.12), transparent 55%),
-    radial-gradient(900px 620px at 50% 118%, rgba(56,211,248,.10), transparent 58%),
+    radial-gradient(1100px 520px at 10% -10%, rgba(56,189,248,.07), transparent 58%),
+    radial-gradient(1000px 560px at 98% -6%, rgba(139,123,255,.08), transparent 55%),
     var(--bg);
 }
 ::selection{background:rgba(99,148,255,.30)}
@@ -1047,7 +1046,7 @@ body.side-mini .collapse-btn{transform:rotate(180deg)}
   box-shadow:var(--shadow), inset 0 1px 0 rgba(255,255,255,.05);
   transition:transform .28s cubic-bezier(.2,.7,.3,1),box-shadow .28s ease,border-color .28s ease;
 }
-html[data-theme="light"] .card{background:linear-gradient(175deg,rgba(255,255,255,.82),rgba(255,255,255,.55));
+html[data-theme="light"] .card{background:#ffffff;
   box-shadow:var(--shadow), inset 0 1px 0 rgba(255,255,255,.8)}
 .card:hover{transform:translateY(-2px);border-color:var(--line2);
   box-shadow:0 16px 44px rgba(2,6,18,.5), inset 0 1px 0 rgba(255,255,255,.07)}
@@ -1071,7 +1070,7 @@ html[data-theme="light"] .card{background:linear-gradient(175deg,rgba(255,255,25
   border:1px solid var(--line);border-radius:13px;padding:14px 14px 12px;
   transition:transform .22s cubic-bezier(.2,.7,.3,1.15),box-shadow .22s ease,border-color .22s ease;
 }
-html[data-theme="light"] .stat{background:linear-gradient(170deg,#ffffff,rgba(255,255,255,.65))}
+html[data-theme="light"] .stat{background:#ffffff}
 .stat::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;
   background:var(--grad);opacity:0;transition:opacity .22s ease}
 .stat:hover{transform:translateY(-3px) scale(1.03);border-color:rgba(139,123,255,.55);
@@ -1171,7 +1170,7 @@ footer .link{color:var(--cyan);cursor:pointer;text-decoration:underline;text-und
 /* ---------- 图表 ---------- */
 .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:15px}
 .chart{background:rgba(7,11,21,.30);border:1px solid rgba(148,163,184,.10);border-radius:12px;padding:12px}
-html[data-theme="light"] .chart{background:rgba(255,255,255,.55);border-color:var(--line)}
+html[data-theme="light"] .chart{background:#ffffff;border-color:var(--line)}
 .chart h3{font-size:13px;color:var(--dim);margin-bottom:8px;font-weight:600;letter-spacing:.3px}
 canvas{width:100%;height:250px}
 #chartTip{position:fixed;z-index:9999;pointer-events:none;background:rgba(13,18,33,.94);

@@ -956,45 +956,8 @@ PAGE = r"""<!DOCTYPE html>
   --shadow-a:.30;
   --rim:inset 0 0 0 1px rgba(255,255,255,.05);
 }
-html[data-theme="light"]{
-  --bg:#f5f5f7;
-  --panel:#ffffff;
-  --panel2:#f2f3f5;
-  --line:#e0e2e8;
-  --line2:#bfc4cc;
-  --txt:#1d2129;
-  --dim:#4e5969;
-  --acc:#2563eb;
-  --acc2:#059669;
-  --warn:#d97706;
-  --err:#dc2626;
-  --purp:#7c3aed;
-  --cyan:#0891b2;
-  --pink:#2563eb;
-  --grad:#2563eb;
-  --grad-v:#2563eb;
-  --shadow:0 1px 3px rgba(31,41,55,.08);
-  --glow:0 6px 18px rgba(37,99,235,.12);
-  --tb-bg:rgba(255,255,255,.62);
-  --thead-bg:rgba(247,248,250,.96);
-  --input-bg:#ffffff;
-  --log-bg:#f7f8fa;
-  --log-txt:#3a4150;
-  --c-label:#6b7484;
-  --c-txt:#1d2129;
-  --c-emph:#0f172a;
-  --scrim:rgba(246,247,250,.44);
-  --grid:#d9dde2;
-  --glass-fill:rgba(255,255,255,.68);
-  --glass-side:rgba(255,255,255,.74);
-  --edge:rgba(51,51,51,.10);
-  --gloss:.32;
-  --shadow-a:.12;
-  --rim:inset 2px -2px 1px -1px rgba(255,255,255,.85),inset -2px 2px 1px -1px rgba(255,255,255,.85),inset 6px -6px 1px -6px rgba(255,255,255,.48),inset -6px 6px 1px -6px rgba(255,255,255,.48),inset 0 0 2px rgba(0,0,0,.22);
-}
 *{box-sizing:border-box;margin:0;padding:0}
 html{color-scheme:dark}
-html[data-theme="light"]{color-scheme:light}
 body{
   background-color:var(--bg);
   position:relative;
@@ -1042,10 +1005,6 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;background:var(--scrim
 .blobs i:nth-child(4){width:30vmax;height:30vmax;right:20vw;bottom:-12vmax;
   background:radial-gradient(circle at 50% 50%,rgba(47,214,163,.15),transparent 66%);
   animation:drift4 31s ease-in-out infinite alternate}
-html[data-theme="light"] .blobs i:nth-child(1){background:radial-gradient(circle at 40% 40%,rgba(79,141,255,.30),transparent 62%)}
-html[data-theme="light"] .blobs i:nth-child(2){background:radial-gradient(circle at 58% 42%,rgba(56,211,248,.30),transparent 62%)}
-html[data-theme="light"] .blobs i:nth-child(3){background:radial-gradient(circle at 50% 45%,rgba(96,165,250,.24),transparent 62%)}
-html[data-theme="light"] .blobs i:nth-child(4){background:radial-gradient(circle at 50% 50%,rgba(47,214,163,.18),transparent 64%)}
 @keyframes drift1{from{transform:translate(0,0) scale(1)}to{transform:translate(10vw,8vh) scale(1.18)}}
 @keyframes drift2{from{transform:translate(0,0) scale(1.05)}to{transform:translate(-9vw,10vh) scale(.92)}}
 @keyframes drift3{from{transform:translate(0,0) scale(.95)}to{transform:translate(12vw,-8vh) scale(1.12)}}
@@ -1065,10 +1024,6 @@ html[data-theme="light"] .blobs i:nth-child(4){background:radial-gradient(circle
   box-shadow:inset -1px 0 0 var(--edge);-webkit-
   border-right:1px solid var(--line);
   transition:width .3s cubic-bezier(.2,.7,.3,1),transform .32s cubic-bezier(.2,.7,.3,1);
-}
-html[data-theme="light"] .side{
-  background:var(--glass-side);
-  box-shadow:6px 0 30px rgba(51,65,105,.06);
 }
 .brand{position:relative;display:flex;align-items:center;gap:11px;padding:18px 16px 14px;border-bottom:1px solid var(--line)}
 .logo{
@@ -1405,26 +1360,9 @@ tr.just-tested{outline:2px solid rgba(47,214,163,.65);outline-offset:-2px;backgr
 @media (min-width:921px){ .scrim{display:none} }
 
 /* 浅色主题下的弹窗与横幅 */
-html[data-theme="light"] .modal{
-  background:linear-gradient(175deg,rgba(255,255,255,.97),rgba(248,250,255,.94));
-  box-shadow:0 24px 70px rgba(51,65,105,.22);
-}
-html[data-theme="light"] .modal h2{color:var(--txt)}
 
-html[data-theme="light"] #routeDiag{color:#be123c;background:rgba(225,29,99,.07)}
-html[data-theme="light"] #routeDiag b{color:#9f1239}
-html[data-theme="light"] #routeDiag code{background:rgba(15,23,42,.08)}
-html[data-theme="light"] .pin-bar{color:#0f766e;background:rgba(14,164,114,.09)}
-html[data-theme="light"] tr.just-tested{outline-color:rgba(14,164,114,.6)}
 
 /* 浅色主题下的悬停详情弹层 */
-html[data-theme="light"] .f .tip .pop{background:rgba(255,255,255,.98);border-color:var(--line2);
-  box-shadow:0 12px 32px rgba(51,65,105,.18)}
-html[data-theme="light"] #chartTip{background:rgba(255,255,255,.98)}
-html[data-theme="light"] #chartTip .t-title{color:var(--txt)}
-html[data-theme="light"] #chartTip .t-row .k{color:var(--dim)}
-html[data-theme="light"] #chartTip .t-row .v{color:var(--txt)}
-html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-color:rgba(15,23,42,.10)}
 .content{overflow-x:clip}
 
 @media (max-width:720px){

@@ -700,12 +700,22 @@ WP = {"url": "https://www.nasa.gov/wp-content/uploads/2026/03/over-the-horizon-%
 def _wp_refresh():
     """解析 NASA 每日一图(APOD)的图片直链; 仅请求JSON元数据,
     壁纸本体由浏览器直连 NASA, 服务器不下载任何图片.
-    当日若是视频则逐天回退取最近一个图片日; 全部失败15分钟后重试."""
+    当日若是视频则逐天回退取最近一个图片日; 失败30分钟后重试.
+    可在 cf_settings.json 加 "nasa_api_key" 使用个人Key(DEMO_KEY限额50次/天)."""
+    now = time.time()
+    if now - WP.get("try", 0) < 60:
+        return
+    WP["try"] = now
+    key = "DEMO_KEY"
+    try:
+        key = (load_settings() or {}).get("nasa_api_key") or key
+    except Exception:
+        pass
     for delta in range(0, 4):
-        d = time.strftime("%Y-%m-%d", time.gmtime(time.time() - delta * 86400))
+        d = time.strftime("%Y-%m-%d", time.gmtime(now - delta * 86400))
         try:
             req = urllib.request.Request(
-                f"https://api.nasa.gov/planetary/apod?api_key=DEMO_KEY&date={d}",
+                f"https://api.nasa.gov/planetary/apod?api_key={key}&date={d}",
                 headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=10) as r:
                 j = json.loads(r.read().decode("utf-8", "replace"))
@@ -715,7 +725,7 @@ def _wp_refresh():
                 return
         except Exception:
             break
-    WP["ts"] = time.time() - 6 * 3600 + 900
+    WP["ts"] = now - 6 * 3600 + 1800
 
 
 def _wp_loop():
@@ -848,6 +858,7 @@ class Handler(BaseHTTPRequestHandler):
                     threading.Thread(target=_wp_resolve_once, daemon=True).start()
                 self.send_response(302)
                 self.send_header("Location", WP["url"])
+                self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
             elif path == "/vendor/ba-click-fx.js":
@@ -1647,7 +1658,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     </section>
     <section class="view" id="v-fx">
       <div class="card">
-        <div class="h">✨ 点击特效设置<span class="sub">蔚蓝档案风格点击特效与光标拖尾 · 调整即时生效并自动保存 · 手机触屏同样支持</span></div>
+        <div class="h">✨ 点击特效设置<span class="sub">蔚蓝档案风格点击特效与光标拖尾 · 调整即时生效并自动保存</span></div>
         <div class="row">
           <div class="chk"><input type="checkbox" id="fxClick" checked><label for="fxClick">点击特效</label></div>
           <div class="chk"><input type="checkbox" id="fxTrail" checked><label for="fxTrail">光标拖尾</label></div>

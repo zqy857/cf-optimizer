@@ -894,6 +894,7 @@ PAGE = r"""<!DOCTYPE html>
   --rim-lo:rgba(255,255,255,.03);
   --rim-ga:rgba(255,255,255,.36);
   --rim-gb:rgba(139,123,255,.30);
+  --spot:rgba(150,170,255,.09);
   --thead-bg:rgba(11,16,30,.92);
   --input-bg:rgba(7,10,22,.55);
   --log-bg:rgba(4,7,14,.68);
@@ -927,6 +928,7 @@ html[data-theme="light"]{
   --rim-lo:rgba(15,23,42,.05);
   --rim-ga:rgba(255,255,255,.98);
   --rim-gb:rgba(124,108,246,.38);
+  --spot:rgba(124,108,246,.11);
   --thead-bg:rgba(255,255,255,.94);
   --input-bg:#ffffff;
   --log-bg:#10162b;
@@ -963,6 +965,31 @@ html[data-theme="light"] body{
 .sub{color:var(--dim);font-size:13px}
 .h{font-size:15px;font-weight:700;margin-bottom:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .h .sub{font-weight:400;margin:0}
+
+/* ================= 背景漂移光团(液态玻璃的折射源) ================= */
+.blobs{position:fixed;inset:0;z-index:-1;pointer-events:none;overflow:hidden}
+.blobs i{position:absolute;border-radius:50%;will-change:transform}
+.blobs i:nth-child(1){width:46vmax;height:46vmax;left:-14vmax;top:-16vmax;
+  background:radial-gradient(circle at 40% 40%,rgba(79,141,255,.32),transparent 64%);
+  animation:drift1 44s ease-in-out infinite alternate}
+.blobs i:nth-child(2){width:42vmax;height:42vmax;right:-15vmax;top:4vmax;
+  background:radial-gradient(circle at 58% 42%,rgba(56,211,248,.27),transparent 64%);
+  animation:drift2 37s ease-in-out infinite alternate}
+.blobs i:nth-child(3){width:54vmax;height:54vmax;left:20vw;bottom:-26vmax;
+  background:radial-gradient(circle at 50% 45%,rgba(139,123,255,.26),transparent 64%);
+  animation:drift3 51s ease-in-out infinite alternate}
+.blobs i:nth-child(4){width:30vmax;height:30vmax;right:20vw;bottom:-12vmax;
+  background:radial-gradient(circle at 50% 50%,rgba(47,214,163,.15),transparent 66%);
+  animation:drift4 31s ease-in-out infinite alternate}
+html[data-theme="light"] .blobs i:nth-child(1){background:radial-gradient(circle at 40% 40%,rgba(79,141,255,.30),transparent 62%)}
+html[data-theme="light"] .blobs i:nth-child(2){background:radial-gradient(circle at 58% 42%,rgba(56,211,248,.30),transparent 62%)}
+html[data-theme="light"] .blobs i:nth-child(3){background:radial-gradient(circle at 50% 45%,rgba(139,123,255,.24),transparent 62%)}
+html[data-theme="light"] .blobs i:nth-child(4){background:radial-gradient(circle at 50% 50%,rgba(47,214,163,.18),transparent 64%)}
+@keyframes drift1{from{transform:translate(0,0) scale(1)}to{transform:translate(10vw,8vh) scale(1.18)}}
+@keyframes drift2{from{transform:translate(0,0) scale(1.05)}to{transform:translate(-9vw,10vh) scale(.92)}}
+@keyframes drift3{from{transform:translate(0,0) scale(.95)}to{transform:translate(12vw,-8vh) scale(1.12)}}
+@keyframes drift4{from{transform:translate(0,0) scale(1)}to{transform:translate(-8vw,-6vh) scale(1.2)}}
+@media (prefers-reduced-motion:reduce){.blobs i{animation:none !important}}
 
 /* ================= 侧边栏 ================= */
 .side{
@@ -1064,7 +1091,7 @@ body.side-mini .collapse-btn{transform:rotate(180deg)}
   -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
   -webkit-mask-composite:xor;mask-composite:exclude}
 .card::after{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;
-  background:radial-gradient(460px circle at var(--px,50%) var(--py,-30%),rgba(255,255,255,.13),transparent 62%);
+  background:radial-gradient(290px circle at var(--px,50%) var(--py,-30%),var(--spot),transparent 60%);
   opacity:0;transition:opacity .4s ease}
 .card:hover::after{opacity:1}
 .card:hover{transform:translateY(-2px);box-shadow:0 18px 52px rgba(2,6,18,calc(var(--shadow-a)*1.35)), inset 0 1px 0 var(--rim-hi)}
@@ -1378,6 +1405,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
 }
 </style>
 <body>
+<div class="blobs" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
 <div class="scrim" id="scrim"></div>
 <aside class="side" id="side">
   <div class="brand">

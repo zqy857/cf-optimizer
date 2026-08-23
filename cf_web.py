@@ -34,6 +34,7 @@ import types
 import webbrowser
 import base64
 import hmac
+import urllib.request
 import secrets
 import string
 import subprocess
@@ -692,6 +693,40 @@ def stop_scan():
     return {"ok": True}
 
 
+def _bg_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "bing_bg.jpg")
+
+
+def refresh_bing_bg(max_age=6 * 3600):
+    """抓取 Bing 每日壁纸缓存为 bing_bg.jpg (6小时新鲜期); 失败静默保留旧图"""
+    p = _bg_path()
+    try:
+        if os.path.exists(p) and time.time() - os.path.getmtime(p) < max_age:
+            return True
+        req = urllib.request.Request(
+            "https://cn.bing.com/HPImageArchive.aspx?format=js&idx=0&n=1",
+            headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            u = json.loads(r.read().decode("utf-8", "replace"))["images"][0]["url"]
+        if u.startswith("/"):
+            u = "https://cn.bing.com" + u
+        data = urllib.request.urlopen(
+            urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"}), timeout=20).read()
+        tmp = p + ".tmp"
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, p)
+        return True
+    except Exception:
+        return False
+
+
+def _bg_loop():
+    while True:
+        refresh_bing_bg()
+        time.sleep(3600)
+
+
 def test_ip(db, params):
     ip = (params.get("ip") or "").strip()
     act = params.get("action") or "lat"
@@ -805,6 +840,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/":
                 self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
+            elif path == "/bg.jpg":
+                p = _bg_path()
+                if os.path.exists(p):
+                    with open(p, "rb") as fh:
+                        self._send(200, fh.read(), "image/jpeg")
+                else:
+                    self._send(404, b"", "text/plain")
             elif path == "/api/status":
                 st = get_state()
                 st["db"] = os.path.abspath(db)
@@ -887,7 +929,7 @@ PAGE = r"""<!DOCTYPE html>
   --grad-v:#93c5fd;
   --shadow:0 1px 3px rgba(0,0,0,.4);
   --glow:0 6px 18px rgba(37,99,235,.16);
-  --tb-bg:rgba(13,15,19,.66);
+  --tb-bg:rgba(10,13,19,.55);
   --thead-bg:rgba(22,22,24,.95);
   --input-bg:#131316;
   --log-bg:#101114;
@@ -895,9 +937,10 @@ PAGE = r"""<!DOCTYPE html>
   --c-label:#9ba1ad;
   --c-txt:#e8e8ec;
   --c-emph:#ffffff;
+  --scrim:rgba(6,9,15,.52);
   --grid:rgba(255,255,255,.065);
-  --glass-fill:rgba(30,36,45,.34);
-  --glass-side:rgba(15,18,23,.55);
+  --glass-fill:rgba(18,22,30,.50);
+  --glass-side:rgba(14,17,23,.58);
   --edge:rgba(255,255,255,.09);
   --gloss:.09;
   --shadow-a:.30;
@@ -922,7 +965,7 @@ html[data-theme="light"]{
   --grad-v:#2563eb;
   --shadow:0 1px 3px rgba(31,41,55,.08);
   --glow:0 6px 18px rgba(37,99,235,.12);
-  --tb-bg:rgba(247,248,250,.70);
+  --tb-bg:rgba(255,255,255,.55);
   --thead-bg:rgba(247,248,250,.96);
   --input-bg:#ffffff;
   --log-bg:#f7f8fa;
@@ -930,9 +973,10 @@ html[data-theme="light"]{
   --c-label:#6b7484;
   --c-txt:#1d2129;
   --c-emph:#0f172a;
+  --scrim:rgba(246,247,250,.44);
   --grid:#d9dde2;
-  --glass-fill:rgba(255,255,255,.38);
-  --glass-side:rgba(250,251,252,.52);
+  --glass-fill:rgba(255,255,255,.55);
+  --glass-side:rgba(255,255,255,.60);
   --edge:rgba(51,51,51,.10);
   --gloss:.32;
   --shadow-a:.12;
@@ -943,10 +987,10 @@ html{color-scheme:dark}
 html[data-theme="light"]{color-scheme:light}
 body{
   background-color:var(--bg);
-  background-image:
-    linear-gradient(0deg,transparent 24%,var(--grid) 25%,var(--grid) 26%,transparent 27%,transparent 74%,var(--grid) 75%,var(--grid) 76%,transparent 77%),
-    linear-gradient(90deg,transparent 24%,var(--grid) 25%,var(--grid) 26%,transparent 27%,transparent 74%,var(--grid) 75%,var(--grid) 76%,transparent 77%);
-  background-size:52px 52px;
+  background-image:url("/bg.jpg");
+  background-position:center;background-size:cover;background-repeat:no-repeat;background-attachment:fixed;
+}
+body::before{content:"";position:fixed;inset:0;z-index:-1;background:var(--scrim);pointer-events:none}
   color:var(--txt);
   font-family:"Inter","HarmonyOS Sans SC","PingFang SC","Segoe UI","Microsoft YaHei",system-ui,sans-serif;
   font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;
@@ -992,7 +1036,7 @@ html[data-theme="light"] .blobs i:nth-child(4){background:radial-gradient(circle
   display:flex;flex-direction:column;
   background:var(--glass-side);
   box-shadow:inset -1px 0 0 var(--edge);
-  backdrop-filter:blur(12px) saturate(1.4);-webkit-backdrop-filter:blur(12px) saturate(1.4);
+  backdrop-filter:blur(22px) saturate(1.5);-webkit-backdrop-filter:blur(22px) saturate(1.5);
   border-right:1px solid var(--line);
   transition:width .3s cubic-bezier(.2,.7,.3,1),transform .32s cubic-bezier(.2,.7,.3,1);
 }
@@ -1074,7 +1118,7 @@ body.side-mini .collapse-btn{transform:rotate(180deg)}
 .card{
   position:relative;
   background:var(--glass-fill);
-  backdrop-filter:blur(7px) saturate(140%);-webkit-backdrop-filter:blur(7px) saturate(140%);
+  backdrop-filter:blur(22px) saturate(170%);-webkit-backdrop-filter:blur(22px) saturate(170%);
   border:1px solid var(--edge);border-radius:12px;padding:18px;margin-bottom:16px;
   box-shadow:var(--rim), 0 4px 12px rgba(0,0,0,var(--shadow-a));
   transition:border-color .2s ease,box-shadow .25s ease,transform .25s ease;
@@ -1102,7 +1146,7 @@ body.side-mini .collapse-btn{transform:rotate(180deg)}
   background:var(--glass-fill);
   border:1px solid var(--edge);border-radius:10px;padding:14px 14px 12px;
   box-shadow:var(--rim);
-  backdrop-filter:blur(6px) saturate(140%);-webkit-backdrop-filter:blur(6px) saturate(140%);
+  backdrop-filter:blur(16px) saturate(160%);-webkit-backdrop-filter:blur(16px) saturate(160%);
   transition:transform .18s ease,box-shadow .18s ease;
 }
 
@@ -2699,6 +2743,7 @@ def main():
         cf_db.open_db(args.db).close()
     except Exception:
         pass
+    threading.Thread(target=_bg_loop, daemon=True).start()
     init_secret()
     if args.child:
         child_main(args)

@@ -866,7 +866,7 @@ PAGE = r"""<!DOCTYPE html>
 <title>CF 优选IP 扫描管理台</title>
 <style>
 /* ============================================================
-   Aurora Glass v3 —— CF 控制台式布局 · 明暗双主题 · 幻彩二次元
+   Aurora Glass v3 —— CF 控制台式布局 · 明暗双主题 · 清新双主题
    ============================================================ */
 :root{
   --bg:#080a18;
@@ -883,8 +883,8 @@ PAGE = r"""<!DOCTYPE html>
   --purp:#c49bff;
   --cyan:#38d3f8;
   --pink:#ff7eb6;
-  --grad:linear-gradient(120deg,#ff7eb6,#8b7bff 48%,#38d3f8);
-  --grad-v:linear-gradient(160deg,#c4b5fd,#f9a8d4 55%,#67e8f9);
+  --grad:linear-gradient(120deg,#4f8dff,#38d3f8);
+  --grad-v:linear-gradient(160deg,#818cf8,#38d3f9);
   --shadow:0 10px 32px rgba(2,4,16,.45);
   --glow:0 0 24px rgba(139,123,255,.35);
   --tb-bg:rgba(10,13,28,.72);
@@ -911,7 +911,7 @@ html[data-theme="light"]{
   --cyan:#0891b2;
   --pink:#ec4899;
   --grad:linear-gradient(120deg,#f472b6,#8b7bff 48%,#22b8e8);
-  --grad-v:linear-gradient(160deg,#7c6cf6,#ec4899 55%,#0891b2);
+  --grad-v:linear-gradient(160deg,#6366f1,#0ea5e9);
   --shadow:0 10px 30px rgba(51,65,105,.12);
   --glow:0 0 22px rgba(124,108,246,.22);
   --tb-bg:rgba(255,255,255,.78);
@@ -927,7 +927,7 @@ html{color-scheme:dark}
 html[data-theme="light"]{color-scheme:light}
 body{
   background:
-    radial-gradient(1100px 520px at 10% -10%, rgba(255,126,182,.12), transparent 58%),
+    radial-gradient(1100px 520px at 10% -10%, rgba(56,189,248,.09), transparent 58%),
     radial-gradient(1000px 560px at 98% -6%, rgba(139,123,255,.16), transparent 55%),
     radial-gradient(900px 620px at 50% 118%, rgba(56,211,248,.10), transparent 58%),
     var(--bg);
@@ -938,12 +938,12 @@ body{
 }
 html[data-theme="light"] body{
   background:
-    radial-gradient(1100px 520px at 10% -10%, rgba(255,126,182,.14), transparent 58%),
+    radial-gradient(1100px 520px at 10% -10%, rgba(56,189,248,.10), transparent 58%),
     radial-gradient(1000px 560px at 98% -6%, rgba(139,123,255,.12), transparent 55%),
     radial-gradient(900px 620px at 50% 118%, rgba(56,211,248,.10), transparent 58%),
     var(--bg);
 }
-::selection{background:rgba(255,126,182,.32)}
+::selection{background:rgba(99,148,255,.30)}
 ::-webkit-scrollbar{width:9px;height:9px}
 ::-webkit-scrollbar-thumb{background:rgba(148,163,184,.25);border-radius:8px;border:2px solid transparent;background-clip:content-box}
 ::-webkit-scrollbar-thumb:hover{background-color:rgba(148,163,184,.45)}
@@ -966,7 +966,7 @@ html[data-theme="light"] .side{
   background:linear-gradient(180deg,rgba(255,255,255,.88),rgba(244,246,255,.92));
   box-shadow:6px 0 30px rgba(51,65,105,.06);
 }
-.brand{display:flex;align-items:center;gap:11px;padding:18px 16px 14px;border-bottom:1px solid var(--line)}
+.brand{position:relative;display:flex;align-items:center;gap:11px;padding:18px 16px 14px;border-bottom:1px solid var(--line)}
 .logo{
   flex:0 0 auto;width:36px;height:36px;border-radius:12px;display:grid;place-items:center;
   background:var(--grad);color:#fff;font-size:18px;font-weight:800;
@@ -989,7 +989,7 @@ html[data-theme="light"] .side{
 .nv:hover{color:var(--txt);background:var(--panel2)}
 .nv:hover i{transform:translateY(-2px) scale(1.18)}
 .nv.on{
-  color:#fff;background:linear-gradient(120deg,rgba(255,126,182,.20),rgba(139,123,255,.26));
+  color:#fff;background:linear-gradient(120deg,rgba(56,211,248,.16),rgba(139,123,255,.24));
   border-color:rgba(139,123,255,.48);
   box-shadow:inset 0 0 20px rgba(139,123,255,.16),0 4px 14px rgba(139,123,255,.22);
 }
@@ -1030,9 +1030,9 @@ body.side-mini .collapse-btn{transform:rotate(180deg)}
 @media (min-width:921px){
   body.side-mini .side{width:70px}
   body.side-mini .main{margin-left:70px}
-  body.side-mini .brand-t,body.side-mini .nv span,body.side-mini .side-tip{opacity:0;pointer-events:none}
+  body.side-mini .nv span,body.side-mini .side-tip{opacity:0;pointer-events:none}
   body.side-mini .brand{justify-content:center;padding-left:8px;padding-right:8px}
-  body.side-mini .brand-t{position:absolute}
+  body.side-mini .brand-t{display:none}
   body.side-mini .nv{justify-content:center;padding:12px 0;margin:3px 12px}
   body.side-mini .side-foot{justify-content:center;flex-wrap:wrap}
 }
@@ -1289,6 +1289,16 @@ tr.just-tested{outline:2px solid rgba(47,214,163,.65);outline-offset:-2px;backgr
 }
 @media (min-width:921px){ .scrim{display:none} }
 
+/* 浅色主题下的悬停详情弹层 */
+html[data-theme="light"] .f .tip .pop{background:rgba(255,255,255,.98);border-color:var(--line2);
+  box-shadow:0 12px 32px rgba(51,65,105,.18)}
+html[data-theme="light"] #chartTip{background:rgba(255,255,255,.98)}
+html[data-theme="light"] #chartTip .t-title{color:var(--txt)}
+html[data-theme="light"] #chartTip .t-row .k{color:var(--dim)}
+html[data-theme="light"] #chartTip .t-row .v{color:var(--txt)}
+html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-color:rgba(15,23,42,.10)}
+.content{overflow-x:clip}
+
 @media (max-width:720px){
   .content{padding:12px 10px 8px}
   .topbar{padding:10px 12px}
@@ -1347,7 +1357,7 @@ tr.just-tested{outline:2px solid rgba(47,214,163,.65);outline-offset:-2px;backgr
   </nav>
   <div class="side-foot">
     <button class="sbtn theme-btn" id="themeBtn" title="主题: 自动(跟随设备) → 浅色 → 深色">🌓</button>
-    <span class="side-tip">✧ 二次元优选</span>
+    
   </div>
 </aside>
 
@@ -1711,7 +1721,7 @@ function chartHover(cv){
     TIP.querySelector(".t-title").style.borderLeftColor=color;
     TIP.querySelector(".t-title").textContent=title;
     TIP.querySelector(".t-body").innerHTML=lines.map(l=>
-      `<div class="t-row"><span class="k">${esc(l[0])}</span><span class="v" style="color:${l[2]||'#fff'}">${esc(l[1])}</span></div>`
+      `<div class="t-row"><span class="k">${esc(l[0])}</span><span class="v" style="color:${l[2]||'var(--c-emph)'}">${esc(l[1])}</span></div>`
     ).join("");
   }
   cv.addEventListener("mousemove",e=>{
@@ -1733,10 +1743,10 @@ function chartHover(cv){
       TIP.style.transform=`translate(${lx-e.clientX}px,${ty-e.clientY}px)`;
       if(d.type==="bar"&&d.items[h]){
         const it=d.items[h],total=d.items.reduce((a,b)=>a+b.count,0);
-        moveTip(it.name,[["数量",it.count,"#fff"],["占比",total?Math.round(it.count/total*100)+"%":"-",d.color],["排名","#"+(h+1),"#8ad"]],d.color);
+        moveTip(it.name,[["数量",it.count,"var(--c-emph)"],["占比",total?Math.round(it.count/total*100)+"%":"-",d.color],["排名","#"+(h+1),"var(--cyan)"]],d.color);
       }else if(d.type==="hist"&&d.data[h]!=null){
         const v=d.data[h],total=d.data.reduce((a,b)=>a+b,0);
-        moveTip(d.labels[h],[[v+" IP",v,"#fff"],[d.labels[h],total?Math.round(v/total*100)+"%":"-",d.color]],d.color);
+        moveTip(d.labels[h],[[v+" IP",v,"var(--c-emph)"],[d.labels[h],total?Math.round(v/total*100)+"%":"-",d.color]],d.color);
       }
     }else{TIP.classList.remove("show")}
     if(cv._hover!==h){cv._hover=h;redraw()}
@@ -2101,18 +2111,18 @@ const CNT={};function countTo(id,val,fmtK,sfx){
 let STATS=null;
 function statTipSetup(){
   const map={
-    st_total:{t:"已测试IP",c:"var(--acc)",rows:s=>[["累计测试",s.tested_all??s.total,"#fff"],["库内保留",s.total,"#22c55e"],["覆盖率",s.coverage+"%","#22c55e"]]},
-    st_alive:{t:"存活IP",c:"var(--acc2)",rows:s=>{const dead=s.total-s.alive;return [["当前存活",s.alive,"#22c55e"],["不可用",dead,"#ef4444"],["存活率",s.total?Math.round(s.alive/s.total*100)+"%":"-","#fff"]]}},
-    st_verified:{t:"已验证地区",c:"var(--purp)",rows:s=>[["已验证",s.verified,"#8b5cf6"],["累计测试",s.tested_all??s.total,"#fff"]]},
-    st_bw:{t:"有带宽数据",c:"var(--acc)",rows:s=>[["有带宽",s.withbw,"#22c55e"],["累计测试",s.tested_all??s.total,"#fff"],["占比",s.tested_all?Math.round(s.withbw/s.tested_all*100)+"%":"-","#fff"]]},
-    st_avglat:{t:"平均延迟",c:"var(--warn)",rows:s=>[["平均值",s.avglat??"-","#f59e0b"],["最低",s.minlat??"-","#fff"]]},
-    st_maxbw:{t:"最高带宽",c:"var(--acc)",rows:s=>[["最近最高",s.maxbw??"-","#fff"],["历史最高",s.bwbest??"-","#22c55e"]]},
-    st_minlat:{t:"最低延迟",c:"var(--warn)",rows:s=>[["最低",s.minlat??"-","#fff"],["平均",s.avglat??"-","#f59e0b"]]},
-    st_cov:{t:"覆盖率",rows:s=>[["覆盖",s.coverage+"%","#fff"],["已发现",s.total,"#22c55e"]]},
+    st_total:{t:"已测试IP",c:"var(--acc)",rows:s=>[["累计测试",s.tested_all??s.total,"var(--c-emph)"],["库内保留",s.total,"var(--acc2)"],["覆盖率",s.coverage+"%","var(--acc2)"]]},
+    st_alive:{t:"存活IP",c:"var(--acc2)",rows:s=>{const dead=s.total-s.alive;return [["当前存活",s.alive,"var(--acc2)"],["不可用",dead,"var(--err)"],["存活率",s.total?Math.round(s.alive/s.total*100)+"%":"-","var(--c-emph)"]]}},
+    st_verified:{t:"已验证地区",c:"var(--purp)",rows:s=>[["已验证",s.verified,"var(--purp)"],["累计测试",s.tested_all??s.total,"var(--c-emph)"]]},
+    st_bw:{t:"有带宽数据",c:"var(--acc)",rows:s=>[["有带宽",s.withbw,"var(--acc2)"],["累计测试",s.tested_all??s.total,"var(--c-emph)"],["占比",s.tested_all?Math.round(s.withbw/s.tested_all*100)+"%":"-","var(--c-emph)"]]},
+    st_avglat:{t:"平均延迟",c:"var(--warn)",rows:s=>[["平均值",s.avglat??"-","var(--warn)"],["最低",s.minlat??"-","var(--c-emph)"]]},
+    st_maxbw:{t:"最高带宽",c:"var(--acc)",rows:s=>[["最近最高",s.maxbw??"-","var(--c-emph)"],["历史最高",s.bwbest??"-","var(--acc2)"]]},
+    st_minlat:{t:"最低延迟",c:"var(--warn)",rows:s=>[["最低",s.minlat??"-","var(--c-emph)"],["平均",s.avglat??"-","var(--warn)"]]},
+    st_cov:{t:"覆盖率",rows:s=>[["覆盖",s.coverage+"%","var(--c-emph)"],["已发现",s.total,"var(--acc2)"]]},
     st_route:{t:"精品线路",c:"var(--acc2)",rows:s=>{const rts=(s.routes||[]).slice(0,5);
-      const base=[["已测线路",s.route_done??0,"#fff"],["其中精品",s.premium??0,"#22c55e"]];
+      const base=[["已测线路",s.route_done??0,"var(--c-emph)"],["其中精品",s.premium??0,"var(--acc2)"]];
       if(!rts.length)return base;
-      return base.concat([["分布"]], rts.map(r=>[r.name, r.count, r.premium?"#22c55e":"#8b98a5"]));}
+      return base.concat([["分布"]], rts.map(r=>[r.name, r.count, r.premium?"var(--acc2)":"#8b98a5"]));}
     }
   };
   Object.entries(map).forEach(([id,cfg])=>{
@@ -2123,7 +2133,7 @@ function statTipSetup(){
       TIP.querySelector(".t-title").textContent=cfg.t;
       TIP.querySelector(".t-title").style.borderLeftColor=cfg.c;
       TIP.querySelector(".t-body").innerHTML=cfg.rows(STATS).map(r=>
-        `<div class="t-row">${r.length>1&&r[1]!==undefined?`<span class="k">${esc(r[0])}</span><span class="v" style="color:${r[2]||"#fff"}">${esc(r[1])}</span>`:`<span class="k sec">${esc(r[0])}</span>`}</div>`
+        `<div class="t-row">${r.length>1&&r[1]!==undefined?`<span class="k">${esc(r[0])}</span><span class="v" style="color:${r[2]||"var(--c-emph)"}">${esc(r[1])}</span>`:`<span class="k sec">${esc(r[0])}</span>`}</div>`
       ).join("");
       TIP.classList.add("show");
       const r=el.getBoundingClientRect(),nw=TIP.offsetWidth,nh=TIP.offsetHeight;
@@ -2183,9 +2193,9 @@ function routeTipSetup(){
     if(TIP._hideTmr){clearTimeout(TIP._hideTmr);TIP._hideTmr=null;}
     const rcl=rt.dataset.cls, label=RCL[rcl]||rcl||"线路";
     const hops=rt.dataset.hk?HOPS[rt.dataset.hk]:null;
-    const rc=rcl==="premium"?"#22c55e":rcl==="mixed"?"#f59e0b":"#fff";
+    const rc=rcl==="premium"?"var(--acc2)":rcl==="mixed"?"var(--warn)":"var(--c-emph)";
     TIP.querySelector(".t-title").textContent="线路详情";
-    TIP.querySelector(".t-title").style.borderLeftColor=rcl==="premium"?"#22c55e":"var(--acc2)";
+    TIP.querySelector(".t-title").style.borderLeftColor=rcl==="premium"?"var(--acc2)":"var(--acc2)";
     let body='<div class="t-row"><span class="k">线路分类</span><span class="v" style="color:'+rc+'">'+esc(label)+'</span></div>';
     if(hops&&hops.length){
       body+='<div class="t-row"><span class="k sec">Traceroute 逐跳</span></div>';
@@ -2195,7 +2205,7 @@ function routeTipSetup(){
         const tm=h.time!=null?(h.time+"ms"):"-";
         const tgt=h.target?" ✓目标":"";
         body+='<div class="t-row"><span class="k">'+esc(h.n+". "+ip)+'</span>'+
-          '<span class="v" style="color:'+(h.target?"#22c55e":h.time!=null?"#fff":"#5b6570")+'">'+tag+' '+tm+tgt+'</span></div>';
+          '<span class="v" style="color:'+(h.target?"var(--acc2)":h.time!=null?"var(--c-emph)":"var(--dim)")+'">'+tag+' '+tm+tgt+'</span></div>';
       });
     }else{
       body+='<div class="t-row"><span class="k sec">逐跳数据缺失(重新测线路后可见)</span></div>';
@@ -2253,10 +2263,12 @@ $("burger").onclick=()=>{sideEl.classList.toggle("open");$("scrim").classList.to
 $("scrim").onclick=closeSide;
 if(localStorage.getItem("sideMini")==="1")document.body.classList.add("side-mini");
 $("sideBtn").onclick=()=>{
+  if(window.innerWidth<=920){closeSide();return;}
   const on=document.body.classList.toggle("side-mini");
   localStorage.setItem("sideMini",on?"1":"0");
-  setTimeout(redrawCharts,330);
+  setTimeout(redrawCharts,340);
 };
+document.querySelector(".main").addEventListener("transitionend",(e)=>{if(e.propertyName==="margin-left")redrawCharts()});
 
 /* ---- 主题: 自动(跟随设备) -> 浅色 -> 深色 循环 ---- */
 const _mq=window.matchMedia("(prefers-color-scheme: dark)");

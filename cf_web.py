@@ -1030,11 +1030,12 @@ body.side-mini .collapse-btn{transform:rotate(180deg)}
 @media (min-width:921px){
   body.side-mini .side{width:70px}
   body.side-mini .main{margin-left:70px}
-  body.side-mini .nv span,body.side-mini .side-tip{opacity:0;pointer-events:none}
   body.side-mini .brand{justify-content:center;padding-left:8px;padding-right:8px}
-  body.side-mini .brand-t{display:none}
-  body.side-mini .nv{justify-content:center;padding:12px 0;margin:3px 12px}
-  body.side-mini .side-foot{justify-content:center;flex-wrap:wrap}
+  body.side-mini .brand-t,body.side-mini .nv span,body.side-mini .side-tip{display:none}
+  body.side-mini .nv{display:block;text-align:center;padding:12px 0;margin:4px 13px;line-height:1}
+  body.side-mini .nv i{font-size:19px}
+  body.side-mini .side-foot{justify-content:center;flex-wrap:wrap;row-gap:8px;padding:12px 8px}
+  body.side-mini .collapse-btn{margin-left:0}
 }
 
 /* ---------- 玻璃卡片 ---------- */
@@ -1773,7 +1774,8 @@ function barChart(cid, items, color){
   const cv=$(cid); if(!cv)return;
   cv._data={type:"bar",items,color}; chartHover(cv);
   const ctx=cv.getContext("2d");
-  const W=cv.width=cv.clientWidth*2, H=cv.height=250*2, pad=90;
+  const CH=parseFloat(getComputedStyle(cv).height)||250;
+  const W=cv.width=cv.clientWidth*2, H=cv.height=CH*2, pad=90;
   const n=items.length, rowH=(H-16)/Math.max(1,n), max=Math.max(1,...items.map(i=>i.count));
   const maxW=(W-pad-20)*0.7;
   const hover=cv._hover!=null?cv._hover:-1;
@@ -1816,7 +1818,8 @@ function histChart(cid, labels, data, color){
   const cv=$(cid); if(!cv)return;
   cv._data={type:"hist",labels,data,color}; chartHover(cv);
   const ctx=cv.getContext("2d");
-  const W=cv.width=cv.clientWidth*2, H=cv.height=250*2, padB=34, padT=30;
+  const CH=parseFloat(getComputedStyle(cv).height)||250;
+  const W=cv.width=cv.clientWidth*2, H=cv.height=CH*2, padB=34, padT=30;
   const n=labels.length;
   const max=Math.max(1,...data), slot=(W-16)/n;
   const maxH=(H-padB-padT)*0.85;

@@ -1479,11 +1479,13 @@ footer{margin-top:auto;padding:14px;color:var(--dim);font-size:12px;text-align:c
 #msg{color:var(--warn);font-size:13px;min-height:18px;margin:8px 0}
   font-size:12.5px;padding:9px 13px;border-radius:8px;margin:6px 0;line-height:1.6}
   font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
-.pin-bar{display:flex;align-items:center;gap:8px;font-size:12.5px;color:#7ef0c8;
-  background:rgba(47,214,163,.10);border:1px solid rgba(47,214,163,.38);padding:7px 13px;
+.pin-bar{display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;color:#0d9488;
+  background:rgba(47,214,163,.20);border:1px solid rgba(13,148,136,.55);padding:8px 13px;
   border-radius:8px;margin:6px 0}
 .pin-bar b{font-family:ui-monospace,Menlo,Consolas,monospace}
-tr.just-tested{outline:2px solid rgba(47,214,163,.65);outline-offset:-2px;background:rgba(47,214,163,.08)}
+tr.just-tested{outline:2.5px solid var(--acc2);outline-offset:-2px;
+  background:rgba(47,214,163,.22) !important;
+  box-shadow:inset 0 0 0 9999px rgba(47,214,163,.10)}
 #toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%) translateY(16px);
   background:rgba(15,21,38,.95);color:#fff;padding:10px 22px;border-radius:8px;
   font-size:13px;opacity:0;pointer-events:none;transition:opacity .25s ease,transform .25s ease;z-index:999;
@@ -1532,7 +1534,8 @@ html[data-theme="light"] .modal{
 html[data-theme="light"] .modal h2{color:var(--txt)}
 
 html[data-theme="light"] .pin-bar{color:#0f766e;background:rgba(14,164,114,.09)}
-html[data-theme="light"] tr.just-tested{outline-color:rgba(14,164,114,.6)}
+html[data-theme="light"] tr.just-tested{outline-color:#059669;
+  background:rgba(16,185,129,.16) !important}
 
 /* 浅色主题下的悬停详情弹层 */
 html[data-theme="light"] .f .tip .pop{background:rgba(255,255,255,.98);border-color:var(--line2);
@@ -1801,7 +1804,6 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
 
 <script>
 const $=id=>document.getElementById(id);
-console.log('[DBG] main脚本开始');
 window.addEventListener("error",e=>{
   try{
     const t=document.createElement("div");
@@ -2319,7 +2321,7 @@ async function poll(){
     barChart("ch_country",s.countries.slice(0,12),"#38d3f8");
     histChart("ch_lat",s.lat.labels,s.lat.data,"#fbbf24");
     histChart("ch_bw",s.bw.labels,s.bw.data,"#2fd6a3");
-  }catch(e){console.error('[DBG] poll异常:',e&&e.message)}
+  }catch(e){console.error('[poll]',e&&e.message)}
   setTimeout(poll,2000);
 }const CNT={};function countTo(id,val,fmtK,sfx){
   const el=$(id); if(!el||val==null)return;
@@ -2415,7 +2417,6 @@ function bwTipSetup(){
 ["f_hasbw","f_v6"].forEach(id=>{
   $(id).addEventListener("change",()=>{OFFSET=0;loadTable()});
 });
-console.log('[DBG] 到达初始化链');
 loadSet();
 $('bench_host').addEventListener("input",()=>{$("srcHost").textContent=$("bench_host").value||"speed.cloudflare.com"});
 loadTable();

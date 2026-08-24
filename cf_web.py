@@ -1575,12 +1575,11 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
   #tabWrap thead th:nth-child(6),#tbody td:nth-child(6),
   #tabWrap thead th:nth-child(7),#tbody td:nth-child(7),
   #tabWrap thead th:nth-child(8),#tbody td:nth-child(8),
-  #tabWrap thead th:nth-child(10),#tbody td:nth-child(10),
-  #tabWrap thead th:nth-child(11),#tbody td:nth-child(11){display:none}
+  #tabWrap thead th:nth-child(10),#tbody td:nth-child(10){display:none}
   #optWrap thead th:nth-child(2),#optBody td:nth-child(2),
   #optWrap thead th:nth-child(6),#optBody td:nth-child(6),
   #optWrap thead th:nth-child(7),#optBody td:nth-child(7),
-  #optWrap thead th:nth-child(10),#optBody td:nth-child(10){display:none}
+  #optWrap thead th:nth-child(9),#optBody td:nth-child(9){display:none}
   th,td{padding:7px 9px;font-size:13px}
   .pager{gap:6px}
   .pager button{padding:8px 10px}
@@ -1817,6 +1816,7 @@ let SORT="bw";
 let OFFSET=0;
 const LIMIT=100;
 let PIN="",PIN_TS=0;
+const MANUAL={};
 let PAGE_TOTAL=0;
 const SEL=new Set();
 function openAbout(){const v=$("ver2");if(v)v.textContent=$("ver").textContent||"?";$("aboutMask").classList.add("open");}
@@ -1969,7 +1969,6 @@ function copyOptSel(){
     else toast("复制失败, 请手动复制","err");
   });
 }
-const MANUAL={};
 const HOPS={};
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
 
@@ -2214,11 +2213,11 @@ function testIp(act,ip,port,btn){
     body:JSON.stringify({action:act,ip:ip,port:port,bench_host:$("bench_host").value})}).then(r=>r.json()).then(r=>{
     if(r.ok){
       PIN=ip;PIN_TS=Date.now();
-              MANUAL[ip+":"+port+":"+act]={text:act==="lat"?(r.latency+"ms"):(r.bandwidth+"M"),
-          title:act==="lat"?("实测延迟 "+r.latency+"ms"):("实测带宽 "+r.bandwidth+" Mbps"),ok:true};
-        btn.textContent=act==="lat"?(r.latency+"ms"):(r.bandwidth+"M");
-        btn.classList.add("done");btn.title=MANUAL[ip+":"+port+":"+act].title;
-        btn.disabled=false;loadTable();
+      MANUAL[ip+":"+port+":"+act]={text:act==="lat"?(r.latency+"ms"):(r.bandwidth+"M"),
+        title:act==="lat"?("实测延迟 "+r.latency+"ms"):("实测带宽 "+r.bandwidth+" Mbps"),ok:true};
+      btn.textContent=act==="lat"?(r.latency+"ms"):(r.bandwidth+"M");
+      btn.classList.add("done");btn.title=MANUAL[ip+":"+port+":"+act].title;
+      btn.disabled=false;loadTable();
     }
     else{btn.textContent="失败";btn.title={lat:"延迟测试失败",bw:"带宽测试失败"}[act];
       setTimeout(()=>{btn.textContent=old;btn.disabled=false},8000);

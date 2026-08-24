@@ -1,6 +1,6 @@
 # 🚀 CF 优选IP 扫描管理台
-![image.png](https://cloudfiles.dpdns.org/file/public/1787475289128_image.png)
-![image.png](https://cloudfiles.dpdns.org/file/public/1787475309750_image.png)
+![image.png](https://cloudfiles.dpdns.org/file/1786948130467_image.png)
+![image.png](https://cloudfiles.dpdns.org/file/1786948153031_image.png)
 
 基于 Cloudflare 官方 IP 地址池的 **优选 IP 持续扫描器**,带 **Web 图形管理界面**。纯 Python 标准库实现,**零第三方依赖**,Python 3.8+ 即可运行。
 
@@ -11,7 +11,6 @@
 - 📊 **实时看板**: 已测/存活/已验证/带宽/平均延迟统计卡片 + 机房 / 国家 / 延迟 / 带宽分布图表
 - 🚀 **带宽实测**: 内置测速模块,支持自定义测速域名(可配合自建 Cloudflare Worker 规避公共限流)
 - 🌍 **地区识别**: 自动识别机房 (colo) 与国家/地区,支持按地区筛选导出
-- 🛤️ **线路分类**: 去程 ASN 判定精品/普通/混合/未识别(CN2-GIA/9929/CMIN2 为精品,163/169/9808 为普通),表格悬停可查看逐跳 Traceroute 详情。ASN 用**纯标准库二分查找**(首次使用需联网下载 ip2asn 数据, 之后离线)
 - 📋 **结果表**: 可排序 / 多条件筛选 / 勾选批量操作,一键导出 `ADD.txt` / `CSV`
 - 🎯 **手动优选**: 从本地库抽候选现场重测, 取最优 N 条(可优先带宽/延迟), 勾选复制, 不落库
 - ⚙️ **灵活配置**: 扫描参数随时通过 Web 界面调整并热重启
@@ -44,8 +43,6 @@ python3 cf_web.py --db cf_ips.db
 打开浏览器访问 `http://127.0.0.1:8787/` 即可看到管理台,点击「开始扫描」。
 
 > **访问控制(默认开启)**:首次启动会自动生成登录凭据(用户名 + 随机密码),保存在同目录 `cf_secret.json`(权限 600),启动日志会打印账号密码;所有页面与 API 均需 Basic Auth。若机器上装了 `openssl`(Linux 一般自带),默认还会启用 **HTTPS(自签名证书)**,地址为 `https://...`,浏览器首次访问需信任自签名证书;不想用加密可把 `cf_secret.json` 里的 `https` 改为 `false` 重启,改密码直接编辑该文件。
->
-> 浏览器访问未登录时会跳转到**登录页**(深色玻璃风格, 背景为每日壁纸); 登录成功后签发 **7 天 HttpOnly Cookie 会话**, 连续失败 5 次锁定该 IP 15 分钟, 顶栏 ⏻ 可随时退出。命令行/脚本不受影响, 仍用 `curl -u 用户名:密码` 的 Basic Auth 直连 API。
 >
 > 注意:自签名 HTTPS 只加密传输、防局域网窥探,**不提供身份公证**;对外网开放管理台请务必保证强密码。
 
@@ -88,11 +85,10 @@ python3 cf_db.py --seed myadd.txt     # 把现有优选名单导入数据库作�
 1. **总览看板**: 统计卡片("已测试IP"为**历史累计**, 含已被清理的IP; 库内保留数见悬浮明细) + 机房 / 国家 / 延迟 / 带宽 / 线路五类图表, 悬停看明细。
 2. **扫描控制**: 地址源(官方全网 / CF官方 / 电信 / 联通 / 移动优选段)、端口、抽样数/轮、并发、验证预算、测带宽/轮、测速并连数、测速域名、地区补全、复核、线路检测预算与重测周期、优质 C 段比例、最大延迟、库上限, 以及 TLS 二次确认 / 线路分类 / 同时扫描 IPv6 开关。参数保存后热生效, 「开始扫描 / 停止」随时切换。
 3. **IP 列表**:
-   - **筛选**: 机房(逗号分隔, 如 `HKG,NRT`)、最小带宽、最大延迟、IP 包含、端口、只显示精品线路、仅有带宽、仅IPv6(激活的筛选会高亮)
+   - **筛选**: 机房(逗号分隔, 如 `HKG,NRT`)、最小带宽、最大延迟、IP 包含、端口、仅有带宽、仅IPv6(激活的筛选会高亮)
    - **排序**: 点击列头(带宽 / 延迟 / IP / 端口 / 机房 / 最近测试)
    - **勾选**: 复制选中(格式 `ip:端口#地区`, 精品自动带「精品」后缀) / 导出选中 txt / 清空选中, 跨页保留
    - **翻页跳转**, 一键导出 `ADD.txt` / `CSV`(跟随当前筛选条件)
-   - **线路列**: 悬停可查看逐跳 Traceroute 与 ASN 列表
 4. **✨ 点击特效**: 蔚蓝档案风格点击特效与光标拖尾开关、特效大小 / 不透明度 / 拖尾与点击速度滑杆、颜色跟随明暗主题或自定义; 所有调整即时生效并保存在浏览器本地。桌面与手机触屏均生效。
 5. **壁纸**: NASA 每日一图(APOD)自动解析并缓存在服务端(`apod_bg.img`), 访客直接加载本地图; 当日为视频时自动取最近图片日, 接口失败沿用旧图。可选在 `cf_settings.json` 加 `"nasa_api_key": "你的key"` 提升接口配额([api.nasa.gov](https://api.nasa.gov) 免费申请, DEMO_KEY 限 50 次/天)。
 
@@ -100,7 +96,7 @@ python3 cf_db.py --seed myadd.txt     # 把现有优选名单导入数据库作�
 
 后台扫描会持续把测过的 IP 累积进本地库。需要**少量精挑**时, 不必等后台扫描:
 
-1. 在「手动优选」卡片设置: 数量 N、**优先带宽 / 优先延迟**、地区过滤、仅精品、仅有带宽、仅IPv6
+1. 在「手动优选」卡片设置: 数量 N、**优先带宽 / 优先延迟**、地区过滤、仅有带宽、仅IPv6
 2. 点「优选」: 先从本地库按筛选条件抽 `max(N×5, 20)` 个候选(上限 150), 再**现场重测**(连通探测 → 地区识别 → 实测带宽, 并发 20)
 3. 取最优 N 条展示在下方表格(优先带宽 = 带宽↓ 延迟↑; 优先延迟 = 延迟↑ 带宽↓), 可勾选后「复制选中」或「复制全部」
 
@@ -158,31 +154,9 @@ python3 cf_db.py --seed myadd.txt     # 把现有优选名单导入数据库作�
 | `--region` | 无 | `--export` 时按机房/地区过滤 |
 | `--max-ips` | 0 | 库内IP上限, 每轮结束超出部分按质量评分剔除(精品/带宽/延迟优先保留), 死IP入墓碑静默7天免重测, 0=不限制 |
 
-## 🌐 关于 IPv6 与精品线路识别
+## 🌐 关于 IPv6
 
-- **IPv4 精品线路**:去程 ASN 判定(CN2-GIA/9929/CMIN2 为精品)。但**精品在 CF 边缘 IP 中占比极低(通常不足 1%)**,需要测大量 IP 才有机会命中,`--route-budget` 越大命中率越高(默认 100)。
-- **IPv6**:用公开「优选 v6 IP 列表」(运营商匹配 + 通用源)优先采样,命中率高;同时把 **CF 官方 v6 大段**纳入随机发现,覆盖更广。**IPv6 同样支持去程线路分类**(ASN 判定与 v4 相同,首次使用需联网下载 ip2asn v6 数据)。需要本机有 IPv6 网络。
-- **线路检测前提**:依赖系统 `ping`(ICMP TTL 递增探测)与出网 ICMP 回包。若代理/防火墙拦截 ICMP、或 NAS 的 ping 不支持 `-t` 参数,会显示"无法判定";此时悬停线路列或点「测线路」会显示具体原因(`route_error`)。首次使用需联网下载一次 ip2asn ASN 数据。
-- **ping 权限不足(cap_net_raw)**:部分 NAS/精简 Linux 上非 root 用户 ping 会报 `Operation not permitted / missing cap_net_raw`。Web 界面顶部会显示红色横幅和修复命令,任选其一即可:
-  ```bash
-  sudo setcap cap_net_raw+ep $(which ping)      # 给 ping 加原始套接字能力(最通用)
-  # 或
-  sysctl -w net.ipv4.ping_group_range="0 2147483647"   # 放开无特权 ICMP 组范围
-  ```
-- **BusyBox ping 不支持 `-t`**:精简系统的 ping 可能没有 TTL 参数,此时会提示 `invalid option -- t`,请换装完整版 `iputils-ping`。
-- **线路检测极速模式与权限**:所有平台优先使用**原生 ICMP 套接字并行探测**(IPv4/IPv6 均 1~3 秒/个),需要特权:**Windows 管理员 / Linux root**。无权限时自动回退系统命令——Windows 的 IPv6 退到 tracert(约15秒/个,且 Windows ping 无法判定 v6),其余退到并行 ping(同样较快)。启动日志会提示当前模式。提权任选其一:
-  ```bash
-  # Linux/NAS 方式一: sudo 直接运行
-  sudo python3 cf_web.py --db cf_ips.db --daemon --no-browser
-
-  # Linux/NAS 方式二(推荐): 给 Python 加原始套接字能力, 之后免 root 常驻
-  sudo setcap cap_net_raw+ep $(which python3)
-
-  # Windows: 开始菜单搜 PowerShell -> 右键「以管理员身份运行」-> cd 到程序目录启动
-  # 或计划任务 SYSTEM 常驻:
-  schtasks /Create /TN "cf-optimizer" /SC ONSTART /RU SYSTEM ^
-    /TR "python D:\你的程序目录\cf_web.py --db cf_ips.db --daemon --no-browser"
-  ```
+- 用公开「优选 v6 IP 列表」(运营商匹配 + 通用源)优先采样,命中率高;同时把 **CF 官方 v6 大段**纳入随机发现,覆盖更广。需要本机有 IPv6 网络。
 
 ## 🛠 技术栈
 
@@ -191,7 +165,6 @@ python3 cf_db.py --seed myadd.txt     # 把现有优选名单导入数据库作�
 - **Cloudflare IP 地址池**: 官方路由数据
 - **内置 HTTP 服务**: Web 管理界面(含 Basic Auth + 可选 HTTPS)
 - [ba-click-fx](https://github.com/CialloKing/ba-click-fx)(MIT): 蔚蓝档案风格网页点击特效
-- **ip2asn 数据**: 去程线路 ASN 判定(首次联网下载一次, 之后离线)
 
 ## 📄 许可证
 

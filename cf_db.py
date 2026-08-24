@@ -48,11 +48,6 @@ import time
 import types
 import urllib.parse
 
-try:
-    import route_probe
-except ImportError:
-    route_probe = None
-
 OFFICIAL_V4_URL = "https://www.cloudflare.com/ips-v4"
 FALLBACK_RANGES = [
     "104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13", "162.158.0.0/15",
@@ -84,7 +79,6 @@ TRACE_HOST = "cloudflare.com"
 SPEED_HOST = "speed.cloudflare.com"
 PORTS_DEFAULT = [443, 2053, 2083, 8443]
 
-# 路由线路分类由独立模块 route_probe.py 负责 (AS 基准/判定逻辑见该模块)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ips(
@@ -120,16 +114,10 @@ CREATE TABLE IF NOT EXISTS meta(
 );
 """
 
-ROUTE_INDEX_SQL = "CREATE INDEX IF NOT EXISTS idx_ips_route_class ON ips(route_class)"
 
 MIGRATIONS = [
     "ALTER TABLE ips ADD COLUMN bw_last_mbps REAL",
     "ALTER TABLE ips ADD COLUMN bw_last_at REAL",
-    "ALTER TABLE ips ADD COLUMN route_as_list TEXT",
-    "ALTER TABLE ips ADD COLUMN route_class TEXT",
-    "ALTER TABLE ips ADD COLUMN route_hops TEXT",
-    "ALTER TABLE ips ADD COLUMN route_at REAL",
-    "ALTER TABLE ips ADD COLUMN route_error TEXT",
     "DROP INDEX IF EXISTS idx_ips_route",
     "ALTER TABLE ips DROP COLUMN route",
     "ALTER TABLE ips DROP COLUMN route_premium",
@@ -166,10 +154,6 @@ def open_db(path):
             conn.execute(m)
         except Exception:
             pass
-    try:
-        conn.execute(ROUTE_INDEX_SQL)
-    except Exception:
-        pass
     # 累计测试计数器: 首次使用时以 库内+墓碑 为基数播种, 之后由 upsert 对新IP累加, 剪枝不扣减
     try:
         conn.execute(
@@ -243,9 +227,8 @@ def upsert(conn, rec):
         """
         INSERT INTO ips(ip,port,colo,loc,latency_ms,bandwidth_mbps,
                         bw_last_mbps,bw_last_at,
-                        tested_at,verified_at,first_seen,ok_count,fail_count,
-                        route_as_list,route_class,route_hops,route_at,route_error)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        tested_at,verified_at,first_seen,ok_count,fail_count)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(ip) DO UPDATE SET
           port=CASE WHEN excluded.latency_ms IS NOT NULL AND excluded.tested_at>=ips.tested_at
                     THEN excluded.port ELSE port END,
@@ -262,12 +245,7 @@ def upsert(conn, rec):
           bw_last_at=CASE WHEN excluded.bw_last_mbps IS NOT NULL AND excluded.tested_at>=ips.tested_at
                      THEN excluded.bw_last_at ELSE bw_last_at END,
           ok_count=ok_count+excluded.ok_count,
-          fail_count=fail_count+excluded.fail_count,
-          route_as_list=CASE WHEN excluded.route_as_list IS NOT NULL THEN excluded.route_as_list ELSE route_as_list END,
-          route_class=CASE WHEN excluded.route_class IS NOT NULL THEN excluded.route_class ELSE route_class END,
-          route_hops=CASE WHEN excluded.route_hops IS NOT NULL THEN excluded.route_hops ELSE route_hops END,
-          route_at=CASE WHEN excluded.route_at IS NOT NULL THEN excluded.route_at ELSE route_at END,
-          route_error=CASE WHEN excluded.route_error IS NOT NULL THEN excluded.route_error ELSE route_error END
+          fail_count=fail_count+excluded.fail_count
         """,
         (
             rec.get("ip"), rec.get("port") or 443,
@@ -277,9 +255,6 @@ def upsert(conn, rec):
             rec.get("tested_at") or time.time(),
             rec.get("verified_at"), rec.get("first_seen") or time.time(),
             ok, fail,
-            rec.get("route_as_list"), rec.get("route_class"),
-            rec.get("route_hops"), rec.get("route_at"),
-            rec.get("route_error"),
         ),
     )
     if is_new:
@@ -293,7 +268,6 @@ def upsert(conn, rec):
 
 PRUNE_SCORE_SQL = (
     "(CASE WHEN ok_count > 0 THEN 200 ELSE 0 END)"          # 活的基础分
-    "+ (CASE WHEN route_class = 'premium' THEN 300 ELSE 0 END)"  # 精品加分
     "+ (CASE WHEN verified_at IS NOT NULL THEN 60 ELSE 0 END)"
     "+ MAX(0, 120 - fail_count * 30)"                        # 连续失败越多越先删
     "+ COALESCE(MIN(MAX(COALESCE(bw_last_mbps, 0), 0), 600), 0)"         # 带宽主导: 1Mbps=1分, 上限600
@@ -360,10 +334,6 @@ def prune_ips(conn, max_ips):
     except Exception:
         pass
     return total - remaining
-
-
-# ------------------------------------------------------------ 路由线路检测
-# 由独立模块 route_probe.py 提供, 见 route_probe.classify_route()
 
 
 def fetch_networks(operator, port):
@@ -825,7 +795,7 @@ async def run_session(nets, known, q, args, stop, nets6=None):
                         out[idx] = None
         return out
 
-    async def verify_one(ip, p, lat, do_bench, do_route=False):
+    async def verify_one(ip, p, lat, do_bench):
         args_ns = types.SimpleNamespace(bench_size=args.bench_size,
                                         bench_timeout=args.bench_timeout,
                                         bench_parallel=args.bench_parallel,
@@ -844,24 +814,8 @@ async def run_session(nets, known, q, args, stop, nets6=None):
                     bw = await bench_bandwidth(ip, p, args_ns)
                 except Exception:
                     bw = None
-        route_as_list = route_class = route_hops = route_at = route_error = None
-        if do_route:
-            try:
-                res = await asyncio.to_thread(route_probe.classify_route, ip)
-                route_class, as_list, hops = res["route_class"], res["as_list"], res["hops"]
-                route_error = res.get("error")
-                if as_list:
-                    route_as_list = json.dumps(as_list)
-                if hops:
-                    route_hops = json.dumps(hops, ensure_ascii=False)
-                route_at = time.time()
-            except Exception:
-                route_as_list = route_class = route_hops = route_at = route_error = None
         rec = {"type": "result", "ip": ip, "port": p, "ok": True,
                "latency": lat, "colo": colo, "loc": loc, "bandwidth": bw,
-               "route_as_list": route_as_list, "route_class": route_class,
-               "route_hops": route_hops, "route_at": route_at,
-               "route_error": route_error,
                "tested_at": time.time()}
         if verified_at:
             rec["verified_at"] = verified_at
@@ -871,38 +825,10 @@ async def run_session(nets, known, q, args, stop, nets6=None):
         if not pend:
             return
         vsem = asyncio.Semaphore(min(8, len(pend)))
-        budget = int(getattr(args, "route_budget", 0) or 0)
-        if not getattr(args, "route_check", True):
-            budget = 0
-        route_targets = set()
-        if budget > 0:
-            meta = {}
-            try:
-                conn_r = sqlite3.connect(args.db)
-                meta = {r[0]: (r[1], r[2]) for r in conn_r.execute(
-                    "SELECT ip, bandwidth_mbps, route_at FROM ips")}
-                conn_r.close()
-            except Exception:
-                pass
-            stale_after = float(getattr(args, "route_stale_hours", 6) or 6) * 3600
-            now = time.time()
-
-            def prio(ip):
-                if ip not in meta:
-                    return 0
-                bw, rt = meta[ip]
-                if rt is None:
-                    return 1 if bw is not None else 2
-                if bw is not None and (now - rt) >= stale_after:
-                    return 1
-                return 3
-
-            ranked = sorted(pend, key=lambda x: prio(x[0]))
-            route_targets = {ip for ip, _, _ in ranked[:budget] if prio(ip) < 3}
 
         async def v(ip, p, lat, idx):
             async with vsem:
-                await verify_one(ip, p, lat, idx < args.bench, ip in route_targets)
+                await verify_one(ip, p, lat, idx < args.bench)
 
         await run_tasks([v(ip, p, lat, i) for i, (ip, p, lat) in enumerate(pend)])
 
@@ -1018,18 +944,18 @@ def export_report(args):
         params.extend(keep)
         params.extend(keep)
     rows = conn.execute(
-        f"SELECT ip, port, colo, loc, latency_ms, bandwidth_mbps, route_class FROM ips "
+        f"SELECT ip, port, colo, loc, latency_ms, bandwidth_mbps FROM ips "
         f"WHERE {where} "
         f"ORDER BY (CASE WHEN bandwidth_mbps IS NULL THEN 0 ELSE bandwidth_mbps END) DESC, "
         f"latency_ms ASC LIMIT ?", params + [args.top if args.top else 100]).fetchall()
     conn.close()
     lines = []
-    csv_lines = ["rank,ip,port,latency_ms,bandwidth_mbps,colo,loc,route_class"]
-    for i, (ip, p, colo, loc, lat, bw, route_class) in enumerate(rows, 1):
+    csv_lines = ["rank,ip,port,latency_ms,bandwidth_mbps,colo,loc"]
+    for i, (ip, p, colo, loc, lat, bw) in enumerate(rows, 1):
         remark = f"{colo or 'UNK'}-{loc or 'UNK'}-{i}"
         lines.append(f"{ip}:{p}#{remark}")
         csv_lines.append(f"{i},{ip},{p},{lat if lat is not None else ''},"
-                         f"{bw if bw is not None else ''},{colo or ''},{loc or ''},{route_class or ''}")
+                         f"{bw if bw is not None else ''},{colo or ''},{loc or ''}")
     mode = args.mode
     if mode == "txt":
         body = "\n".join(lines) + ("\n" if lines else "")
@@ -1050,13 +976,6 @@ def stats_report(args):
         "SELECT colo, COUNT(*) FROM ips WHERE ok_count>0 GROUP BY colo ORDER BY COUNT(*) DESC LIMIT 10").fetchall()
     port_rows = conn.execute(
         "SELECT port, COUNT(*) FROM ips WHERE ok_count>0 GROUP BY port ORDER BY COUNT(*) DESC LIMIT 6").fetchall()
-    route_rows = conn.execute(
-        "SELECT route_class, COUNT(*) FROM ips WHERE route_class IS NOT NULL "
-        "GROUP BY route_class ORDER BY COUNT(*) DESC LIMIT 10").fetchall()
-    with_route = conn.execute(
-        "SELECT COUNT(*) FROM ips WHERE route_class IS NOT NULL").fetchone()[0]
-    premium = conn.execute(
-        "SELECT COUNT(*) FROM ips WHERE route_class='premium'").fetchone()[0]
     conn.close()
     nets, label = fetch_networks(args.operator, args.port)
     cov = net_total(nets)
@@ -1065,17 +984,12 @@ def stats_report(args):
         f"覆盖源: {label}  地址总量约: {cov:,}",
         f"已测试IP: {total:,}  (覆盖率 {total / cov * 100 if cov else 0:.2f}%)",
         f"存活IP:  {ok:,}  已验证地区: {verified:,}  未识别地区: {unverified:,}  有带宽数据: {with_bw:,}",
-        f"已测线路: {with_route:,}  精品线路: {premium:,}",
         f"平均延迟(存活): {avg_lat}ms",
         f"常用端口: " + ", ".join(f"{p}:{c}" for p, c in port_rows),
         "机房分布(前10):",
     ]
     for colo, c in rows:
         out.append(f"  {colo}: {c}")
-    if route_rows:
-        out.append("线路分布(前10):")
-        for r, c in route_rows:
-            out.append(f"  {r}: {c}")
     return "\n".join(out)
 
 
@@ -1145,14 +1059,6 @@ def main():
                     help="每轮复核库内旧IP数量(存活刷新+失败重试, 默认30; 0=关闭)")
     ap.add_argument("--backfill", type=int, default=0,
                     help="每轮为'存活但缺地区(colo/loc)'的旧IP补全地区识别数量(默认0; GUI默认开启)")
-    ap.add_argument("--route-check", dest="route_check", action="store_true", default=True,
-                    help="对验证通过的IP做路由线路分类(ping TTL traceroute, 默认开)")
-    ap.add_argument("--no-route-check", dest="route_check", action="store_false",
-                    help="关闭路由线路分类检测")
-    ap.add_argument("--route-budget", type=int, default=100,
-                    help="每轮做线路检测的IP上限(默认100; 0=关闭; 新发现优先, 已测且新鲜的不占额度)")
-    ap.add_argument("--route-stale-hours", type=float, default=6, dest="route_stale_hours",
-                    help="已测线路的IP超过该小时数且本轮有带宽数据才重测(默认6), 避免重复探测")
     ap.add_argument("--bench-size", type=int, default=50_000_000)
     ap.add_argument("--bench-timeout", type=float, default=12)
     ap.add_argument("--bench-parallel", type=int, default=4)

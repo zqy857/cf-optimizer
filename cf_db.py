@@ -318,23 +318,28 @@ def prune_ips(conn, max_v4, max_v6):
         if not limit or int(limit) <= 0:
             continue
         proto = "ip LIKE '%:%'" if is_v6 else "ip NOT LIKE '%:%'"
-        cnt = conn.execute(f"SELECT COUNT(*) FROM ips WHERE {proto}").fetchone()[0]
-        excess = cnt - int(limit)
-        if excess <= 0:
-            continue
-        conn.execute("CREATE TEMP TABLE IF NOT EXISTS victims"
-                     "(ip TEXT PRIMARY KEY)")
-        conn.execute("DELETE FROM victims")
-        conn.execute(f"INSERT INTO victims(ip) SELECT ip FROM ips "
-                     f"WHERE {proto} "
-                     f"ORDER BY {PRUNE_SCORE_SQL} LIMIT :n",
-                     {"now": now, "n": int(excess)})
-        conn.execute("INSERT OR REPLACE INTO graveyard(ip, buried_at) "
-                     "SELECT v.ip, :ts FROM victims v JOIN ips i "
-                     "ON i.ip = v.ip WHERE i.ok_count = 0",
-                     {"ts": _grave_ts(now)})
-        conn.execute("DELETE FROM ips WHERE ip IN (SELECT ip FROM victims)")
-        pruned += excess
+        alive_cond = f"{proto} AND ok_count > 0"
+        alive = conn.execute(f"SELECT COUNT(*) FROM ips WHERE {alive_cond}").fetchone()[0]
+        dead = conn.execute(f"SELECT COUNT(*) FROM ips WHERE {proto} AND ok_count = 0").fetchone()[0]
+
+        # 第一优先: 清理所有死IP(ok_count=0), 不占存活名额
+        if dead > 0:
+            conn.execute(f"DELETE FROM ips WHERE {proto} AND ok_count = 0")
+            pruned += dead
+
+        # 第二: 存活数超限时按分数剪枝
+        excess = alive - int(limit)
+        if excess > 0:
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS victims"
+                         "(ip TEXT PRIMARY KEY)")
+            conn.execute("DELETE FROM victims")
+            conn.execute(f"INSERT INTO victims(ip) SELECT ip FROM ips "
+                         f"WHERE {alive_cond} "
+                         f"ORDER BY {PRUNE_SCORE_SQL} LIMIT :n",
+                         {"now": now, "n": int(excess)})
+            conn.execute("DELETE FROM ips WHERE ip IN (SELECT ip FROM victims)")
+            pruned += excess
+
     remaining = conn.execute("SELECT COUNT(*) FROM ips").fetchone()[0]
     try:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")

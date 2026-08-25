@@ -181,6 +181,12 @@ def build_where(q):
             pass
     if q.get("hasbw", [""])[0] in ("1", "true"):
         where.append("bw_last_mbps IS NOT NULL AND bw_last_mbps>0")
+    v4 = q.get("v4", [""])[0]
+    v6 = q.get("v6", [""])[0]
+    if v4 == "1":
+        where.append("ip NOT LIKE '%:%'")
+    elif v6 == "1":
+        where.append("ip LIKE '%:%'")
     maxlat = q.get("maxlat", [""])[0]
     if maxlat:
         try:
@@ -270,6 +276,19 @@ def _compute_stats(db):
     minlat = q_one(db, "SELECT ROUND(MIN(latency_ms),1) FROM ips WHERE ok_count>0")
     minlat = minlat[0] if minlat else None
 
+    v4_alive = q_one(db, "SELECT COUNT(*) FROM ips WHERE ok_count>0 AND ip NOT LIKE '%:%'")
+    v4_alive = v4_alive[0] if v4_alive else 0
+    v6_alive = q_one(db, "SELECT COUNT(*) FROM ips WHERE ip LIKE '%:%' AND ok_count>0")
+    v6_alive = v6_alive[0] if v6_alive else 0
+    v4_bw = q_one(db, "SELECT COUNT(*) FROM ips WHERE ok_count>0 AND ip NOT LIKE '%:%' AND bandwidth_mbps>0")
+    v4_bw = v4_bw[0] if v4_bw else 0
+    v6_bw = q_one(db, "SELECT COUNT(*) FROM ips WHERE ok_count>0 AND ip LIKE '%:%' AND bandwidth_mbps>0")
+    v6_bw = v6_bw[0] if v6_bw else 0
+    v4_lat = q_one(db, "SELECT ROUND(AVG(latency_ms),1) FROM ips WHERE ok_count>0 AND ip NOT LIKE '%:%' AND latency_ms IS NOT NULL")
+    v4_lat = v4_lat[0] if v4_lat else None
+    v6_lat = q_one(db, "SELECT ROUND(AVG(latency_ms),1) FROM ips WHERE ok_count>0 AND ip LIKE '%:%' AND latency_ms IS NOT NULL")
+    v6_lat = v6_lat[0] if v6_lat else None
+
     colos = q_rows(db, "SELECT colo, COUNT(*) FROM ips WHERE ok_count>0 AND colo IS NOT NULL "
                        "GROUP BY colo ORDER BY COUNT(*) DESC LIMIT 12")
     locs = q_rows(db, "SELECT loc, COUNT(*) FROM ips WHERE ok_count>0 AND loc IS NOT NULL "
@@ -322,6 +341,9 @@ def _compute_stats(db):
     return {
         "total": total, "alive": alive, "verified": verified, "withbw": withbw,
         "tested_all": tested_all,
+        "v4_alive": v4_alive, "v6_alive": v6_alive,
+        "v4_bw": v4_bw, "v6_bw": v6_bw,
+        "v4_lat": v4_lat, "v6_lat": v6_lat,
         "avglat": avglat, "maxbw": maxbw, "bwbest": bwbest, "minlat": minlat,
         "coverage": round(total / COV_TOTAL * 100, 3) if COV_TOTAL else 0,
         "colos": [{"name": c or "UNK", "count": n} for c, n in colos],
@@ -1393,7 +1415,7 @@ button:disabled{opacity:.38;cursor:not-allowed;filter:none;transform:none;box-sh
 
 .chk{display:flex;align-items:center;gap:6px;font-size:13px;padding-bottom:8px}
 .chk input{accent-color:var(--acc);width:16px;height:16px;cursor:pointer}
-#f_hasbw:checked+label,#f_v6:checked+label,#opt_hasbw:checked+label,#opt_v6:checked+label{color:var(--acc2);font-weight:700}
+#f_hasbw:checked+label,#f_v4:checked+label,#f_v6:checked+label,#opt_hasbw:checked+label,#opt_v4:checked+label,#opt_v6:checked+label{color:var(--acc2);font-weight:700}
 .pin{color:var(--acc2);font-size:13px;font-weight:700;cursor:pointer;user-select:none}
 .pin:hover{text-decoration:underline}
 footer .link{color:var(--cyan);cursor:pointer;text-decoration:underline;text-underline-offset:3px}
@@ -1749,6 +1771,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <div class="f"><label>IP包含</label><input id="f_q" placeholder="IP关键字"></div>
     <div class="f"><label>端口</label><input id="f_port" placeholder="全部"></div>
     <div class="chk"><input type="checkbox" id="f_hasbw"><label for="f_hasbw">仅有带宽</label></div>
+    <div class="chk"><input type="checkbox" id="f_v4"><label for="f_v4">仅IPv4</label></div>
     <div class="chk"><input type="checkbox" id="f_v6"><label for="f_v6">仅IPv6</label></div>
     <button class="ghost" onclick="exportF('txt')">导出 ADD.txt</button>
     <button class="ghost" onclick="exportF('csv')">导出 CSV</button>
@@ -1791,6 +1814,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
       <option value="bw">优先带宽</option><option value="lat">优先延迟</option></select></div>
     <div class="f"><label>地区过滤</label><input id="opt_region" placeholder="如 HKG,NRT"></div>
     <div class="chk"><input type="checkbox" id="opt_hasbw" checked><label for="opt_hasbw">仅有带宽</label></div>
+    <div class="chk"><input type="checkbox" id="opt_v4"><label for="opt_v4">仅IPv4</label></div>
     <div class="chk"><input type="checkbox" id="opt_v6"><label for="opt_v6">仅IPv6</label></div>
     <button class="ghost" id="optBtn" onclick="runOpt()">优选</button>
     <button class="ghost mini" onclick="copyOptSel()">复制选中(<span id="optSelCount">0</span>)</button>
@@ -1949,6 +1973,7 @@ function optParams(){
   p.set("prio",$("opt_prio").value||"bw");
   if($("opt_region").value.trim())p.set("region",$("opt_region").value.trim());
   if($("opt_hasbw").checked)p.set("hasbw","1");
+  if($("opt_v4").checked)p.set("v4","1");
   if($("opt_v6").checked)p.set("v6","1");
   return p;
 }
@@ -2201,6 +2226,7 @@ function tableParams(){
   if($("f_q").value)p.set("q",$("f_q"));
   if($("f_port").value)p.set("port",$("f_port"));
   if($("f_hasbw").checked)p.set("hasbw","1");
+  if($("f_v4").checked)p.set("v4","1");
   if($("f_v6").checked)p.set("v6","1");
   p.set("sort",SORT);
   p.set("offset",OFFSET);
@@ -2296,6 +2322,7 @@ function saveSet(){
     concurrency:$("concurrency").value,verify:$("verify").value,bench:$("bench").value,
     backfill:$("backfill").value,recheck:$("recheck").value,exploit:$("exploit").value,
     max_latency:$("max_latency").value,bench_parallel:$("bench_parallel").value,
+    max_ips_v4:$("max_ips_v4").value,max_ips_v6:$("max_ips_v6").value,
     tls_check:$("tls_check").checked?"1":"0",
     ipv6:$("ipv6").checked?"1":"0"};
   fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},
@@ -2406,11 +2433,23 @@ async function poll(){
 let STATS=null;
 function statTipSetup(){
   const map={
-    st_total:{t:"已测试IP",c:"var(--acc)",rows:s=>[["累计测试",s.tested_all??s.total,"var(--c-emph)"],["库内保留",s.total,"var(--acc2)"],["覆盖率",s.coverage+"%","var(--acc2)"]]},
-    st_alive:{t:"存活IP",c:"var(--acc2)",rows:s=>{const dead=s.total-s.alive;return [["当前存活",s.alive,"var(--acc2)"],["不可用",dead,"var(--err)"],["存活率",s.total?Math.round(s.alive/s.total*100)+"%":"-","var(--c-emph)"]]}},
+    st_total:{t:"已测试IP",c:"var(--acc)",rows:s=>[
+      ["── IPv4 ──","var(--c-emph)"],["存活",s.v4_alive??0,"var(--acc2)"],
+      ["── IPv6 ──","var(--c-emph)"],["存活",s.v6_alive??0,"var(--cyan)"],
+      ["── 汇总 ──","var(--c-emph)"],["累计测试",s.tested_all??s.total,"var(--c-emph)"],["库内保留",s.total,"var(--acc2)"],["覆盖率",s.coverage+"%","var(--acc2)"]]},
+    st_alive:{t:"存活IP",c:"var(--acc2)",rows:s=>{
+      const v4a=s.v4_alive??0, v6a=s.v6_alive??0, dead=s.total-s.alive;
+      return [["IPv4 存活",v4a,"var(--acc2)"],["IPv6 存活",v6a,"var(--cyan)"],
+              ["不可用",dead,"var(--err)"],
+              ["存活率",s.total?Math.round(s.alive/s.total*100)+"%":"-","var(--c-emph)"]]}},
     st_verified:{t:"已验证地区",c:"var(--purp)",rows:s=>[["已验证",s.verified,"var(--purp)"],["累计测试",s.tested_all??s.total,"var(--c-emph)"]]},
-    st_bw:{t:"有带宽数据",c:"var(--acc)",rows:s=>[["有带宽",s.withbw,"var(--acc2)"],["累计测试",s.tested_all??s.total,"var(--c-emph)"],["占比",s.tested_all?Math.round(s.withbw/s.tested_all*100)+"%":"-","var(--c-emph)"]]},
-    st_avglat:{t:"平均延迟",c:"var(--warn)",rows:s=>[["平均值",s.avglat??"-","var(--warn)"],["最低",s.minlat??"-","var(--c-emph)"]]},
+    st_bw:{t:"有带宽数据",c:"var(--acc)",rows:s=>[
+      ["IPv4 有带宽",s.v4_bw??0,"var(--acc2)"],["IPv6 有带宽",s.v6_bw??0,"var(--cyan)"],
+      ["合计",s.withbw,"var(--c-emph)"],
+      ["占存活",s.alive?Math.round(s.withbw/s.alive*100)+"%":"-","var(--c-emph)"]]},
+    st_avglat:{t:"平均延迟",c:"var(--warn)",rows:s=>[
+      ["IPv4 平均",s.v4_lat??"-","var(--warn)"],["IPv6 平均",s.v6_lat??"-","var(--cyan)"],
+      ["总体平均",s.avglat??"-","var(--c-emph)"],["最低",s.minlat??"-","var(--acc2)"]]},
     st_maxbw:{t:"最高带宽",c:"var(--acc)",rows:s=>[["最近最高",s.maxbw??"-","var(--c-emph)"],["历史最高",s.bwbest??"-","var(--acc2)"]]},
     st_minlat:{t:"最低延迟",c:"var(--warn)",rows:s=>[["最低",s.minlat??"-","var(--c-emph)"],["平均",s.avglat??"-","var(--warn)"]]},
     st_cov:{t:"覆盖率",rows:s=>[["覆盖",s.coverage+"%","var(--c-emph)"],["已发现",s.total,"var(--acc2)"]]},
@@ -2480,7 +2519,7 @@ function bwTipSetup(){
 ["f_region","f_minbw","f_maxlat","f_q","f_port"].forEach(id=>{
   $(id).addEventListener("input",()=>{OFFSET=0;loadTable()});
 });
-["f_hasbw","f_v6"].forEach(id=>{
+["f_hasbw","f_v4","f_v6"].forEach(id=>{
   $(id).addEventListener("change",()=>{OFFSET=0;loadTable()});
 });
 loadSet();

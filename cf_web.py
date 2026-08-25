@@ -576,6 +576,9 @@ def scanner_worker(args):
             nonlocal pend_count
             t = rec.get("type")
             if t == "result":
+                mt = MANUAL_HOLD.get(rec.get("ip"))
+                if mt and time.time() < mt:
+                    rec = {k: v for k, v in rec.items() if k not in ("latency", "bandwidth")}
                 cf_db.upsert(conn, rec)
                 pend_count += 1
                 if pend_count >= 200:
@@ -739,6 +742,9 @@ def _wp_loop():
         refresh_wallpaper()
 
 
+MANUAL_HOLD = {}  # ip -> 保护截止时间戳
+
+
 def test_ip(db, params):
     ip = (params.get("ip") or "").strip()
     act = params.get("action") or "lat"
@@ -757,6 +763,7 @@ def test_ip(db, params):
             if lat is None:
                 return {"ok": False, "error": "连接失败或超时"}
             upsert_test(db, ip, port, latency=lat)
+            MANUAL_HOLD[ip] = time.time() + 300
             return {"ok": True, "latency": round(lat, 1)}
         elif act == "bw":
             ns = types.SimpleNamespace(bench_size=30_000_000, bench_timeout=12,
@@ -766,6 +773,7 @@ def test_ip(db, params):
             if bw is None:
                 return {"ok": False, "error": "测速失败"}
             upsert_test(db, ip, port, bandwidth=bw)
+            MANUAL_HOLD[ip] = time.time() + 300
             return {"ok": True, "bandwidth": bw}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -776,8 +784,6 @@ def upsert_test(db, ip, port, latency=None, bandwidth=None):
         conn = sqlite3.connect(db)
         rec = {"ip": ip, "port": port, "ok": True,
                "latency": latency, "bandwidth": bandwidth,
-               "route_as_list": json.dumps(route_as_list) if route_as_list else None,
-               "route_hops": json.dumps(route_hops, ensure_ascii=False) if route_hops else None,
                "tested_at": time.time()}
         cf_db.upsert(conn, rec)
         conn.commit()
@@ -1479,9 +1485,14 @@ footer{margin-top:auto;padding:14px;color:var(--dim);font-size:12px;text-align:c
 #msg{color:var(--warn);font-size:13px;min-height:18px;margin:8px 0}
   font-size:12.5px;padding:9px 13px;border-radius:8px;margin:6px 0;line-height:1.6}
   font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
-.pin-bar{display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;color:#0d9488;
-  background:rgba(47,214,163,.20);border:1px solid rgba(13,148,136,.55);padding:8px 13px;
-  border-radius:8px;margin:6px 0}
+.pin-bar{display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:700;color:#0d9488;
+  background:linear-gradient(90deg,rgba(47,214,163,.30),rgba(47,214,163,.10));
+  border:1px solid rgba(13,148,136,.60);padding:8px 13px;
+  border-radius:8px;margin:6px 0;box-shadow:0 0 16px rgba(47,214,163,.30);
+  animation:pinIn .35s cubic-bezier(.2,.7,.3,1.2)}
+@keyframes pinIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+@keyframes cellFlash{0%{background:rgba(96,165,250,.40)}100%{background:transparent}}
+.cell-flash{animation:cellFlash 1.4s ease}
 .pin-bar b{font-family:ui-monospace,Menlo,Consolas,monospace}
 tr.just-tested{outline:2.5px solid var(--acc2);outline-offset:-2px;
   background:rgba(47,214,163,.22) !important;
@@ -2166,7 +2177,7 @@ function renderTable(data){
   PAGE_TOTAL=data.total;
   const pinBar=$("pinBar");
   if(PIN&&Date.now()-PIN_TS<30000){
-    pinBar.innerHTML='已置顶刚测试的 IP <b>'+esc(PIN)+'</b> <span class="link" onclick="unpin()">✕ 取消置顶</span>';
+    pinBar.innerHTML='📌 已置顶刚测试的 IP <b>'+esc(PIN)+'</b> <button class="mini ghost" onclick="unpin()" style="margin-left:6px;padding:3px 10px">取消置顶 ✕</button>';
     pinBar.style.display="flex";
   }else{pinBar.style.display="none";}
   $("pageInfo").textContent="共 "+data.total+" 条 · 显示 "+(data.offset+1)+"~"+(data.offset+rows.length)+" · 每页 "+data.limit;
@@ -2218,6 +2229,15 @@ function testIp(act,ip,port,btn){
       btn.textContent=act==="lat"?(r.latency+"ms"):(r.bandwidth+"M");
       btn.classList.add("done");btn.title=MANUAL[ip+":"+port+":"+act].title;
       btn.disabled=false;loadTable();
+      setTimeout(()=>{
+        const tr=[...document.querySelectorAll("#tbody tr")].find(t=>t.querySelector('[data-ip]')?.dataset.ip===ip);
+        if(!tr)return;
+        const tds=tr.querySelectorAll("td");
+        if(act==="lat"&&r.latency!=null){tds[3].innerHTML='<span class="lat">'+r.latency+"</span>";}
+        if(act==="bw"&&r.bandwidth!=null){tds[2].innerHTML='<span class="bw">'+r.bandwidth+"</span>";}
+        const td=tds[act==="lat"?3:2];
+        if(td){td.classList.remove("cell-flash");void td.offsetWidth;td.classList.add("cell-flash");}
+      },600);
     }
     else{btn.textContent="失败";btn.title={lat:"延迟测试失败",bw:"带宽测试失败"}[act];
       setTimeout(()=>{btn.textContent=old;btn.disabled=false},8000);

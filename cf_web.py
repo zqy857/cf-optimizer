@@ -1096,7 +1096,6 @@ PAGE = r"""<!DOCTYPE html>
    ============================================================ */
 :root{
   --bg:#0f0f0f;
-  --panel:#161618;
   --panel2:#1f1f22;
   --line:#2e2e34;
   --line2:#3d3d44;
@@ -1110,7 +1109,6 @@ PAGE = r"""<!DOCTYPE html>
   --cyan:#67e8f9;
   --grad:#2563eb;
   --grad-v:#93c5fd;
-  --shadow:0 1px 3px rgba(0,0,0,.4);
   --tb-bg:rgba(10,13,19,.62);
   --thead-bg:rgba(22,22,24,.95);
   --input-bg:#131316;
@@ -1129,7 +1127,6 @@ PAGE = r"""<!DOCTYPE html>
 }
 html[data-theme="light"]{
   --bg:#f5f5f7;
-  --panel:#ffffff;
   --panel2:#f2f3f5;
   --line:#e0e2e8;
   --line2:#bfc4cc;
@@ -1143,7 +1140,6 @@ html[data-theme="light"]{
   --cyan:#0891b2;
   --grad:#2563eb;
   --grad-v:#2563eb;
-  --shadow:0 1px 3px rgba(31,41,55,.08);
   --tb-bg:rgba(255,255,255,.62);
   --thead-bg:rgba(247,248,250,.96);
   --input-bg:#ffffff;
@@ -1171,7 +1167,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;background:var(--scrim
   color:var(--txt);
   font-family:"Inter","HarmonyOS Sans SC","PingFang SC","Segoe UI","Microsoft YaHei",system-ui,sans-serif;
   font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;
-}
+
 ::selection{background:rgba(99,148,255,.30)}
 ::-webkit-scrollbar{width:9px;height:9px}
 ::-webkit-scrollbar-thumb{background:rgba(148,163,184,.25);border-radius:8px;border:2px solid transparent;background-clip:content-box}
@@ -1460,7 +1456,7 @@ tbody tr:hover{transform:scale(1.012);box-shadow:0 2px 16px rgba(2,6,18,.45);z-i
 .lat{color:var(--warn);font-variant-numeric:tabular-nums}
 .colo{font-weight:700;color:var(--purp)}
   background:var(--panel2);border:1px dashed var(--line);border-radius:8px;
-  padding:8px 12px;margin:0 0 14px}
+  padding:8px 12px;margin:0 0 14px
 .dead{color:var(--dim);text-align:center;padding:20px;font-size:13px}
 #tabWrap{max-height:560px;overflow-y:auto;overflow-x:auto}
 .mini{font-size:12px;padding:4px 10px;border-radius:6px;box-shadow:none}
@@ -1483,8 +1479,8 @@ footer{margin-top:auto;padding:14px;color:var(--dim);font-size:12px;text-align:c
 
 /* ---------- 消息 / 横幅 ---------- */
 #msg{color:var(--warn);font-size:13px;min-height:18px;margin:8px 0}
-  font-size:12.5px;padding:9px 13px;border-radius:8px;margin:6px 0;line-height:1.6}
-  font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
+  font-size:12.5px;padding:9px 13px;border-radius:8px;margin:6px 0;line-height:1.6
+  font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all
 .pin-bar{display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:700;color:#0d9488;
   background:linear-gradient(90deg,rgba(47,214,163,.30),rgba(47,214,163,.10));
   border:1px solid rgba(13,148,136,.60);padding:8px 13px;
@@ -1559,45 +1555,94 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
 .content{overflow-x:clip}
 
 @media (max-width:720px){
-  .content{padding:12px 10px 8px}
-  .topbar{padding:10px 12px}
-  .crumb{font-size:14.5px}
-  #dbpath{display:none}
-  .card{padding:12px;border-radius:13px}
+  /* 布局基础 */
+  body{padding:10px 8px;font-size:14px;-webkit-text-size-adjust:100%}
+  .content{padding:10px 6px 6px}
+  .topbar{padding:10px 10px}
+  .crumb{font-size:15px;font-weight:700}
+
+  /* 侧栏抽屉 */
+  .side{width:280px;box-shadow:12px 0 40px rgba(0,0,0,.5)}
+  .side.open{transform:translateX(0)}
+  .brand{padding:16px 14px}
+  .brand-t{font-size:16px}
+  .nav{padding:10px 6px}
+  .nv{padding:13px 14px;margin:4px 6px;border-radius:12px;font-size:14.5px}
+  .nv i{font-size:19px}
+  .side-foot{padding:14px 12px;gap:10px}
+  .sbtn{width:44px;height:44px;font-size:17px}
+  .theme-btn{font-size:18px}
+
+  /* 统计卡片 */
   .stats{grid-template-columns:repeat(2,1fr);gap:8px}
-  .stat .v{font-size:22px}
+  .stat{padding:14px 12px 11px;border-radius:12px}
+  .stat .v{font-size:26px;font-weight:800}
+  .stat .l{font-size:11.5px;margin-top:3px}
+
+  /* 图表 */
   .charts{grid-template-columns:1fr;gap:10px}
-  canvas{height:170px}
+  .chart{padding:10px;border-radius:10px}
+  .chart h3{font-size:13px}
+  canvas{height:200px}
+
+  /* 扫描控制表单 */
   .row{gap:8px}
-  .row .f{flex:1 1 42%}
-  .row .f input,.row .f select{width:100%;min-width:0}
-  .row button{flex:1 1 30%;padding:10px 8px}
-  .toolbar{gap:8px}
-  .toolbar .f{flex:1 1 42%}
-  .toolbar .f input{width:100%;min-width:0}
-  .toolbar button{flex:1 1 30%;padding:10px 6px}
-  .chk{font-size:12.5px}
-  .f .tip .pop{width:min(230px,82vw);left:auto;right:0;bottom:150%}
-  #tabWrap,#optWrap{overflow-x:auto}
-  #tabWrap table,#optWrap table{min-width:480px}
-  #tbody td:last-child{white-space:normal}
-  #tbody td:last-child .mini{display:block;width:100%;margin:3px 0;text-align:center}
-  #tabWrap thead th:nth-child(2),#tbody td:nth-child(2),
-  #tabWrap thead th:nth-child(6),#tbody td:nth-child(6),
-  #tabWrap thead th:nth-child(7),#tbody td:nth-child(7),
-  #tabWrap thead th:nth-child(8),#tbody td:nth-child(8),
-  #tabWrap thead th:nth-child(10),#tbody td:nth-child(10){display:none}
-  #optWrap thead th:nth-child(2),#optBody td:nth-child(2),
-  #optWrap thead th:nth-child(6),#optBody td:nth-child(6),
-  #optWrap thead th:nth-child(7),#optBody td:nth-child(7),
-  #optWrap thead th:nth-child(9),#optBody td:nth-child(9){display:none}
-  th,td{padding:7px 9px;font-size:13px}
-  .pager{gap:6px}
-  .pager button{padding:8px 10px}
-  .pager .pg{flex-wrap:wrap}
-  .modal{width:96%;padding:14px 14px}
-  .logbox{height:150px}
+  .row .f{flex:1 1 100%}
+  .row .f label{font-size:12.5px;margin-bottom:4px}
+  .row .f input,.row .f select{width:100%;min-width:0;padding:12px 10px;font-size:16px;border-radius:10px}
+  .row button{flex:1 1 45%;padding:13px 8px;font-size:14.5px;min-height:46px}
+  .chk{padding:6px 0;font-size:14px}
+  .chk input{width:20px;height:20px}
+  .chk label{font-size:13.5px}
+
+  /* 进度条与日志 */
+  .prog{gap:8px;margin-top:10px}
+  .prog .bar{height:18px;border-radius:10px}
   .prog .plabel{font-size:12px}
+  .logbox{height:160px;font-size:12px;padding:10px;border-radius:10px;margin-top:8px}
+  .logline{line-height:1.7}
+
+  /* IP 列表 */
+  .toolbar{gap:6px;margin-bottom:8px}
+  .toolbar .f{flex:1 1 45%}
+  .toolbar .f input{width:100%;min-width:0;padding:10px;font-size:16px}
+  .toolbar button{flex:1 1 44%;padding:11px 6px;font-size:13px;min-height:44px}
+  th,td{padding:9px 8px;font-size:13.5px}
+  #tabWrap,#optWrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  #tabWrap table,#optWrap table{min-width:520px}
+  #tbody td:last-child{white-space:normal;min-width:70px}
+  #tbody td:last-child .mini{display:block;width:100%;margin:3px 0;text-align:center;padding:8px 4px;font-size:12.5px;min-height:34px}
+  .mini{padding:7px 10px;font-size:12.5px;min-height:34px}
+
+  /* 手动优选 */
+  #optWrap table{min-width:480px}
+
+  /* 分页 */
+  .pager{gap:6px;margin-top:10px}
+  .pager button{padding:9px 10px;font-size:12.5px}
+  .pager span{font-size:12px}
+  .pager input{width:48px;padding:8px 4px;font-size:14px}
+  .pager .pg{flex-wrap:wrap}
+
+  /* 弹窗与提示 */
+  .modal{width:94%;padding:16px 14px;border-radius:14px}
+  #toast{bottom:20px;padding:12px 20px;font-size:13.5px;max-width:90vw}
+  .route-hint{padding:8px 10px;font-size:11.5px}
+
+  /* 特效设置 */
+  #v-fx .fr{flex-wrap:wrap;gap:8px}
+  #v-fx .fr label{flex:0 0 100%;margin-bottom:2px}
+  #v-fx input[type=range]{width:100%;min-width:0}
+  #v-fx input[type=color]{width:50px;height:32px}
+}
+
+/* 超小屏(≤380px) */
+@media (max-width:380px){
+  .stats{grid-template-columns:1fr 1fr;gap:6px}
+  .stat{padding:11px 9px 9px}
+  .stat .v{font-size:22px}
+  .nv{padding:12px 10px;font-size:13.5px}
+  .brand-t{font-size:14.5px}
 }
 </style>
 <body>

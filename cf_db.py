@@ -36,7 +36,6 @@ CF 优选IP 扫描数据库 (常驻稳定扫描器) - 增强版
 import argparse
 import asyncio
 import ipaddress
-import json
 import os
 import queue
 import random

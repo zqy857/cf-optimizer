@@ -285,13 +285,13 @@ def _grave_ts(now):
     return now + GRAVE_DAYS * 86400 - 3600
 
 
-def prune_ips(conn, max_ips):
-    """库内超过 max_ips 时按质量评分从低到高剔除, 返回剔除数量. max_ips<=0 不限.
+def prune_ips(conn, max_v4, max_v6):
+    """IPv4/IPv6 分别按上限剪枝, 返回总剔除数. limit<=0 不限该协议.
 
-    被淘汰的"从未成功"的死IP写入 graveyard 墓碑, 静默期内不再被抽中,
-    避免反复浪费探测预算; 墓碑过期自动清理且总量封顶.
+    被淘汰的"从未成功"的死IP写入 graveyard 墓碑, 静默期内不再被抽中;
+    墓碑过期自动清理且总量封顶.
     """
-    if not max_ips or int(max_ips) <= 0:
+    if (not max_v4 or int(max_v4) <= 0) and (not max_v6 or int(max_v6) <= 0):
         return 0
     now = time.time()
     try:
@@ -313,13 +313,20 @@ def prune_ips(conn, max_ips):
                      {"cut": now - 7 * 86400})
 
     _purge_dead()
-    total = conn.execute("SELECT COUNT(*) FROM ips").fetchone()[0]
-    excess = total - int(max_ips)
-    if excess > 0:
+    pruned = 0
+    for is_v6, limit in [(False, max_v4), (True, max_v6)]:
+        if not limit or int(limit) <= 0:
+            continue
+        proto = "ip LIKE '%:%'" if is_v6 else "ip NOT LIKE '%:%'"
+        cnt = conn.execute(f"SELECT COUNT(*) FROM ips WHERE {proto}").fetchone()[0]
+        excess = cnt - int(limit)
+        if excess <= 0:
+            continue
         conn.execute("CREATE TEMP TABLE IF NOT EXISTS victims"
                      "(ip TEXT PRIMARY KEY)")
         conn.execute("DELETE FROM victims")
         conn.execute(f"INSERT INTO victims(ip) SELECT ip FROM ips "
+                     f"WHERE {proto} "
                      f"ORDER BY {PRUNE_SCORE_SQL} LIMIT :n",
                      {"now": now, "n": int(excess)})
         conn.execute("INSERT OR REPLACE INTO graveyard(ip, buried_at) "
@@ -327,12 +334,13 @@ def prune_ips(conn, max_ips):
                      "ON i.ip = v.ip WHERE i.ok_count = 0",
                      {"ts": _grave_ts(now)})
         conn.execute("DELETE FROM ips WHERE ip IN (SELECT ip FROM victims)")
+        pruned += excess
     remaining = conn.execute("SELECT COUNT(*) FROM ips").fetchone()[0]
     try:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     except Exception:
         pass
-    return total - remaining
+    return pruned
 
 
 def fetch_networks(operator, port):
@@ -1062,8 +1070,10 @@ def main():
     ap.add_argument("--bench-timeout", type=float, default=12)
     ap.add_argument("--bench-parallel", type=int, default=4)
     ap.add_argument("--cycles", type=int, default=0, help="扫描轮数限制, 0=无限")
-    ap.add_argument("--max-ips", type=int, default=0,
-                    help="库内IP数量上限, 每轮结束超出部分按质量从低到高剔除, 0=不限制")
+    ap.add_argument("--max-ips-v4", type=int, default=0, dest="max_ips_v4",
+                    help="IPv4 库上限(0=不限)")
+    ap.add_argument("--max-ips-v6", type=int, default=0, dest="max_ips_v6",
+                    help="IPv6 库上限(0=不限)")
     ap.add_argument("--gap", type=float, default=5, help="轮间间隔秒(默认5)")
     ap.add_argument("--once", action="store_true", help="只扫描一轮(发现+验证预算)后退出")
     ap.add_argument("--reverify", type=int, metavar="N", default=0,
@@ -1162,7 +1172,7 @@ def main():
                 print(banner(), f"| 本轮达标 {rec['ok']}", flush=True)
                 if getattr(args, "max_ips", 0):
                     try:
-                        npruned = prune_ips(conn, args.max_ips)
+                        npruned = prune_ips(conn, args.max_ips_v4, args.max_ips_v6)
                         conn.commit()
                         if npruned:
                             print(f"库内超限清理: 剔除 {npruned} 个低质量IP",

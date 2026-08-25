@@ -76,7 +76,7 @@ COLO_COUNTRY = {
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cf_settings.json")
 SETTINGS_KEYS = ["operator", "ports", "count", "concurrency", "verify", "bench",
                  "bench_parallel", "backfill", "recheck", "exploit", "max_latency", "tls_check",
-                                   "bench_host", "ipv6", "max_ips"]
+                                   "bench_host", "ipv6", "max_ips_v4", "max_ips_v6"]
 
 
 def load_settings():
@@ -539,7 +539,8 @@ def scan_args(params, db):
         tls_check=str(flat.get("tls_check", "1")) not in ("0", "false", ""),
         exploit=min(1.0, max(0.0, num("exploit", 0.6))),
         cooldown=max(1, num("cooldown", 3600)),
-        max_ips=max(0, int(num("max_ips", 0, int))),
+        max_ips_v4=max(0, int(num("max_ips_v4", 0, int))),
+        max_ips_v6=max(0, int(num("max_ips_v6", 0, int))),
         bench_size=int(max(1_000_000, min(num("bench_size", 30_000_000, int), 80_000_000))),
         bench_timeout=max(1, num("bench_timeout", 10)),
         bench_parallel=max(1, int(num("bench_parallel", 6, int))),
@@ -562,7 +563,7 @@ def scanner_worker(args):
                   msg=f"已启动: {label} | 抽样{args.count} 并发{args.concurrency} | "
                       f"端口{','.join(map(str, args.ports))} | TLS确认{'开' if args.tls_check else '关'} | "
                       f"IPv6{'开' if args.ipv6 else '关'} | "
-                      f"库上限{'开' if args.max_ips else '关'}({args.max_ips})")
+                      f"V4{'开' if args.max_ips_v4 else '关'}({args.max_ips_v4}) V6{'开' if args.max_ips_v6 else '关'}({args.max_ips_v6})")
 
         pend_count = 0
 
@@ -592,7 +593,7 @@ def scanner_worker(args):
             elif t == "cycle_end":
                 flush()
                 try:
-                    _n = cf_db.prune_ips(conn, getattr(args, "max_ips", 0))
+                    _n = cf_db.prune_ips(conn, args.max_ips_v4, args.max_ips_v6)
                     if _n:
                         conn.commit()
                         log_event(f"库内超限清理: 已剔除 {_n} 个低质量IP")
@@ -1721,7 +1722,8 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <div class="f"><label>复核/轮<span class="tip">?<span class="pop">对冷却期已过的最旧IP重新探测, 防止IP失效后仍留在列表</span></span></label><input id="recheck" type="number" value="200"></div>
     <div class="f"><label>优质C段比例<span class="tip">?<span class="pop">抽样时0-1比例的IP从历史优质C段(邻居表现好)里选. 0.6=6成优质邻域+4成随机</span></span></label><input id="exploit" type="number" step="0.1" value="0.6"></div>
     <div class="f"><label>最大延迟ms<span class="tip">?<span class="pop">延迟超过该值的IP不算"达标", 不会被送去做验证和测速</span></span></label><input id="max_latency" type="number" value="2000"></div>
-    <div class="f"><label>库上限(个)<span class="tip">?<span class="pop">每轮结束若库内IP超过该值, 自动按质量评分从低到高剔除: 彻底失联的先删, 已验证地区/高带宽/低延迟的保留. 0=不限制. NAS等弱盘建议设5万~20万, 可控制库体积与内存占用</span></span></label><input id="max_ips" type="number" value="0"></div>
+        <div class="f"><label>IPv4库上限<span class="tip">?<span class="pop">IPv4超限后按质量剔除</span></span></label><input id="max_ips_v4" type="number" value="0"></div>
+    <div class="f"><label>IPv6库上限<span class="tip">?<span class="pop">IPv6超限后按质量剔除</span></span></label><input id="max_ips_v6" type="number" value="0"></div>
     <div class="chk"><input type="checkbox" id="tls_check" checked><label for="tls_check">TLS二次确认<span class="tip">?<span class="pop">TCP能连后还要TLS握手(SNI=cloudflare.com)成功才算存活, 过滤假IP. 首次验证的新IP才做(能滤掉约1/4假IP), 复核已达标IP只做TCP不重复握手, 省CPU</span></span></label></div>
     <div class="chk"><input type="checkbox" id="ipv6"><label for="ipv6">同时扫描IPv6<span class="tip">?<span class="pop">IPv6 池 = 公开优选 v6 列表(优先测, 命中率高) + CF官方大段(随机发现新地址). 本机需有IPv6网络</span></span></label></div>
     <button id="startBtn" onclick="control('start')">开始扫描</button>
@@ -2306,7 +2308,7 @@ function loadSet(){
     if(!d||!Object.keys(d).length)return;
     if(d.operator!==undefined)$("operator").value=d.operator||"";
     ["ports","count","concurrency","verify","bench","bench_parallel","bench_host",
-     "max_ips"].forEach(k=>{
+     "max_ips_v4", "max_ips_v6"].forEach(k=>{
        const v=d[k];
        if(v!==undefined&&v!==null&&v!=="")$(k).value=v;
     });

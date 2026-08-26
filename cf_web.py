@@ -346,7 +346,7 @@ def _compute_stats(db):
         "v4_lat": v4_lat, "v6_lat": v6_lat,
         "avglat": avglat, "maxbw": maxbw, "bwbest": bwbest, "minlat": minlat,
         "coverage": round(total / COV_TOTAL * 100, 3) if COV_TOTAL else 0,
-        "colo_list": sorted(set(r[0] for r in q_rows(db, "SELECT DISTINCT colo FROM ips WHERE colo IS NOT NULL AND colo != '' AND ok_count>0"))),
+        "colo_list": [{"code": r[0], "name": country(r[0])} for r in q_rows(db, "SELECT colo FROM ips WHERE colo IS NOT NULL AND colo != '' AND ok_count>0 GROUP BY colo ORDER BY COUNT(*) DESC LIMIT 15")],
         "colos": [{"name": c or "UNK", "count": n} for c, n in colos],
         "countries": countries,
         "locs": [{"name": l or "UNK", "count": n} for l, n in locs],
@@ -2540,7 +2540,7 @@ function bwTipSetup(){
 loadSet();
 fetch("/api/stats").then(r=>r.json()).then(d=>{
   const dl=document.getElementById("coloList");
-  if(dl&&d.colo_list)dl.innerHTML=d.colo_list.map(c=>`<option value="${c}">`).join("");
+  if(dl&&d.colo_list)dl.innerHTML=d.colo_list.map(c=>`<option value="${c.code}">${c.code} - ${c.name}</option>`).join("");
 }).catch(e=>{});
 $('bench_host').addEventListener("input",()=>{$("srcHost").textContent=$("bench_host").value||"speed.cloudflare.com"});
 loadTable();

@@ -1,7 +1,6 @@
 # 🚀 CF 优选IP 扫描管理台
-![image.png](https://cloudfiles.dpdns.org/file/1786948130467_image.png)
-![image.png](https://cloudfiles.dpdns.org/file/1786948153031_image.png)
-
+![image.png](https://cloudfiles.dpdns.org/file/1787702437419_image.png)
+![image.png](https://cloudfiles.dpdns.org/file/1787702457481_image.png)
 基于 Cloudflare 官方 IP 地址池的 **优选 IP 持续扫描器**,带 **Web 图形管理界面**。纯 Python 标准库实现,**零第三方依赖**,Python 3.8+ 即可运行。
 
 ## ✨ 功能特性

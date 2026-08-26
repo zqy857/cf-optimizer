@@ -1780,7 +1780,12 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <section class="view" id="v-table">
       <div class="card">
   <div class="toolbar">
-    <div class="f"><label>机房过滤<span class="tip">?<span class="pop">输入机房代码, 逗号分隔. 点击输入框可从列表选择</span></span></label><input id="f_region" list="coloList" placeholder="如 HKG,NRT"><datalist id="coloList"></datalist></div>
+    <div class="f"><label>机房过滤<span class="tip">?<span class="pop">输入机房代码, 逗号分隔. 点击输入框可从列表选择</span></span></label><div style="display:flex;gap:4px;width:100%">
+      <input id="f_region" placeholder="如 HKG,NRT" style="flex:1;min-width:0">
+      <select id="coloSelect" onchange="addToRegion(this.value);this.selectedIndex=0" style="width:auto;min-width:0;padding:8px 4px;font-size:13px">
+        <option value="" disabled selected>📋 选择</option>
+      </select>
+    </div></div>
     <div class="f"><label>最小带宽Mbps</label><input id="f_minbw" type="number" value="0"></div>
     <div class="f"><label>最大延迟ms</label><input id="f_maxlat" type="number" value="2000"></div>
     <div class="f"><label>IP包含</label><input id="f_q" placeholder="IP关键字"></div>
@@ -2539,9 +2544,17 @@ function bwTipSetup(){
 });
 loadSet();
 fetch("/api/stats").then(r=>r.json()).then(d=>{
-  const dl=document.getElementById("coloList");
-  if(dl&&d.colo_list)dl.innerHTML=d.colo_list.map(c=>`<option value="${c.code}">${c.code} - ${c.name}</option>`).join("");
+  const sel=document.getElementById("coloSelect");
+  if(sel&&d.colo_list)sel.innerHTML='<option value="" disabled selected>📋 选择机房</option>'+d.colo_list.map(c=>`<option value="${c.code}">${c.code} · ${c.name}</option>`).join("");
 }).catch(e=>{});
+function addToRegion(code){
+  if(!code)return;
+  const inp=document.getElementById("f_region");
+  const cur=inp.value.trim();
+  if(cur.includes(code))return;
+  inp.value=cur?cur+","+code:code;
+  OFFSET=0;loadTable();
+}
 $('bench_host').addEventListener("input",()=>{$("srcHost").textContent=$("bench_host").value||"speed.cloudflare.com"});
 loadTable();
 statTipSetup();

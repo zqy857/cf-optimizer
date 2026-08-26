@@ -346,6 +346,7 @@ def _compute_stats(db):
         "v4_lat": v4_lat, "v6_lat": v6_lat,
         "avglat": avglat, "maxbw": maxbw, "bwbest": bwbest, "minlat": minlat,
         "coverage": round(total / COV_TOTAL * 100, 3) if COV_TOTAL else 0,
+        "colo_list": sorted(set(r[0] for r in q_rows(db, "SELECT DISTINCT colo FROM ips WHERE colo IS NOT NULL AND colo != '' AND ok_count>0"))),
         "colos": [{"name": c or "UNK", "count": n} for c, n in colos],
         "countries": countries,
         "locs": [{"name": l or "UNK", "count": n} for l, n in locs],
@@ -995,6 +996,20 @@ class Handler(BaseHTTPRequestHandler):
                         self._send(200, fh.read(), "text/javascript; charset=utf-8")
                 else:
                     self._send(404, b"", "text/plain")
+            elif path == "/zashboard" or path.startswith("/zashboard/"):
+                fp = path.replace("/zashboard", "") or "/index.html"
+                fp = os.path.join(os.path.expanduser("~/cf-work/zashboard"), fp.lstrip("/"))
+                if not os.path.isfile(fp):
+                    fp = os.path.join(os.path.expanduser("~/cf-work/zashboard"), "index.html")
+                ctype = "text/html"
+                if fp.endswith(".js"): ctype = "application/javascript"
+                elif fp.endswith(".css"): ctype = "text/css"
+                elif fp.endswith(".svg"): ctype = "image/svg+xml"
+                elif fp.endswith(".png"): ctype = "image/png"
+                elif fp.endswith(".woff2"): ctype = "font/woff2"
+                elif fp.endswith(".ico"): ctype = "image/x-icon"
+                with open(fp, "rb") as fh:
+                    self._send(200, fh.read(), ctype)
             elif path == "/api/status":
                 st = get_state()
                 st["db"] = os.path.abspath(db)
@@ -1765,7 +1780,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <section class="view" id="v-table">
       <div class="card">
   <div class="toolbar">
-    <div class="f"><label>机房过滤</label><input id="f_region" placeholder="如 HKG,NRT"></div>
+    <div class="f"><label>机房过滤<span class="tip">?<span class="pop">输入机房代码, 逗号分隔. 点击输入框可从列表选择</span></span></label><input id="f_region" list="coloList" placeholder="如 HKG,NRT"><datalist id="coloList"></datalist></div>
     <div class="f"><label>最小带宽Mbps</label><input id="f_minbw" type="number" value="0"></div>
     <div class="f"><label>最大延迟ms</label><input id="f_maxlat" type="number" value="2000"></div>
     <div class="f"><label>IP包含</label><input id="f_q" placeholder="IP关键字"></div>
@@ -2523,6 +2538,10 @@ function bwTipSetup(){
   $(id).addEventListener("change",()=>{OFFSET=0;loadTable()});
 });
 loadSet();
+fetch("/api/stats").then(r=>r.json()).then(d=>{
+  const dl=document.getElementById("coloList");
+  if(dl&&d.colo_list)dl.innerHTML=d.colo_list.map(c=>`<option value="${c}">`).join("");
+}).catch(e=>{});
 $('bench_host').addEventListener("input",()=>{$("srcHost").textContent=$("bench_host").value||"speed.cloudflare.com"});
 loadTable();
 statTipSetup();

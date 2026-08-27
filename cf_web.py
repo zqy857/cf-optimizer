@@ -211,10 +211,6 @@ def build_where(q):
     if ipq:
         where.append("ip LIKE ?")
         params.append(f"%{ipq}%")
-    if q.get("v6", [""])[0] in ("1", "true"):
-        where.append("instr(ip, ':') > 0")
-    if q.get("v4", [""])[0] in ("1", "true"):
-        where.append("instr(ip, ':') = 0")
     return " AND ".join(where), params
 
 
@@ -2242,10 +2238,10 @@ function tableParams(){
   const region=($("f_region").value||"").split(",").map(s=>s.trim()).filter(Boolean);
   const p=new URLSearchParams();
   if(region.length)p.set("region",region.join(","));
-  if(+$("f_minbw")>0)p.set("minbw",$("f_minbw"));
-  if(+$("f_maxlat")<99999)p.set("maxlat",$("f_maxlat"));
-  if($("f_q").value)p.set("q",$("f_q"));
-  if($("f_port").value)p.set("port",$("f_port"));
+  if(+$("f_minbw").value>0)p.set("minbw",$("f_minbw").value);
+  if(+$("f_maxlat").value<99999)p.set("maxlat",$("f_maxlat").value);
+  if($("f_q").value)p.set("q",$("f_q").value);
+  if($("f_port").value)p.set("port",$("f_port").value);
   if($("f_hasbw").checked)p.set("hasbw","1");
   if($("f_v4").checked)p.set("v4","1");
   if($("f_v6").checked)p.set("v6","1");

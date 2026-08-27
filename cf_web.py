@@ -233,6 +233,11 @@ _STATS_CACHE = {"at": 0.0, "data": None}
 STATS_TTL = 30
 
 
+def api_ports(db):
+    rows = q_rows(db, "SELECT DISTINCT port FROM ips WHERE ok_count>0 ORDER BY port")
+    return [r[0] for r in rows]
+
+
 def api_stats(db):
     if (_STATS_CACHE["data"] is None
             or time.time() - _STATS_CACHE["at"] >= STATS_TTL):
@@ -1018,6 +1023,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps(api_table(db, q)).encode("utf-8"))
             elif path == "/api/settings":
                 self._send(200, json.dumps(load_settings()).encode("utf-8"))
+            elif path == "/api/ports":
+                self._send(200, json.dumps(api_ports(db)).encode("utf-8"))
             elif path == "/api/export":
                 fmt = q.get("fmt", ["txt"])[0]
                 body, ctype, fname = export_body(db, q, fmt)
@@ -1786,7 +1793,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <div class="f"><label>最小带宽Mbps</label><input id="f_minbw" type="number" value="0"></div>
     <div class="f"><label>最大延迟ms</label><input id="f_maxlat" type="number" value="2000"></div>
     <div class="f"><label>IP包含</label><input id="f_q" placeholder="IP关键字"></div>
-    <div class="f"><label>端口</label><input id="f_port" placeholder="全部"></div>
+    <div class="f"><label>端口</label><select id="f_port"><option value="">全部</option></select></div>
     <div class="chk"><input type="checkbox" id="f_hasbw"><label for="f_hasbw">仅有带宽</label></div>
     <div class="chk"><input type="checkbox" id="f_v4"><label for="f_v4">仅IPv4</label></div>
     <div class="chk"><input type="checkbox" id="f_v6"><label for="f_v6">仅IPv6</label></div>
@@ -2359,7 +2366,11 @@ function loadSet(){
     if(d.tls_check!==undefined)$("tls_check").checked=d.tls_check!=="0";
     if(d.ipv6!==undefined)$("ipv6").checked=d.ipv6!=="0"&&d.ipv6!==false;
     $("srcHost").textContent=$("bench_host").value||"speed.cloudflare.com";
-  }).catch(e=>{});
+}).catch(e=>{});
+fetch("/api/ports").then(r=>r.json()).then(ports=>{
+  const sel=document.getElementById("f_port");
+  if(sel&&ports.length)sel.innerHTML='<option value="">全部</option>'+ports.map(p=>`<option value="${p}">${p}</option>`).join("");
+}).catch(e=>{});
 }
 function exportF(fmt){
   const u="/api/export?fmt="+fmt+"&"+tableParams();

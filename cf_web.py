@@ -44,6 +44,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import cf_db
+import cf_push
 
 COV_TOTAL = sum(1 << (32 - int(r.split("/")[1])) for r in cf_db.FALLBACK_RANGES)
 VERSION = "2.0.0"
@@ -3071,8 +3072,6 @@ def main():
         daemon_status(args.pidfile)
         return
     try:
-        import cf_db
-        import cf_push
         cf_db.open_db(args.db).close()
     except Exception:
         pass

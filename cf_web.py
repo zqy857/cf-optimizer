@@ -930,6 +930,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, body.encode("utf-8"), ctype, fname)
             elif path == "/api/copy":
                 self._send(200, json.dumps(api_copy(db, q)).encode("utf-8"))
+            elif path == "/api/cf":
+                cfg = cf_push.load_cf_settings(SETTINGS_FILE)
+                self._send(200, json.dumps(cfg).encode("utf-8"))
+            elif path == "/api/cf/status":
+                sched = cf_push.get_scheduler()
+                self._send(200, json.dumps(sched.status).encode("utf-8"))
             else:
                 self._send(404, b'{"error":"not found"}')
         except Exception as e:
@@ -1016,6 +1022,32 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps({"ok": True, "saved": saved}).encode("utf-8"))
             elif path == "/api/test":
                 out = test_ip(db, params)
+                self._send(200, json.dumps(out).encode("utf-8"))
+            elif path == "/api/cf":
+                cf_push.save_cf_settings(SETTINGS_FILE, params)
+                sched = cf_push.get_scheduler()
+                cfg = cf_push.load_cf_settings(SETTINGS_FILE)
+                if cfg.get("auto_enabled"):
+                    sched.start(cfg, SETTINGS_FILE, db)
+                else:
+                    sched.stop()
+                self._send(200, json.dumps({"ok": True}).encode("utf-8"))
+            elif path == "/api/cf/test":
+                token = params.get("token", "")
+                zone_id = params.get("zone_id", "")
+                out = cf_push.test_connection(token, zone_id)
+                self._send(200, json.dumps(out).encode("utf-8"))
+            elif path == "/api/cf/push":
+                cfg = cf_push.load_cf_settings(SETTINGS_FILE)
+                ip = params.get("ip", "")
+                if not ip:
+                    self._send(200, json.dumps({"ok": False, "error": "缺少 ip 参数"}).encode("utf-8"))
+                    return
+                existing = cf_push.get_dns_record(cfg["token"], cfg["zone_id"],
+                                                  cfg["domain"], cfg.get("subdomain", "@"))
+                rec_id = existing.get("id") if existing.get("ok") else None
+                out = cf_push.push_ip(cfg["token"], cfg["zone_id"], cfg["domain"],
+                                      cfg.get("subdomain", "@"), ip, record_id=rec_id)
                 self._send(200, json.dumps(out).encode("utf-8"))
             else:
                 self._send(404, b'{"error":"not found"}')
@@ -1593,6 +1625,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <a class="nv on" data-v="overview"><i>🏠</i><span>总览看板</span></a>
     <a class="nv" data-v="scan"><i>🛰️</i><span>扫描控制</span></a>
     <a class="nv" data-v="table"><i>📋</i><span>IP 列表</span></a>
+    <a class="nv" data-v="cf"><i>☁️</i><span>CF 推送</span></a>
     <a class="nv" data-v="fx"><i>✨</i><span>点击特效</span></a>
   </nav>
   <div class="side-foot">
@@ -1721,6 +1754,48 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
 </div>
 
 
+    </section>
+    <section class="view" id="v-cf">
+      <div class="card">
+  <div class="h">☁️ Cloudflare DNS 推送 <span class="sub">将最优 IP 自动/手动推送到 CF 域名解析</span></div>
+
+  <div style="margin-bottom:16px">
+    <div class="h" style="font-size:14px;margin-bottom:8px">🔑 API 配置</div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:end">
+      <div class="f" style="flex:2;min-width:200px"><label>API Token</label><input id="cf_token" type="password" placeholder="Zone:DNS:Edit 权限的 Token"></div>
+      <div class="f" style="flex:1;min-width:120px"><label>Zone ID</label><input id="cf_zone_id" placeholder="域名概览页底部"></div>
+      <button class="ghost mini" onclick="testCF()">测试连接</button>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:end;margin-top:8px">
+      <div class="f" style="flex:1;min-width:120px"><label>域名</label><input id="cf_domain" placeholder="example.com"></div>
+      <div class="f" style="flex:1;min-width:120px"><label>子域名</label><input id="cf_subdomain" placeholder="@ 或 sub"></div>
+      <button class="ghost mini" onclick="saveCF()">保存配置</button>
+    </div>
+  </div>
+
+  <div style="margin-bottom:16px">
+    <div class="h" style="font-size:14px;margin-bottom:8px">🚀 手动推送</div>
+    <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap">
+      <div class="f" style="flex:1;min-width:180px"><label>IP:PORT</label><input id="cf_push_ip" placeholder="1.2.3.4:443"></div>
+      <button class="ghost mini" onclick="pushCF()">推送到 DNS</button>
+      <span id="cf_push_result" style="font-size:12px;color:var(--dim)"></span>
+    </div>
+  </div>
+
+  <div>
+    <div class="h" style="font-size:14px;margin-bottom:8px">⏰ 自动推送</div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:end">
+      <div class="chk"><input type="checkbox" id="cf_auto_enabled"><label for="cf_auto_enabled">启用</label></div>
+      <div class="f"><label>周期(秒)</label><input id="cf_auto_interval" type="number" min="60" value="300"></div>
+      <div class="f"><label>最小带宽</label><input id="cf_auto_min_bw" type="number" value="0"></div>
+      <div class="f"><label>最大延迟</label><input id="cf_auto_max_lat" type="number" value="99999"></div>
+      <div class="f"><label>机房</label><input id="cf_auto_region" placeholder="如 HKG,NRT"></div>
+      <div class="chk"><input type="checkbox" id="cf_auto_ipv6"><label for="cf_auto_ipv6">仅IPv6</label></div>
+      <button class="ghost mini" onclick="saveCF()">保存</button>
+    </div>
+    <div id="cf_auto_status" style="margin-top:8px;font-size:12px;color:var(--dim)"></div>
+  </div>
+</div>
     </section>
     <section class="view" id="v-fx">
       <div class="card">
@@ -2069,6 +2144,7 @@ function renderTable(data){
                    :`<button class="mini lat" onclick="testIp('lat','${r.ip}',${r.port},this)">测延迟</button>`;
     const bwBtn=mbw?`<button class="mini bw done" title="${esc(mbw.title)}" onclick="testIp('bw','${r.ip}',${r.port},this)">${mbw.text}</button>`
                    :`<button class="mini bw" onclick="testIp('bw','${r.ip}',${r.port},this)">测带宽</button>`;
+    const pushBtn=`<button class="mini ghost" style="color:var(--acc2)" onclick="pushIP('${r.ip}',${r.port})" title="推送到 CF DNS">推送</button>`;
     const tr=document.createElement("tr");
     if(r.ip===PIN&&Date.now()-PIN_TS<30000)tr.classList.add("just-tested");
     const ck=SEL.has(r.ip);
@@ -2076,7 +2152,7 @@ function renderTable(data){
       `<td>${data.offset+i+1}</td><td>${bwCell}</td><td>${lat}</td><td>${esc(r.ip)}</td><td>${r.port}</td>`+
       `<td class="colo">${esc(r.colo)}</td><td>${esc(r.country)}</td><td>${tt}</td>`+
       `<td>${fmt(r.ok)}/<span style="color:var(--err)">${r.fail}</span></td>`+
-      `<td>${latBtn}${bwBtn}</td>`;
+      `<td>${latBtn}${bwBtn}${pushBtn}</td>`;
     tr.classList.add("rowIn");
     tr.style.animationDelay=Math.min(i*20,420)+"ms";
     tb.appendChild(tr);
@@ -2147,6 +2223,73 @@ fetch("/api/ports").then(r=>r.json()).then(ports=>{
   const sel=document.getElementById("f_port");
   if(sel&&ports.length)sel.innerHTML='<option value="">全部</option>'+ports.map(p=>`<option value="${p}">${p}</option>`).join("");
 }).catch(e=>{});
+}
+function loadCF(){
+  fetch("/api/cf").then(r=>r.json()).then(d=>{
+    if(!d)return;
+    if(d.token)$("cf_token").value=d.token;
+    if(d.zone_id)$("cf_zone_id").value=d.zone_id;
+    if(d.domain)$("cf_domain").value=d.domain;
+    if(d.subdomain)$("cf_subdomain").value=d.subdomain;
+    if(d.auto_enabled!==undefined)$("cf_auto_enabled").checked=d.auto_enabled;
+    if(d.auto_interval)$("cf_auto_interval").value=d.auto_interval;
+    if(d.auto_min_bw)$("cf_auto_min_bw").value=d.auto_min_bw;
+    if(d.auto_max_lat)$("cf_auto_max_lat").value=d.auto_max_lat;
+    if(d.auto_region)$("cf_auto_region").value=d.auto_region;
+    if(d.auto_ipv6!==undefined)$("cf_auto_ipv6").checked=d.auto_ipv6==="1";
+  }).catch(e=>{});
+  pollCFStatus();
+}
+function saveCF(){
+  const cfg={token:$("cf_token").value,zone_id:$("cf_zone_id").value,
+    domain:$("cf_domain").value,subdomain:$("cf_subdomain").value||"@",
+    auto_enabled:$("cf_auto_enabled").checked,
+    auto_interval:+$("cf_auto_interval").value||300,
+    auto_min_bw:+$("cf_auto_min_bw").value||0,
+    auto_max_lat:+$("cf_auto_max_lat").value||99999,
+    auto_region:$("cf_auto_region").value,
+    auto_ipv6:$("cf_auto_ipv6").checked?"1":"0"};
+  fetch("/api/cf",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(cfg)})
+    .then(r=>r.json()).then(d=>{toast(d.ok?"配置已保存":"保存失败","ok")}).catch(e=>toast("保存失败: "+e,"err"));
+}
+function testCF(){
+  const token=$("cf_token").value,zone_id=$("cf_zone_id").value;
+  if(!token||!zone_id){toast("请先填写 Token 和 Zone ID","err");return}
+  fetch("/api/cf/test",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token,zone_id})})
+    .then(r=>r.json()).then(d=>{
+      if(d.ok)toast("连接成功: "+d.name+" ("+d.status+")","ok");
+      else toast("连接失败: "+(typeof d.error==="string"?d.error:JSON.stringify(d.error)),"err");
+    }).catch(e=>toast("连接失败: "+e,"err"));
+}
+function pushCF(){
+  const ip=$("cf_push_ip").value.trim();
+  if(!ip){toast("请输入 IP:PORT","err");return}
+  $("cf_push_result").textContent="推送中...";
+  fetch("/api/cf/push",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ip})})
+    .then(r=>r.json()).then(d=>{
+      if(d.ok){$("cf_push_result").innerHTML='<span style="color:var(--ok)">✓ 已推送: '+d.name+' → '+d.ip+'</span>';toast("推送成功","ok");}
+      else{$("cf_push_result").innerHTML='<span style="color:var(--err)">✗ '+JSON.stringify(d.error)+'</span>';toast("推送失败","err");}
+    }).catch(e=>{$("cf_push_result").innerHTML='<span style="color:var(--err)">✗ 请求失败</span>';toast("推送失败: "+e,"err");});
+}
+function pushIP(ip,port){
+  const target=ip+":"+port;
+  $("cf_push_ip").value=target;
+  showView("cf");
+  pushCF();
+}
+function pollCFStatus(){
+  fetch("/api/cf/status").then(r=>r.json()).then(d=>{
+    const el=$("cf_auto_status");
+    if(!el)return;
+    if(d.running){
+      const last=d.last_push?new Date(d.last_push*1000).toLocaleString("zh-CN",{hour12:false}):"从未";
+      const res=d.last_result?(d.last_result.ok?"✓ "+d.last_result.ip:"✗ "+d.last_result.error):"等待中";
+      el.textContent="运行中 · 上次推送: "+last+" · "+res;
+    }else{
+      el.textContent="未启用";
+    }
+  }).catch(e=>{});
+  setTimeout(pollCFStatus,15000);
 }
 function exportF(fmt){
   const u="/api/export?fmt="+fmt+"&"+tableParams();
@@ -2327,6 +2470,7 @@ function bwTipSetup(){
   $(id).addEventListener("change",()=>{OFFSET=0;loadTable()});
 });
 loadSet();
+loadCF();
 fetch("/api/stats").then(r=>r.json()).then(d=>{
   const sel=document.getElementById("coloSelect");
   if(sel&&d.colo_list)sel.innerHTML='<option value="" disabled selected>📋 选择机房</option>'+d.colo_list.map(c=>`<option value="${c.code}">${c.code} · ${c.name}</option>`).join("");
@@ -2347,7 +2491,7 @@ scrollGuardSetup();
 poll();
 
 /* ================= 布局: 视图导航 / 侧栏 / 主题 ================= */
-const VIEWS={overview:"总览看板",scan:"扫描控制",table:"IP 列表",fx:"点击特效"};
+const VIEWS={overview:"总览看板",scan:"扫描控制",table:"IP 列表",cf:"CF 推送",fx:"点击特效"};
 function showView(v){
   document.querySelectorAll(".nv").forEach(a=>a.classList.toggle("on",a.dataset.v===v));
   document.querySelectorAll(".view").forEach(s=>s.classList.toggle("on",s.id==="v-"+v));
@@ -2865,6 +3009,11 @@ def serve_forever(args, host, port):
     if not args.no_browser:
         webbrowser.open(f"{scheme}://{local}:{port}/")
     try:
+        cfg = cf_push.load_cf_settings(SETTINGS_FILE)
+        if cfg.get("auto_enabled"):
+            sched = cf_push.get_scheduler()
+            sched.start(cfg, SETTINGS_FILE, args.db)
+            print(f"  Cloudflare 自动推送已启用, 间隔 {cfg.get('auto_interval', 300)}s", flush=True)
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
@@ -2923,6 +3072,7 @@ def main():
         return
     try:
         import cf_db
+        import cf_push
         cf_db.open_db(args.db).close()
     except Exception:
         pass

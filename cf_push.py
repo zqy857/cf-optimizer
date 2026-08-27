@@ -29,8 +29,17 @@ def _api(token, method, path, body=None):
     url = f"{CF_API}{path}"
     data = json.dumps(body).encode() if body else None
     req = urllib.request.Request(url, data=data, headers=_headers(token), method=method)
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", "replace")
+        try:
+            return json.loads(err_body)
+        except Exception:
+            return {"success": False, "errors": [{"message": f"HTTP {e.code}: {err_body[:200]}"}]}
+    except Exception as e:
+        return {"success": False, "errors": [{"message": str(e)}]}
 
 
 def load_cf_settings(path):

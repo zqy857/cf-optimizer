@@ -2664,6 +2664,14 @@ def daemon_main(args):
     if existing:
         print(f"已在运行 (PID {existing}), 无需重复启动")
         return
+    try:
+        lines = open(args.log, "r", encoding="utf-8").readlines()
+        if len(lines) > 5000:
+            with open(args.log, "w", encoding="utf-8") as fh:
+                fh.writelines(lines[-5000:])
+            print(f"日志轮转: {len(lines)} → 5000 行")
+    except FileNotFoundError:
+        pass
     log = open(args.log, "a", encoding="utf-8", buffering=1)
     cmd = [sys.executable, os.path.abspath(__file__),
            "--db", args.db, "--host", args.host, "--port", str(args.port),

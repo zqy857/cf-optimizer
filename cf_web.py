@@ -2148,7 +2148,6 @@ fetch("/api/ports").then(r=>r.json()).then(ports=>{
   if(sel&&ports.length)sel.innerHTML='<option value="">全部</option>'+ports.map(p=>`<option value="${p}">${p}</option>`).join("");
 }).catch(e=>{});
 }
-}
 function exportF(fmt){
   const u="/api/export?fmt="+fmt+"&"+tableParams();
   fetch(u).then(r=>r.blob()).then(b=>{

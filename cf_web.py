@@ -412,107 +412,6 @@ def api_copy(db, q):
     return {"rows": out}
 
 
-def api_optimize(db, q):
-    """手动优选: 从本地库抽候选 -> 现场重测(探测+识别+测速) -> 取最优 N 条。
-    prio=bw 优先带宽(bw↓,lat↑) / prio=lat 优先延迟(lat↑,bw↓)。
-    重测结果会写入 ips (正常测试记录), 但"优选清单"本身不保存, 仅返回展示。"""
-    try:
-        n = max(1, min(int(q.get("count", [""])[0] or 10), 200))
-    except ValueError:
-        n = 10
-    prio = ((q.get("prio", [""])[0] or "bw").strip().lower() or "bw")
-    where, params = build_where(q)
-    cand_order = "latency_ms ASC, (CASE WHEN bw_last_mbps IS NULL THEN -1 ELSE bw_last_mbps END) DESC" if prio == "lat" else build_order(q)
-    m = min(max(n * 5, 20), 150)
-    cand_rows = q_rows(db, f"SELECT ip, port FROM ips WHERE {where} "
-                           f"ORDER BY {cand_order} LIMIT ?", params + [m])
-    if not cand_rows:
-        return {"rows": [], "live": 0, "cands": 0}
-    flat = load_settings()
-    flat["count"] = "1"
-    flat["bench"] = "1"
-    flat["verify"] = str(m)
-    flat["ipv6"] = "0"
-    for k in ("count", "region", "hasbw", "v6", "sort"):
-        v = (q.get(k, [""])[0] or "").strip()
-        if v:
-            flat[k] = v
-    args = scan_args(flat, db)
-    loop = asyncio.new_event_loop()
-    try:
-        live = loop.run_until_complete(_optimize_live(args, cand_rows, db))
-    finally:
-        loop.close()
-    if prio == "lat":
-        live.sort(key=lambda x: (x["latency"], -(x["bandwidth"] or 0)))
-    top = live[:n]
-    out = []
-    for r in top:
-        ip, port, lat, colo, loc, bw = (r["ip"], r["port"], r["latency"],
-                                        r["colo"], r["loc"], r["bandwidth"])
-        if colo:
-            name = country(colo)
-        elif loc:
-            name = loc
-        else:
-            name = "未知"
-        out.append({"ip": ip, "port": port, "colo": colo or "UNK", "country": name,
-                    "latency": round(lat, 1) if lat is not None else None,
-                    "bandwidth": bw})
-    if out:
-        ph = ",".join("?" for _ in out)
-    return {"rows": out, "live": len(live), "cands": len(cand_rows)}
-
-
-async def _optimize_live(args, cands, db):
-    """现场重测候选: 探测连通 -> 识别地区 -> 实测带宽; 结果写回 ips 并排序返回"""
-    sem = asyncio.Semaphore(min(20, len(cands)))
-
-    async def one(item):
-        ip, port = item
-        async with sem:
-            try:
-                r = await cf_db.probe_ip(ip, [port], args)
-            except Exception:
-                return None
-            if r is None or r[1] is None:
-                return None
-            _, p, lat, _ = r
-            args_ns = types.SimpleNamespace(
-                bench_size=args.bench_size, bench_timeout=args.bench_timeout,
-                bench_parallel=args.bench_parallel, bench_host=args.bench_host)
-            info = None
-            try:
-                info = await cf_db.identify(ip, p, args_ns, latency=lat)
-            except Exception:
-                info = None
-            bw = None
-            if info:
-                try:
-                    bw = await cf_db.bench_bandwidth(ip, p, args_ns)
-                except Exception:
-                    bw = None
-            return {"ip": ip, "port": p, "latency": lat,
-                    "colo": info["colo"] if info else None,
-                    "loc": info["loc"] if info else None, "bandwidth": bw}
-
-    results = await asyncio.gather(*(one(c) for c in cands))
-    conn = cf_db.open_db(db)
-    for r in results:
-        if r is None:
-            continue
-        rec = {"ip": r["ip"], "port": r["port"], "ok": True, "latency": r["latency"],
-               "colo": r["colo"], "loc": r["loc"], "bandwidth": r["bandwidth"],
-               "tested_at": time.time(),
-               "verified_at": time.time() if r["colo"] else None}
-        cf_db.upsert(conn, rec)
-    conn.commit()
-    conn.close()
-    live = [r for r in results if r is not None]
-    live.sort(key=lambda x: (-(x["bandwidth"] or 0), x["latency"]))
-    return live
-
-
 def export_body(db, q, fmt):
     where, params = build_where(q)
     sql = (f"SELECT ip, port, colo, loc, latency_ms, bandwidth_mbps FROM ips "
@@ -1031,8 +930,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, body.encode("utf-8"), ctype, fname)
             elif path == "/api/copy":
                 self._send(200, json.dumps(api_copy(db, q)).encode("utf-8"))
-            elif path == "/api/optimize":
-                self._send(200, json.dumps(api_optimize(db, q)).encode("utf-8"))
             else:
                 self._send(404, b'{"error":"not found"}')
         except Exception as e:
@@ -1434,7 +1331,7 @@ button:disabled{opacity:.38;cursor:not-allowed;filter:none;transform:none;box-sh
 
 .chk{display:flex;align-items:center;gap:6px;font-size:13px;padding-bottom:8px}
 .chk input{accent-color:var(--acc);width:16px;height:16px;cursor:pointer}
-#f_hasbw:checked+label,#f_v4:checked+label,#f_v6:checked+label,#opt_hasbw:checked+label,#opt_v4:checked+label,#opt_v6:checked+label{color:var(--acc2);font-weight:700}
+#f_hasbw:checked+label,#f_v4:checked+label,#f_v6:checked+label{color:var(--acc2);font-weight:700}
 .pin{color:var(--acc2);font-size:13px;font-weight:700;cursor:pointer;user-select:none}
 .pin:hover{text-decoration:underline}
 footer .link{color:var(--cyan);cursor:pointer;text-decoration:underline;text-underline-offset:3px}
@@ -1650,14 +1547,11 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
   .toolbar .f input{width:100%;min-width:0;padding:10px;font-size:16px}
   .toolbar button{flex:1 1 44%;padding:11px 6px;font-size:13px;min-height:44px}
   th,td{padding:9px 8px;font-size:13.5px}
-  #tabWrap,#optWrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
-  #tabWrap table,#optWrap table{min-width:520px}
+  #tabWrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  #tabWrap table{min-width:520px}
   #tbody td:last-child{white-space:normal;min-width:70px}
   #tbody td:last-child .mini{display:block;width:100%;margin:3px 0;text-align:center;padding:8px 4px;font-size:12.5px;min-height:34px}
   .mini{padding:7px 10px;font-size:12.5px;min-height:34px}
-
-  /* 手动优选 */
-  #optWrap table{min-width:480px}
 
   /* 分页 */
   .pager{gap:6px;margin-top:10px}
@@ -1699,7 +1593,6 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <a class="nv on" data-v="overview"><i>🏠</i><span>总览看板</span></a>
     <a class="nv" data-v="scan"><i>🛰️</i><span>扫描控制</span></a>
     <a class="nv" data-v="table"><i>📋</i><span>IP 列表</span></a>
-    <a class="nv" data-v="opt"><i>🎯</i><span>手动优选</span></a>
     <a class="nv" data-v="fx"><i>✨</i><span>点击特效</span></a>
   </nav>
   <div class="side-foot">
@@ -1824,37 +1717,6 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <span class="pg">第 <input id="pageJump" type="number" min="1" value="1"> / <span id="pageTotal">1</span> 页</span>
     <button class="ghost mini" onclick="jumpPage()">跳转</button>
     <button class="ghost mini" onclick="page(1)">下一页</button>
-  </div>
-</div>
-
-
-    </section>
-    <section class="view" id="v-opt">
-      <div class="card">
-  <div class="h">🎯 手动优选 <span class="sub">从本地库已优选 IP 中抽候选现场重测(连通+识别+测速), 取最优 N 条展示, 不写入本地库</span></div>
-  <div class="toolbar">
-    <div class="f"><label>数量</label><input id="opt_count" type="number" min="1" max="200" value="10"></div>
-    <div class="f"><label>优先</label><select id="opt_prio">
-      <option value="bw">优先带宽</option><option value="lat">优先延迟</option></select></div>
-    <div class="f"><label>地区过滤</label><input id="opt_region" placeholder="如 HKG,NRT"></div>
-    <div class="chk"><input type="checkbox" id="opt_hasbw" checked><label for="opt_hasbw">仅有带宽</label></div>
-    <div class="chk"><input type="checkbox" id="opt_v4"><label for="opt_v4">仅IPv4</label></div>
-    <div class="chk"><input type="checkbox" id="opt_v6"><label for="opt_v6">仅IPv6</label></div>
-    <button class="ghost" id="optBtn" onclick="runOpt()">优选</button>
-    <button class="ghost mini" onclick="copyOptSel()">复制选中(<span id="optSelCount">0</span>)</button>
-    <button class="ghost mini" onclick="copyOpt()">复制全部</button>
-    <span class="pin" id="optPin"></span>
-  </div>
-  <div id="optWrap">
-    <table>
-      <thead><tr>
-        <th style="width:26px"><input type="checkbox" id="optCkAll" title="全选" onclick="toggleOptAll(this)"></th>
-        <th>#</th><th>带宽Mbps</th><th>延迟ms</th><th>IP</th><th>端口</th>
-        <th>机房</th><th>国家/地区</th><th>测速时间</th>
-      </tr></thead>
-      <tbody id="optBody"></tbody>
-    </table>
-    <div class="dead" id="optEmpty">点击「优选」: 从本地库已优选 IP 中抽候选, 现场重测后取最优 N 条, 展示在此处, 不写入本地库</div>
   </div>
 </div>
 
@@ -1989,92 +1851,6 @@ function jumpPage(){
   $("pageJump").value=pg;
   OFFSET=(pg-1)*LIMIT;
   loadTable();
-}
-let OPT_ROWS=[], OSEL=new Set(), OPT_TS=0;
-function optParams(){
-  const p=new URLSearchParams();
-  p.set("count",$("opt_count").value||10);
-  p.set("prio",$("opt_prio").value||"bw");
-  if($("opt_region").value.trim())p.set("region",$("opt_region").value.trim());
-  if($("opt_hasbw").checked)p.set("hasbw","1");
-  if($("opt_v4").checked)p.set("v4","1");
-  if($("opt_v6").checked)p.set("v6","1");
-  return p;
-}
-function optLine(r){return ep(r.ip,r.port)+"#"+r.country;}
-function optSelUI(){
-  const c=$("optSelCount");if(c)c.textContent=OSEL.size;
-  const all=$("optCkAll");
-  if(all){const cs=[...document.querySelectorAll("#optBody .optck")];all.checked=cs.length>0&&cs.every(c=>c.checked);}
-}
-function toggleOptSel(el){
-  const k=el.dataset.key;
-  if(el.checked)OSEL.add(k);else OSEL.delete(k);
-  optSelUI();
-}
-function toggleOptAll(el){
-  document.querySelectorAll("#optBody .optck").forEach(c=>{c.checked=el.checked;const k=c.dataset.key;if(el.checked)OSEL.add(k);else OSEL.delete(k);});
-  optSelUI();
-}
-function renderOpt(d){
-  const rows=d.rows||[];
-  const tb=$("optBody"), empty=$("optEmpty");
-  tb.innerHTML="";
-  OPT_ROWS=rows;
-  OSEL=new Set([...OSEL].filter(k=>rows.some(r=>r.ip+":"+r.port===k)));
-  if(!rows.length){empty.style.display="block";$("optPin").textContent="";optSelUI();return}
-  empty.style.display="none";
-  const now=OPT_TS?new Date(OPT_TS*1000).toLocaleString("zh-CN",{hour12:false}):"";
-  tb.innerHTML=rows.map((r,i)=>{
-    const key=r.ip+":"+r.port;
-    const rtxt="";
-    return "<tr>"+
-      '<td><input type="checkbox" class="optck" data-key="'+key+'" '+(OSEL.has(key)?"checked":"")+' onchange="toggleOptSel(this)"></td>'+
-      "<td>"+(i+1)+"</td>"+
-      "<td>"+(r.bandwidth!=null?r.bandwidth:"<span class=\"muted\">—</span>")+"</td>"+
-      "<td>"+(r.latency!=null?r.latency:"—")+"</td>"+
-      "<td>"+r.ip+"</td>"+"<td>"+r.port+"</td>"+
-      "<td>"+(r.colo||"UNK")+"</td>"+"<td>"+r.country+"</td>"+
-      "<td>"+rtxt+"</td>"+"<td>"+now+"</td>"+
-      "</tr>";
-  }).join("");
-  $("optPin").textContent="🔝 最优 "+rows.length+" 条, 勾选后「复制选中」";
-  optSelUI();
-}
-function runOpt(){
-  const btn=document.querySelector("#optBtn");
-  if(btn){btn.disabled=true;btn.textContent="优选中...";}
-  $("optEmpty").textContent="正在从本地库抽候选并现场重测(探测+识别+测速), 请稍候...";
-  $("optEmpty").style.display="block";
-  $("optBody").innerHTML="";
-  fetch("/api/optimize?"+optParams()).then(r=>r.json()).then(d=>{
-    OPT_TS=Math.floor(Date.now()/1000);
-    if(!d.rows||!d.rows.length){OPT_ROWS=[];OSEL.clear();$("optEmpty").textContent="无符合条件的结果, 请调整筛选条件";$("optEmpty").style.display="block";$("optPin").textContent="";optSelUI();toast("无符合条件的结果","err");return}
-    renderOpt(d);
-    toast("优选完成: 候选"+d.cands+"条/存活"+d.live+"条","ok");
-  }).catch(e=>{
-    $("optEmpty").textContent="优选请求失败: "+e;
-    toast("优选请求失败: "+e,"err");
-  }).finally(()=>{
-    if(btn){btn.disabled=false;btn.textContent="优选";}
-  });
-}
-function copyOpt(){
-  if(!OPT_ROWS.length){toast("请先点「优选」","err");return}
-  const txt=OPT_ROWS.map(optLine).join("\n");
-  copyText(txt).then(ok=>{
-    if(ok)toast("已复制全部 "+OPT_ROWS.length+" 条","ok");
-    else toast("复制失败, 请手动复制","err");
-  });
-}
-function copyOptSel(){
-  if(!OSEL.size){toast("未选中任何优选结果","err");return}
-  const map=Object.fromEntries(OPT_ROWS.map(r=>[r.ip+":"+r.port,optLine(r)]));
-  const txt=[...OSEL].map(k=>map[k]).filter(Boolean).join("\n");
-  copyText(txt).then(ok=>{
-    if(ok)toast("已复制选中 "+OSEL.size+" 条","ok");
-    else toast("复制失败, 请手动复制","err");
-  });
 }
 const HOPS={};
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
@@ -2571,7 +2347,7 @@ scrollGuardSetup();
 poll();
 
 /* ================= 布局: 视图导航 / 侧栏 / 主题 ================= */
-const VIEWS={overview:"总览看板",scan:"扫描控制",table:"IP 列表",opt:"手动优选",fx:"点击特效"};
+const VIEWS={overview:"总览看板",scan:"扫描控制",table:"IP 列表",fx:"点击特效"};
 function showView(v){
   document.querySelectorAll(".nv").forEach(a=>a.classList.toggle("on",a.dataset.v===v));
   document.querySelectorAll(".view").forEach(s=>s.classList.toggle("on",s.id==="v-"+v));

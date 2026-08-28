@@ -592,14 +592,14 @@ def stop_scan():
     return {"ok": True}
 
 
-WP_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "apod_bg.img")
+WP_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "apod_bg.jpg")
 WP_FALLBACK = ("https://www.nasa.gov/wp-content/uploads/2026/03/"
                "over-the-horizon-%E2%80%93-desktop-%E2%80%93-image-only.png")
 WP_STATE = {"date": None, "try": 0}
 
 
 def refresh_wallpaper(force=False):
-    """每日一次: 解析 APOD 直链并下载缓存到本地 apod_bg.img.
+    """每日一次: 解析 APOD 直链并下载缓存到本地 apod_bg.jpg.
     当日为视频则逐天回退取最近图片日; 失败5分钟后重试, 期间沿用旧图."""
     now = time.time()
     today = time.strftime("%Y-%m-%d", time.gmtime(now))

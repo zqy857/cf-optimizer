@@ -28,7 +28,7 @@
 | `cf_settings.json` | Web 界面保存的参数(可选,缺失时用默认值) |
 | `vendor/ba-click-fx.js` | 点击特效库 ba-click-fx(MIT, 本地自托管) |
 
-> 运行时自动生成: `cf_secret.json`(登录凭据)、`cf_https_*.pem`(自签证书)、`apod_bg.img`(壁纸缓存)、`ip2asn-v4/v6.tsv.gz`(ASN 数据)。
+> 运行时自动生成: `cf_secret.json`(登录凭据)、`cf_https_*.pem`(自签证书)、`apod_bg.jpg`(壁纸缓存)、`ip2asn-v4/v6.tsv.gz`(ASN 数据)。
 
 ## 🚀 快速开始
 
@@ -89,7 +89,7 @@ python3 cf_db.py --seed myadd.txt     # 把现有优选名单导入数据库作�
    - **勾选**: 复制选中(格式 `ip:端口#地区`, 精品自动带「精品」后缀) / 导出选中 txt / 清空选中, 跨页保留
    - **翻页跳转**, 一键导出 `ADD.txt` / `CSV`(跟随当前筛选条件)
 4. **✨ 点击特效**: 蔚蓝档案风格点击特效与光标拖尾开关、特效大小 / 不透明度 / 拖尾与点击速度滑杆、颜色跟随明暗主题或自定义; 所有调整即时生效并保存在浏览器本地。桌面与手机触屏均生效。
-5. **壁纸**: NASA 每日一图(APOD)自动解析并缓存在服务端(`apod_bg.img`), 访客直接加载本地图; 当日为视频时自动取最近图片日, 接口失败沿用旧图。可选在 `cf_settings.json` 加 `"nasa_api_key": "你的key"` 提升接口配额([api.nasa.gov](https://api.nasa.gov) 免费申请, DEMO_KEY 限 50 次/天)。
+5. **壁纸**: NASA 每日一图(APOD)自动解析并缓存在服务端(`apod_bg.jpg`), 访客直接加载本地图; 当日为视频时自动取最近图片日, 接口失败沿用旧图。可选在 `cf_settings.json` 加 `"nasa_api_key": "你的key"` 提升接口配额([api.nasa.gov](https://api.nasa.gov) 免费申请, DEMO_KEY 限 50 次/天)。
 
 ## 🎯 手动优选(从本地库抽候选现场重测)
 

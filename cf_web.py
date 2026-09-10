@@ -724,9 +724,11 @@ def test_ip(db, params):
                     "tcp": round(tcp, 1) if tcp is not None else None,
                     "tls": round(tls, 1) if tls is not None else None}
         elif act == "bw":
-            ns = types.SimpleNamespace(bench_size=30_000_000, bench_timeout=12,
+            ns = types.SimpleNamespace(bench_size=50_000_000, bench_timeout=15,
                                        bench_parallel=6,
-                                       bench_host=(params.get("bench_host") or cf_db.SPEED_HOST))
+                                       bench_host=(params.get("bench_host")
+                                                   or load_settings().get("bench_host")
+                                                   or cf_db.SPEED_HOST))
             bw = asyncio.run(cf_db.bench_bandwidth(ip, port, ns))
             if bw is None:
                 return {"ok": False, "error": "测速失败"}
@@ -2160,6 +2162,7 @@ function saveSet(){
     concurrency:$("concurrency").value,verify:$("verify").value,bench:$("bench").value,
     backfill:$("backfill").value,recheck:$("recheck").value,exploit:$("exploit").value,
     max_latency:$("max_latency").value,bench_parallel:$("bench_parallel").value,
+    bench_host:$("bench_host").value,
     max_ips_v4:$("max_ips_v4").value,max_ips_v6:$("max_ips_v6").value,
     tls_check:$("tls_check").checked?"1":"0",
     ipv6:$("ipv6").checked?"1":"0"};

@@ -718,8 +718,9 @@ async def bench_bandwidth(ip, port, args, parallel=4):
 
     async def one():
         if time.perf_counter() >= deadline:
-            return 0
+            return (0, None, None)
         n = 0
+        start = None
         reader = writer = None
         try:
             reader, writer = await asyncio.wait_for(
@@ -741,13 +742,15 @@ async def bench_bandwidth(ip, port, args, parallel=4):
                 chunk = await asyncio.wait_for(reader.read(65536), rem)
                 if not chunk:
                     break
+                if start is None:
+                    start = time.perf_counter()
                 n += len(chunk)
                 if n >= size:
                     break
         except asyncio.TimeoutError:
             pass
         except Exception:
-            return 0
+            return (0, None, None)
         finally:
             if writer is not None:
                 try:
@@ -755,18 +758,18 @@ async def bench_bandwidth(ip, port, args, parallel=4):
                     await writer.wait_closed()
                 except Exception:
                     pass
-        return n
+        if start is None:
+            return (0, None, None)
+        return (n, start, time.perf_counter())
 
     bodies = await asyncio.gather(*(one() for _ in range(parallel)), return_exceptions=True)
-    total = 0
-    for b in bodies:
-        if isinstance(b, int):
-            total += b
+    items = [b for b in bodies if isinstance(b, tuple) and b[0] and b[1] is not None]
+    total = sum(b[0] for b in items)
     if total < 100_000:
         return None
-    elapsed = time.perf_counter() - begin
-    if elapsed <= 0:
-        return None
+    w0 = min(b[1] for b in items)
+    w1 = max(b[2] for b in items)
+    elapsed = max(0.05, w1 - w0)
     mbps = (total * 8) / (elapsed * 1_000_000)
     return round(mbps, 2)
 

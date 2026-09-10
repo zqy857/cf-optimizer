@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # 开机自启安装脚本 (DSM7/systemd)
-# 用法: bash install_autostart.sh [部署目录]
-#   - 缺省 /vol1/1000/cf-optimizer-main
+# 用法: bash cf_autostart_install.sh [部署目录]
+#   - 缺省为脚本所在目录(cf_web.py / cf_ips.db 同目录), 适配任意机器
 #   - 需要 sudo 权限(复制到 /etc/systemd/system 并 enable/start)
 set -euo pipefail
-DEPLOY_DIR="${1:-/vol1/1000/cf-optimizer-main}"
 SERVICE="cf-optimizer.service"
+DEPLOY_DIR="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 cd "$DEPLOY_DIR"
 
 echo "1. 停止现有服务（如有）"

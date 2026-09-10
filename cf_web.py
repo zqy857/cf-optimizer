@@ -2694,6 +2694,26 @@ def get_pid(pidfile):
         return None
 
 
+def _log_rotator(log_path, max_lines=5000, min_bytes=256 * 1024, check_interval=60):
+    """后台线程: 运行期间定期检查日志, 超过阈值则保留尾部 max_lines 行截断."""
+    try:
+        while not STATE["stop"].is_set():
+            time.sleep(check_interval)
+            try:
+                if os.path.getsize(log_path) < min_bytes:
+                    continue
+                with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+                    lines = fh.readlines()
+                if len(lines) > max_lines:
+                    with open(log_path, "w", encoding="utf-8") as fh:
+                        fh.writelines(lines[-max_lines:])
+                    print(f"[LOG] 运行时日志轮转: {len(lines)} → {max_lines} 行", flush=True)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
 def daemon_main(args):
     """启动为后台服务: 脱离终端, 关闭会话不退出, 可 --stop 停止"""
     import subprocess
@@ -2910,6 +2930,7 @@ def serve_forever(args, host, port):
         print(f"  局域网: {scheme}://{disp}:{port}/", flush=True)
     if not args.no_browser:
         webbrowser.open(f"{scheme}://{local}:{port}/")
+    threading.Thread(target=_log_rotator, args=(args.log,), daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

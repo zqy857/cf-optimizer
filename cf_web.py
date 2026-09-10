@@ -1363,7 +1363,7 @@ footer .link{color:var(--cyan);cursor:pointer;text-decoration:underline;text-und
 /* ---------- 图表 ---------- */
 .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:15px}
 .chart{background:var(--glass-fill);border:1px solid var(--edge);border-radius:10px;padding:12px;
-       overflow-y:auto;max-height:480px;
+       overflow-y:auto;height:300px;
   box-shadow:var(--rim);}
 
 .chart h3{font-size:13px;color:var(--dim);margin-bottom:8px;font-weight:600;letter-spacing:.3px}
@@ -1686,13 +1686,10 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <section class="view" id="v-table">
       <div class="card">
   <div class="toolbar">
-    <div class="f"><label>机房过滤<span class="tip">?<span class="pop">输入机房代码, 逗号分隔. 点击输入框可从列表选择</span></span></label><div style="display:flex;gap:4px;width:100%">
+    <div class="f"><label>机房过滤<span class="tip">?<span class="pop">输入机房代码, 逗号分隔. 点击输入框可从列表选择(含国家名)</span></span></label><div style="display:flex;gap:4px;width:100%">
       <input id="f_region" placeholder="如 HKG,NRT" style="flex:1;min-width:0">
       <select id="coloSelect" onchange="addToRegion(this.value);this.selectedIndex=0" style="width:auto;min-width:0;padding:8px 4px;font-size:13px">
-        <option value="" disabled selected>📋 机房</option>
-      </select>
-      <select id="locSelect" onchange="addToRegion(this.value);this.selectedIndex=0" style="width:auto;min-width:0;padding:8px 4px;font-size:13px">
-        <option value="" disabled selected>🌍 国家</option>
+        <option value="" disabled selected>📋 选择</option>
       </select>
     </div></div>
     <div class="f"><label>最小带宽Mbps</label><input id="f_minbw" type="number" value="0"></div>
@@ -2345,9 +2342,7 @@ function bwTipSetup(){
 loadSet();
 fetch("/api/stats").then(r=>r.json()).then(d=>{
   const sel=document.getElementById("coloSelect");
-  if(sel&&d.colo_list)sel.innerHTML='<option value="" disabled selected>📋 机房</option>'+d.colo_list.map(c=>`<option value="${c.code}">${c.code} · ${c.name}</option>`).join("");
-  const lsel=document.getElementById("locSelect");
-  if(lsel&&d.locs)lsel.innerHTML='<option value="" disabled selected>🌍 国家</option>'+d.locs.map(l=>`<option value="${l.name}">${l.name} (${l.count})</option>`).join("");
+  if(sel&&d.colo_list)sel.innerHTML='<option value="" disabled selected>📋 选择</option>'+d.colo_list.map(c=>`<option value="${c.code}">${c.code} · ${c.name}</option>`).join("");
 }).catch(e=>{});
 function addToRegion(code){
   if(!code)return;

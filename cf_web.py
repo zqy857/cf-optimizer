@@ -684,12 +684,20 @@ def test_ip(db, params):
     log_event(f"手动测试: {ip}:{port}")
     try:
         if act == "lat":
-            lat = asyncio.run(cf_db.tls_probe(ip, port, 4.0))
-            if lat is None:
+            async def _probe():
+                tcp, tls = await asyncio.gather(
+                    cf_db.tcp_latency(ip, port, 3.0),
+                    cf_db.tls_probe(ip, port, 4.0))
+                return tcp, tls
+            tcp, tls = asyncio.run(_probe())
+            if tcp is None and tls is None:
                 return {"ok": False, "error": "连接失败或超时"}
-            upsert_test(db, ip, port, latency=lat)
+            store_lat = tcp if tcp is not None else tls
+            upsert_test(db, ip, port, latency=store_lat)
             MANUAL_HOLD[ip] = time.time() + 300
-            return {"ok": True, "latency": round(lat, 1)}
+            return {"ok": True, "latency": round(store_lat, 1),
+                    "tcp": round(tcp, 1) if tcp is not None else None,
+                    "tls": round(tls, 1) if tls is not None else None}
         elif act == "bw":
             ns = types.SimpleNamespace(bench_size=30_000_000, bench_timeout=12,
                                        bench_parallel=6,
@@ -2097,10 +2105,11 @@ function testIp(act,ip,port,btn){
     body:JSON.stringify({action:act,ip:ip,port:port,bench_host:$("bench_host").value})}).then(r=>r.json()).then(r=>{
     if(r.ok){
       PIN=ip;PIN_TS=Date.now();
+      const latTitle=act==="lat"?(r.tcp!=null&&r.tls!=null?("TCP "+r.tcp+"ms · TLS "+r.tls+"ms"):("实测延迟 "+r.latency+"ms")):("实测带宽 "+r.bandwidth+" Mbps");
       MANUAL[ip+":"+port+":"+act]={text:act==="lat"?(r.latency+"ms"):(r.bandwidth+"M"),
-        title:act==="lat"?("实测延迟 "+r.latency+"ms"):("实测带宽 "+r.bandwidth+" Mbps"),ok:true};
+        title:latTitle,ok:true};
       btn.textContent=act==="lat"?(r.latency+"ms"):(r.bandwidth+"M");
-      btn.classList.add("done");btn.title=MANUAL[ip+":"+port+":"+act].title;
+      btn.classList.add("done");btn.title=latTitle;
       btn.disabled=false;loadTable();
       setTimeout(()=>{
         const tr=[...document.querySelectorAll("#tbody tr")].find(t=>t.querySelector('[data-ip]')?.dataset.ip===ip);

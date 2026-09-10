@@ -292,9 +292,9 @@ def _compute_stats(db):
     v6_lat = v6_lat[0] if v6_lat else None
 
     colos = q_rows(db, "SELECT colo, COUNT(*) FROM ips WHERE ok_count>0 AND colo IS NOT NULL "
-                       "GROUP BY colo ORDER BY COUNT(*) DESC LIMIT 12")
+                       "GROUP BY colo ORDER BY COUNT(*) DESC")
     locs = q_rows(db, "SELECT loc, COUNT(*) FROM ips WHERE ok_count>0 AND loc IS NOT NULL "
-                      "GROUP BY loc ORDER BY COUNT(*) DESC LIMIT 10")
+                      "GROUP BY loc ORDER BY COUNT(*) DESC")
     ports = q_rows(db, "SELECT port, COUNT(*) FROM ips WHERE ok_count>0 GROUP BY port "
                        "ORDER BY COUNT(*) DESC LIMIT 8")
 
@@ -339,7 +339,7 @@ def _compute_stats(db):
     for c, n in colos:
         c_agg[country(c or "UNK")] += n
     countries = sorted([{"name": k, "count": v} for k, v in c_agg.items()],
-                       key=lambda x: x["count"], reverse=True)[:12]
+                       key=lambda x: x["count"], reverse=True)
     return {
         "total": total, "alive": alive, "verified": verified, "withbw": withbw,
         "tested_all": tested_all,
@@ -348,7 +348,7 @@ def _compute_stats(db):
         "v4_lat": v4_lat, "v6_lat": v6_lat,
         "avglat": avglat, "maxbw": maxbw, "bwbest": bwbest, "minlat": minlat,
         "coverage": round(total / COV_TOTAL * 100, 3) if COV_TOTAL else 0,
-        "colo_list": [{"code": r[0], "name": country(r[0])} for r in q_rows(db, "SELECT colo FROM ips WHERE colo IS NOT NULL AND colo != '' AND ok_count>0 GROUP BY colo ORDER BY COUNT(*) DESC LIMIT 15")],
+        "colo_list": [{"code": r[0], "name": country(r[0])} for r in q_rows(db, "SELECT colo FROM ips WHERE colo IS NOT NULL AND colo != '' AND ok_count>0 GROUP BY colo ORDER BY COUNT(*) DESC")],
         "colos": [{"name": c or "UNK", "count": n} for c, n in colos],
         "countries": countries,
         "locs": [{"name": l or "UNK", "count": n} for l, n in locs],
@@ -1363,6 +1363,7 @@ footer .link{color:var(--cyan);cursor:pointer;text-decoration:underline;text-und
 /* ---------- 图表 ---------- */
 .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:15px}
 .chart{background:var(--glass-fill);border:1px solid var(--edge);border-radius:10px;padding:12px;
+       overflow-y:auto;max-height:480px;
   box-shadow:var(--rim);}
 
 .chart h3{font-size:13px;color:var(--dim);margin-bottom:8px;font-weight:600;letter-spacing:.3px}
@@ -1635,8 +1636,8 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
 
       <div class="card">
   <div class="charts">
-    <div class="chart"><h3>机房分布 (colo 前12)</h3><canvas id="ch_colo"></canvas></div>
-    <div class="chart"><h3>国家/地区分布 (colo 前12)</h3><canvas id="ch_country"></canvas></div>
+    <div class="chart"><h3>机房分布 (全部)</h3><canvas id="ch_colo"></canvas></div>
+    <div class="chart"><h3>国家/地区分布 (全部)</h3><canvas id="ch_country"></canvas></div>
     <div class="chart"><h3>延迟分布 (ms)</h3><canvas id="ch_lat"></canvas></div>
     <div class="chart"><h3>带宽分布 (Mbps)</h3><canvas id="ch_bw"></canvas></div>
   </div>
@@ -1688,7 +1689,10 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <div class="f"><label>机房过滤<span class="tip">?<span class="pop">输入机房代码, 逗号分隔. 点击输入框可从列表选择</span></span></label><div style="display:flex;gap:4px;width:100%">
       <input id="f_region" placeholder="如 HKG,NRT" style="flex:1;min-width:0">
       <select id="coloSelect" onchange="addToRegion(this.value);this.selectedIndex=0" style="width:auto;min-width:0;padding:8px 4px;font-size:13px">
-        <option value="" disabled selected>📋 选择</option>
+        <option value="" disabled selected>📋 机房</option>
+      </select>
+      <select id="locSelect" onchange="addToRegion(this.value);this.selectedIndex=0" style="width:auto;min-width:0;padding:8px 4px;font-size:13px">
+        <option value="" disabled selected>🌍 国家</option>
       </select>
     </div></div>
     <div class="f"><label>最小带宽Mbps</label><input id="f_minbw" type="number" value="0"></div>
@@ -1916,9 +1920,12 @@ function barChart(cid, items, color){
   const cv=$(cid); if(!cv)return;
   cv._data={type:"bar",items,color}; chartHover(cv);
   const ctx=cv.getContext("2d");
-  const CH=parseFloat(getComputedStyle(cv).height)||250;
+  const n=items.length;
+  const target=Math.max(250,Math.min(1200,n*26));
+  if(Math.abs(parseFloat(cv.style.height)||0-target)>1)cv.style.height=target+"px";
+  const CH=parseFloat(getComputedStyle(cv).height)||target;
   const W=cv.width=cv.clientWidth*2, H=cv.height=CH*2, pad=90;
-  const n=items.length, rowH=(H-16)/Math.max(1,n), max=Math.max(1,...items.map(i=>i.count));
+  const rowH=(H-16)/Math.max(1,n), max=Math.max(1,...items.map(i=>i.count));
   const maxW=(W-pad-20)*0.7;
   const hover=cv._hover!=null?cv._hover:-1;
   const prog=(cv.dataset.bar||1)-0; const p=Math.min(1,prog+0.14);
@@ -2223,8 +2230,8 @@ async function poll(){
     $("st_maxbw").textContent=fmt(s.maxbw);
     countTo("st_minlat",s.minlat,false);
     countTo("st_cov",s.coverage,false,"%");
-    barChart("ch_colo",s.colos.slice(0,12),"#b494ff");
-    barChart("ch_country",s.countries.slice(0,12),"#38d3f8");
+    barChart("ch_colo",s.colos,"#b494ff");
+    barChart("ch_country",s.countries,"#38d3f8");
     histChart("ch_lat",s.lat.labels,s.lat.data,"#fbbf24");
     histChart("ch_bw",s.bw.labels,s.bw.data,"#2fd6a3");
   }catch(e){console.error('[poll]',e&&e.message)}
@@ -2338,7 +2345,9 @@ function bwTipSetup(){
 loadSet();
 fetch("/api/stats").then(r=>r.json()).then(d=>{
   const sel=document.getElementById("coloSelect");
-  if(sel&&d.colo_list)sel.innerHTML='<option value="" disabled selected>📋 选择机房</option>'+d.colo_list.map(c=>`<option value="${c.code}">${c.code} · ${c.name}</option>`).join("");
+  if(sel&&d.colo_list)sel.innerHTML='<option value="" disabled selected>📋 机房</option>'+d.colo_list.map(c=>`<option value="${c.code}">${c.code} · ${c.name}</option>`).join("");
+  const lsel=document.getElementById("locSelect");
+  if(lsel&&d.locs)lsel.innerHTML='<option value="" disabled selected>🌍 国家</option>'+d.locs.map(l=>`<option value="${l.name}">${l.name} (${l.count})</option>`).join("");
 }).catch(e=>{});
 function addToRegion(code){
   if(!code)return;

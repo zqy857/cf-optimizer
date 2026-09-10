@@ -48,61 +48,12 @@ import cf_db
 COV_TOTAL = sum(1 << (32 - int(r.split("/")[1])) for r in cf_db.FALLBACK_RANGES)
 VERSION = "2.1.0"
 
-COLO_COUNTRY = {
-    "LAX": "美国", "SJC": "美国", "SEA": "美国", "PDX": "美国",
-    "DEN": "美国", "ORD": "美国", "DFW": "美国", "IAD": "美国",
-    "ATL": "美国", "MIA": "美国", "JFK": "美国", "EWR": "美国",
-    "PHX": "美国", "SFO": "美国", "BOS": "美国", "PHL": "美国",
-    "MCI": "美国", "MSP": "美国", "STL": "美国", "MSY": "美国",
-    "SLC": "美国", "SAN": "美国", "LAS": "美国", "AUS": "美国",
-    "SAT": "美国", "OKC": "美国", "TUS": "美国", "RDU": "美国",
-    "CLT": "美国", "BNA": "美国", "MCO": "美国", "MKE": "美国",
-    "IND": "美国", "CMH": "美国", "CLE": "美国", "PIT": "美国",
-    "ABQ": "美国", "ELP": "美国", "OMA": "美国",
-    "YYZ": "加拿大", "YVR": "加拿大", "YUL": "加拿大", "YOW": "加拿大",
-    "YEG": "加拿大", "YWG": "加拿大", "YYC": "加拿大", "YHZ": "加拿大",
-    "HKG": "中国香港", "TPE": "中国台湾", "NRT": "日本", "KIX": "日本",
-    "FUK": "日本", "NGO": "日本", "CTS": "日本",
-    "SEL": "韩国", "ICN": "韩国", "SIN": "新加坡", "BKK": "泰国", "KUL": "马来西亚",
-    "SGN": "越南", "HAN": "越南", "MNL": "菲律宾", "CGK": "印尼",
-    "DPS": "印尼", "PNH": "柬埔寨", "RGN": "缅甸", "DAC": "孟加拉",
-    "CMB": "斯里兰卡", "KTM": "尼泊尔",
-    "LHR": "英国", "MAN": "英国", "FRA": "德国", "MUC": "德国", "DUS": "德国",
-    "HAM": "德国", "TXL": "德国", "BER": "德国",
-    "AMS": "荷兰", "PAR": "法国", "CDG": "法国", "MRS": "法国",
-    "MAD": "西班牙", "BCN": "西班牙", "MXP": "意大利", "MIL": "意大利",
-    "FCO": "意大利", "VCE": "意大利", "NAP": "意大利", "PMO": "意大利",
-    "WAW": "波兰", "KRK": "波兰", "ARN": "瑞典", "STO": "瑞典",
-    "HEL": "芬兰", "OSL": "挪威", "CPH": "丹麦", "ZRH": "瑞士",
-    "GVA": "瑞士", "VIE": "奥地利", "PRG": "捷克", "BUD": "匈牙利",
-    "SOF": "保加利亚", "ATH": "希腊", "HER": "希腊", "SKG": "希腊",
-    "LIS": "葡萄牙", "BRU": "比利时", "DUB": "爱尔兰", "ZAG": "克罗地亚",
-    "OTP": "罗马尼亚", "BUH": "罗马尼亚", "LJU": "斯洛文尼亚",
-    "IST": "土耳其", "GZT": "土耳其",
-    "DXB": "阿联酋", "MCT": "阿曼", "TLV": "以色列", "BEY": "黎巴嫩",
-    "AMM": "约旦", "KWI": "科威特", "RUH": "沙特", "JED": "沙特",
-    "DOH": "卡塔尔", "BHR": "巴林",
-    "JNB": "南非", "CPT": "南非", "LOS": "尼日利亚", "GBE": "博茨瓦纳",
-    "KGL": "卢旺达", "NBO": "肯尼亚", "MBA": "肯尼亚", "MUB": "博茨瓦纳",
-    "ADD": "埃塞俄比亚", "DAR": "坦桑尼亚", "TUN": "突尼斯", "CMN": "摩洛哥",
-    "ACC": "加纳", "EBB": "乌干达",
-    "GIG": "巴西", "GRU": "巴西", "BSB": "巴西", "MAO": "巴西",
-    "FOR": "巴西", "REC": "巴西", "CNF": "巴西", "BEL": "巴西",
-    "EZE": "阿根廷", "LIM": "秘鲁", "BOG": "哥伦比亚", "MEX": "墨西哥",
-    "GDL": "墨西哥", "MTY": "墨西哥", "SCL": "智利", "PTY": "巴拿马",
-    "CCS": "委内瑞拉", "MVD": "乌拉圭", "ASU": "巴拉圭", "UIO": "厄瓜多尔",
-    "GYE": "厄瓜多尔", "SJO": "哥斯达黎加",
-    "SYD": "澳大利亚", "MEL": "澳大利亚", "PER": "澳大利亚",
-    "BNE": "澳大利亚", "ADL": "澳大利亚",
-    "AKL": "新西兰", "KUL": "马来西亚",
-    "BOM": "印度", "BLR": "印度", "DEL": "印度", "MAA": "印度", "HYD": "印度",
-    "CCU": "印度", "KBP": "乌克兰",
-}
+COLO_COUNTRY = cf_db.COLO_COUNTRY
 
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cf_settings.json")
 SETTINGS_KEYS = ["operator", "ports", "count", "concurrency", "verify", "bench",
                  "bench_parallel", "backfill", "recheck", "exploit", "max_latency", "tls_check",
-                                 "bench_host", "ipv6", "max_ips_v4", "max_ips_v6", "colo_max_pct"]
+                                 "bench_host", "ipv6", "max_ips_v4", "max_ips_v6", "country_max_pct"]
 
 
 def load_settings():
@@ -241,9 +192,6 @@ def build_where(q):
 
 def build_order(q):
     sort = q.get("sort", [""])[0]
-    if sort == "geo":
-        return ("ROW_NUMBER() OVER (PARTITION BY colo ORDER BY "
-                "(CASE WHEN ok_count > 0 THEN 0 ELSE 1 END), latency_ms ASC, ip ASC), latency_ms ASC")
     if sort == "lat":
         return "latency_ms ASC"
     if sort == "colo":
@@ -493,7 +441,7 @@ def scan_args(params, db):
         cooldown=max(1, num("cooldown", 3600)),
         max_ips_v4=max(0, int(num("max_ips_v4", 0, int))),
         max_ips_v6=max(0, int(num("max_ips_v6", 0, int))),
-        colo_max_pct=max(0, int(num("colo_max_pct", 30, int))),
+        country_max_pct=max(0, int(num("country_max_pct", 30, int))),
         bench_size=int(max(1_000_000, min(num("bench_size", 30_000_000, int), 80_000_000))),
         bench_timeout=max(1, num("bench_timeout", 10)),
         bench_parallel=max(1, int(num("bench_parallel", 6, int))),
@@ -533,7 +481,7 @@ def scanner_worker(args):
                 mt = MANUAL_HOLD.get(rec.get("ip"))
                 if mt and time.time() < mt:
                     rec = {k: v for k, v in rec.items() if k not in ("latency", "bandwidth")}
-                cf_db.upsert(conn, rec, getattr(args, "colo_max_pct", 0))
+                cf_db.upsert(conn, rec, getattr(args, "country_max_pct", 0))
                 pend_count += 1
                 if pend_count >= 200:
                     flush()
@@ -547,7 +495,7 @@ def scanner_worker(args):
                 flush()
                 try:
                     _n = cf_db.prune_ips(conn, args.max_ips_v4, args.max_ips_v6,
-                                  getattr(args, "colo_max_pct", 0))
+                                  getattr(args, "country_max_pct", 0))
                     if _n:
                         conn.commit()
                         log_event(f"库内超限清理: 已剔除 {_n} 个低质量IP")
@@ -750,7 +698,7 @@ def upsert_test(db, ip, port, latency=None, bandwidth=None):
         rec = {"ip": ip, "port": port, "ok": True,
                "latency": latency, "bandwidth": bandwidth,
                "tested_at": time.time()}
-        cf_db.upsert(conn, rec, int(load_settings().get("colo_max_pct", 30) or 30))
+        cf_db.upsert(conn, rec, int(load_settings().get("country_max_pct", 30) or 30))
         conn.commit()
         conn.close()
     except Exception:
@@ -1700,7 +1648,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <div class="f"><label>最大延迟ms<span class="tip">?<span class="pop">延迟超过该值的IP不算"达标", 不会被送去做验证和测速</span></span></label><input id="max_latency" type="number" value="2000"></div>
         <div class="f"><label>IPv4库上限<span class="tip">?<span class="pop">IPv4超限后按质量剔除</span></span></label><input id="max_ips_v4" type="number" value="0"></div>
     <div class="f"><label>IPv6库上限<span class="tip">?<span class="pop">IPv6超限后按质量剔除</span></span></label><input id="max_ips_v6" type="number" value="0"></div>
-    <div class="f"><label>单地区占比上限%<span class="tip">?<span class="pop">单个机房(colo)活跃IP最多占库的百分比, 让优选结果覆盖更多地区. 0=关闭(按原样全收). 超过上限后该地区新IP不再新增, 超限时按质量先裁剪该地区</span></span></label><input id="colo_max_pct" type="number" value="30"></div>
+    <div class="f"><label>单国家占比上限%<span class="tip">?<span class="pop">同一个国家(按CF机房归属映射, 美国/香港/日本等)活跃IP最多占库的百分比, 让优选结果覆盖更多地区. 0=关闭(按原样全收). 超过上限后该国家新IP不再新增, 超限时按质量先裁剪该国</span></span></label><input id="country_max_pct" type="number" value="30"></div>
     <div class="chk"><input type="checkbox" id="tls_check" checked><label for="tls_check">TLS二次确认<span class="tip">?<span class="pop">TCP能连后还要TLS握手(SNI=cloudflare.com)成功才算存活, 过滤假IP. 首次验证的新IP才做(能滤掉约1/4假IP), 复核已达标IP只做TCP不重复握手, 省CPU</span></span></label></div>
     <div class="chk"><input type="checkbox" id="ipv6"><label for="ipv6">同时扫描IPv6<span class="tip">?<span class="pop">IPv6 池 = 公开优选 v6 列表(优先测, 命中率高) + CF官方大段(随机发现新地址). 本机需有IPv6网络</span></span></label></div>
     <button id="startBtn" onclick="control('start')">开始扫描</button>
@@ -1733,7 +1681,6 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <div class="chk"><input type="checkbox" id="f_hasbw"><label for="f_hasbw">仅有带宽</label></div>
     <div class="chk"><input type="checkbox" id="f_v4"><label for="f_v4">仅IPv4</label></div>
     <div class="chk"><input type="checkbox" id="f_v6"><label for="f_v6">仅IPv6</label></div>
-    <button class="ghost" id="btnGeo" onclick="toggleGeo()" title="按机房交错排序, 每机房各取一台再轮换, 取前N条可覆盖多个地区">🌐 地区均衡</button>
     <button class="ghost" onclick="exportF('txt')">导出 ADD.txt</button>
     <button class="ghost" onclick="exportF('csv')">导出 CSV</button>
   </div>
@@ -2134,9 +2081,7 @@ function renderTable(data){
   if(ca)ca.checked=rows.length>0&&rows.every(r=>SEL.has(r.ip));
   updateSelUI();
 }
-function sortBy(k){SORT=k;OFFSET=0;syncGeo();loadTable()}
-function toggleGeo(){SORT=(SORT==="geo")?"bw":"geo";OFFSET=0;syncGeo();loadTable()}
-function syncGeo(){const b=document.getElementById("btnGeo");if(b)b.classList.toggle("on",SORT==="geo")}
+function sortBy(k){SORT=k;OFFSET=0;loadTable()}
 function unpin(){PIN="";PIN_TS=0;loadTable()}
 function page(d){OFFSET=Math.max(0,OFFSET+d*LIMIT);loadTable()}
 function loadTable(){
@@ -2176,7 +2121,7 @@ function saveSet(){
     max_latency:$("max_latency").value,bench_parallel:$("bench_parallel").value,
     bench_host:$("bench_host").value,
     max_ips_v4:$("max_ips_v4").value,max_ips_v6:$("max_ips_v6").value,
-    colo_max_pct:$("colo_max_pct").value,
+    country_max_pct:$("country_max_pct").value,
     tls_check:$("tls_check").checked?"1":"0",
     ipv6:$("ipv6").checked?"1":"0"};
   fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},
@@ -2189,7 +2134,7 @@ function loadSet(){
     if(!d||!Object.keys(d).length)return;
     if(d.operator!==undefined)$("operator").value=d.operator||"";
     ["ports","count","concurrency","verify","bench","bench_parallel","bench_host",
-     "backfill","recheck","exploit","max_latency","max_ips_v4","max_ips_v6","colo_max_pct"].forEach(k=>{
+     "backfill","recheck","exploit","max_latency","max_ips_v4","max_ips_v6","country_max_pct"].forEach(k=>{
        const v=d[k];
        if(v!==undefined&&v!==null&&v!=="")$(k).value=v;
     });

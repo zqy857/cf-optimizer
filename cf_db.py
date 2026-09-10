@@ -215,24 +215,33 @@ async def fetch(url, timeout=10):
             pass
 
 
-def _quota_ok(conn, colo, pct):
-    """单地区占比配额: 该 colo 活跃数占比 >= pct% 则拒绝新增该地区新IP。
-    冷启动(<2个活跃地区)时不设限, 保证首批能收集到多种地区."""
+def _quota_ok(conn, country, pct):
+    """单国家占比配额: 该国家(colos 映射聚合)活跃数占比 >= pct% 则拒绝新增该国家新IP。
+    冷启动(<2个活跃国家)时不设限, 保证首批能收集到多种地区."""
+    if not country:
+        return True
     try:
-        nc = conn.execute("SELECT COUNT(DISTINCT colo) FROM ips "
-                          "WHERE colo IS NOT NULL AND ok_count > 0").fetchone()[0]
-        if nc < 2:
-            return True
         alive = conn.execute("SELECT COUNT(*) FROM ips WHERE ok_count > 0").fetchone()[0]
-        cc = conn.execute("SELECT COUNT(*) FROM ips WHERE colo=? AND ok_count > 0",
-                          (colo,)).fetchone()[0]
-        return cc * 100 < alive * pct
+        if alive < 2:
+            return True
+        rows = conn.execute("SELECT colo, COUNT(*) FROM ips "
+                            "WHERE colo IS NOT NULL AND ok_count > 0 "
+                            "GROUP BY colo").fetchall()
+        agg = {}
+        for colo, cnt in rows:
+            c = _country(colo)
+            if c:
+                agg[c] = agg.get(c, 0) + cnt
+        if len(agg) < 2:
+            return True
+        cnt = agg.get(country, 0)
+        return cnt * 100 < alive * pct
     except Exception:
         return True
 
 
-def upsert(conn, rec, colo_pct=0):
-    """写入一条 IP 记录. colo_pct>0 时按单地区占比上限吸收新IP(均衡地区).
+def upsert(conn, rec, country_pct=0):
+    """写入一条 IP 记录. country_pct>0 时按单国家占比上限吸收新IP(均衡地区).
     配额拒绝时返回 'refused', 不新增(已有 IP 仍会正常更新)."""
     if rec.get("ip") is None:
         return None
@@ -240,8 +249,8 @@ def upsert(conn, rec, colo_pct=0):
     fail = 0 if ok else 1
     is_new = conn.execute("SELECT 1 FROM ips WHERE ip=? LIMIT 1",
                           (rec["ip"],)).fetchone() is None
-    if is_new and ok and rec.get("colo") and colo_pct and colo_pct > 0:
-        if not _quota_ok(conn, rec["colo"], colo_pct):
+    if is_new and ok and rec.get("colo") and country_pct and country_pct > 0:
+        if not _quota_ok(conn, _country(rec["colo"]), country_pct):
             return "refused"
     conn.execute(
         """
@@ -300,20 +309,77 @@ GRAVE_DAYS = 7           # 死IP墓碑静默期(天): 期间抽样自动跳过
 GRAVE_EXPIRE_DAYS = 30   # 墓碑过期天数
 GRAVE_MAX_ROWS = 200000  # 墓碑行数硬上限
 
+# CF 机房三字码 → 国家/地区 (与 Web 端共用一份)
+COLO_COUNTRY = {
+    "LAX": "美国", "SJC": "美国", "SEA": "美国", "PDX": "美国",
+    "DEN": "美国", "ORD": "美国", "DFW": "美国", "IAD": "美国",
+    "ATL": "美国", "MIA": "美国", "JFK": "美国", "EWR": "美国",
+    "PHX": "美国", "SFO": "美国", "BOS": "美国", "PHL": "美国",
+    "MCI": "美国", "MSP": "美国", "STL": "美国", "MSY": "美国",
+    "SLC": "美国", "SAN": "美国", "LAS": "美国", "AUS": "美国",
+    "SAT": "美国", "OKC": "美国", "TUS": "美国", "RDU": "美国",
+    "CLT": "美国", "BNA": "美国", "MCO": "美国", "MKE": "美国",
+    "IND": "美国", "CMH": "美国", "CLE": "美国", "PIT": "美国",
+    "ABQ": "美国", "ELP": "美国", "OMA": "美国",
+    "YYZ": "加拿大", "YVR": "加拿大", "YUL": "加拿大", "YOW": "加拿大",
+    "YEG": "加拿大", "YWG": "加拿大", "YYC": "加拿大", "YHZ": "加拿大",
+    "HKG": "中国香港", "TPE": "中国台湾", "NRT": "日本", "KIX": "日本",
+    "FUK": "日本", "NGO": "日本", "CTS": "日本",
+    "SEL": "韩国", "ICN": "韩国", "SIN": "新加坡", "BKK": "泰国", "KUL": "马来西亚",
+    "SGN": "越南", "HAN": "越南", "MNL": "菲律宾", "CGK": "印尼",
+    "DPS": "印尼", "PNH": "柬埔寨", "RGN": "缅甸", "DAC": "孟加拉",
+    "CMB": "斯里兰卡", "KTM": "尼泊尔",
+    "LHR": "英国", "MAN": "英国", "FRA": "德国", "MUC": "德国", "DUS": "德国",
+    "HAM": "德国", "TXL": "德国", "BER": "德国",
+    "AMS": "荷兰", "PAR": "法国", "CDG": "法国", "MRS": "法国",
+    "MAD": "西班牙", "BCN": "西班牙", "MXP": "意大利", "MIL": "意大利",
+    "FCO": "意大利", "VCE": "意大利", "NAP": "意大利", "PMO": "意大利",
+    "WAW": "波兰", "KRK": "波兰", "ARN": "瑞典", "STO": "瑞典",
+    "HEL": "芬兰", "OSL": "挪威", "CPH": "丹麦", "ZRH": "瑞士",
+    "GVA": "瑞士", "VIE": "奥地利", "PRG": "捷克", "BUD": "匈牙利",
+    "SOF": "保加利亚", "ATH": "希腊", "HER": "希腊", "SKG": "希腊",
+    "LIS": "葡萄牙", "BRU": "比利时", "DUB": "爱尔兰", "ZAG": "克罗地亚",
+    "OTP": "罗马尼亚", "BUH": "罗马尼亚", "LJU": "斯洛文尼亚",
+    "IST": "土耳其", "GZT": "土耳其",
+    "DXB": "阿联酋", "MCT": "阿曼", "TLV": "以色列", "BEY": "黎巴嫩",
+    "AMM": "约旦", "KWI": "科威特", "RUH": "沙特", "JED": "沙特",
+    "DOH": "卡塔尔", "BHR": "巴林",
+    "JNB": "南非", "CPT": "南非", "LOS": "尼日利亚", "GBE": "博茨瓦纳",
+    "KGL": "卢旺达", "NBO": "肯尼亚", "MBA": "肯尼亚", "MUB": "博茨瓦纳",
+    "ADD": "埃塞俄比亚", "DAR": "坦桑尼亚", "TUN": "突尼斯", "CMN": "摩洛哥",
+    "ACC": "加纳", "EBB": "乌干达",
+    "GIG": "巴西", "GRU": "巴西", "BSB": "巴西", "MAO": "巴西",
+    "FOR": "巴西", "REC": "巴西", "CNF": "巴西", "BEL": "巴西",
+    "EZE": "阿根廷", "LIM": "秘鲁", "BOG": "哥伦比亚", "MEX": "墨西哥",
+    "GDL": "墨西哥", "MTY": "墨西哥", "SCL": "智利", "PTY": "巴拿马",
+    "CCS": "委内瑞拉", "MVD": "乌拉圭", "ASU": "巴拉圭", "UIO": "厄瓜多尔",
+    "GYE": "厄瓜多尔", "SJO": "哥斯达黎加",
+    "SYD": "澳大利亚", "MEL": "澳大利亚", "PER": "澳大利亚",
+    "BNE": "澳大利亚", "ADL": "澳大利亚",
+    "AKL": "新西兰",
+    "BOM": "印度", "BLR": "印度", "DEL": "印度", "MAA": "印度", "HYD": "印度",
+    "CCU": "印度", "KBP": "乌克兰",
+}
+
+
+def _country(colo):
+    """colo 三字码 → 国家/地区, 未知返回 None"""
+    return COLO_COUNTRY.get((colo or "").upper())
+
 
 def _grave_ts(now):
     """使墓碑在 known 冷却判断下恰好静默 GRAVE_DAYS 天"""
     return now + GRAVE_DAYS * 86400 - 3600
 
 
-def prune_ips(conn, max_v4, max_v6, colo_max_pct=0):
+def prune_ips(conn, max_v4, max_v6, country_pct=0):
     """IPv4/IPv6 分别按上限剪枝, 返回总剔除数. limit<=0 不限该协议.
 
-    colo_max_pct>0 时先做地区均衡裁剪: 每机房(colo)活跃数超过占比上限的超额
-    部分按分数剪掉, 使库整体覆盖更多地区, 再执行原有全库剪枝.
+    country_pct>0 时先做国家均衡裁剪: 单个国家(通过的colo映射聚合)活跃数超过
+    占比上限的超额部分按分数剪掉, 使库整体覆盖更多地区, 再执行原有全库剪枝.
     """
     if (not max_v4 or int(max_v4) <= 0) and (not max_v6 or int(max_v6) <= 0) \
-            and (not colo_max_pct or int(colo_max_pct) <= 0):
+            and (not country_pct or int(country_pct) <= 0):
         return 0
     now = time.time()
     try:
@@ -347,29 +413,40 @@ def prune_ips(conn, max_v4, max_v6, colo_max_pct=0):
             conn.execute(f"DELETE FROM ips WHERE {proto} AND ok_count = 0")
             pruned += dead
 
-        # 阶段0: 地区均衡裁剪 —— 每机房超过占比上限(colo_max_pct)的部分, 低分先删。
+        # 阶段0: 国家均衡裁剪 —— 单个国家超过占比上限(country_pct)的部分, 低分先删。
         # 不依赖库容上限(max_v4/max_v6), 只要开了均衡就每轮强制生效。
         # cap 一次按"本轮裁剪前总量"快照计算, 逐轮扫描会向 30% 收敛, 避免过量删除。
-        if colo_max_pct and int(colo_max_pct) > 0:
+        if country_pct and int(country_pct) > 0:
             alive = conn.execute(
                 f"SELECT COUNT(*) FROM ips WHERE {alive_cond}").fetchone()[0]
-            cap = max(1, int(alive * int(colo_max_pct) / 100))
+            cap = max(1, int(alive * int(country_pct) / 100))
             rows = conn.execute(f"SELECT colo, COUNT(*) FROM ips "
                                 f"WHERE {alive_cond} GROUP BY colo").fetchall()
-            overs = [(colo, cnt - cap) for colo, cnt in rows
-                     if colo and cnt > cap]
+            agg = {}
+            for colo, cnt in rows:
+                if not colo:
+                    continue
+                c = _country(colo)
+                if c:
+                    agg[c] = agg.get(c, 0) + cnt
+            overs = [(c, cnt - cap) for c, cnt in agg.items() if cnt > cap]
             has_gap = any((cnt if colo else 0) < cap for colo, cnt in rows) or \
                 any(not colo for colo, _ in rows)
-            # 只有当仍有"闲余"空间(未超限机房或未归类IP)时才裁剪, 否则所有机房都满,
-            # 已是最优分布(总量=各机房之和, 无法继续降占比), 停了避免慢性删光.
+            # 只有当仍有"闲余"空间(未超限国家或未归类IP)时才裁剪, 否则所有国家都满,
+            # 已是最优分布(总量=各国之和, 无法继续降占比), 停了避免慢性删光.
             if overs and has_gap:
-                for colo, n_del in overs:
+                for ctry, n_del in overs:
+                    colos = [colo for colo, _ in rows
+                             if colo and _country(colo) == ctry]
+                    ph = ",".join(":c%d" % i for i in range(len(colos)))
+                    params = {"now": now, "n": n_del}
+                    params.update({"c%d" % i: co for i, co in enumerate(colos)})
                     conn.execute(
-                        f"DELETE FROM ips WHERE {alive_cond} AND colo=:c AND ip IN "
+                        f"DELETE FROM ips WHERE {alive_cond} AND colo IN ({ph}) AND ip IN "
                         f"(SELECT ip FROM (SELECT ip FROM ips "
-                        f"WHERE {alive_cond} AND colo=:c "
+                        f"WHERE {alive_cond} AND colo IN ({ph}) "
                         f"ORDER BY {PRUNE_SCORE_SQL} LIMIT :n))",
-                        {"now": now, "n": n_del, "c": colo})
+                        params)
                     pruned += n_del
 
         # 第二: 存活数超限时按分数剪枝(只有超库容上限才需要)
@@ -1129,8 +1206,8 @@ def main():
                     help="IPv4 库上限(0=不限)")
     ap.add_argument("--max-ips-v6", type=int, default=0, dest="max_ips_v6",
                     help="IPv6 库上限(0=不限)")
-    ap.add_argument("--colo-max-pct", type=int, default=30, dest="colo_max_pct",
-                    help="单机房(colo)活跃占比上限% (0=关闭均衡). 超过上限的新IP不吸收, 超限时该机房低分IP先裁剪")
+    ap.add_argument("--country-pct", type=int, default=30, dest="country_pct",
+                    help="单国家活跃占比上限% (0=关闭均衡). 超过上限的新IP不吸收, 超限时该国低分IP先裁剪")
     ap.add_argument("--gap", type=float, default=5, help="轮间间隔秒(默认5)")
     ap.add_argument("--once", action="store_true", help="只扫描一轮(发现+验证预算)后退出")
     ap.add_argument("--reverify", type=int, metavar="N", default=0,
@@ -1218,7 +1295,7 @@ def main():
             except queue.Empty:
                 continue
             if rec["type"] == "result":
-                upsert(conn, rec, getattr(args, "colo_max_pct", 0))
+                upsert(conn, rec, getattr(args, "country_pct", 0))
                 pend += 1
                 if pend >= 200:
                     conn.commit()
@@ -1230,10 +1307,10 @@ def main():
                 if getattr(args, "max_ips_v4", 0) or getattr(args, "max_ips_v6", 0):
                     try:
                         npruned = prune_ips(conn, args.max_ips_v4, args.max_ips_v6,
-                                            getattr(args, "colo_max_pct", 0))
+                                            getattr(args, "country_pct", 0))
                         conn.commit()
                         if npruned:
-                            print(f"库内超限清理(地区均衡): 剔除 {npruned} 个低质量IP",
+                            print(f"库内超限清理(国家均衡): 剔除 {npruned} 个低质量IP",
                                   flush=True)
                     except Exception as e:
                         print(f"库清理失败: {e}", flush=True)

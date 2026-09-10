@@ -46,7 +46,7 @@ from urllib.parse import parse_qs, urlparse
 import cf_db
 
 COV_TOTAL = sum(1 << (32 - int(r.split("/")[1])) for r in cf_db.FALLBACK_RANGES)
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 COLO_COUNTRY = {
     "LAX": "美国", "SJC": "美国", "SEA": "美国", "PDX": "美国",
@@ -1794,9 +1794,11 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <ul>
       <li>多端口并发探测 + TLS 二次确认, 自动发现可用 CF 边缘 IP</li>
       <li>邻域加权采样(优质 C 段优先), 达标命中率远高于纯随机</li>
-      <li>带宽实测(可配自建 Worker 测速域名规避公共限流) + 机房/国家地区识别</li>
-      <li>手动优选: 从本地库抽候选现场重测, 取最优 N 条, 可优先带宽/延迟, 勾选复制</li>
-      <li>本地IP列表: 列排序 / 多条件筛选 / 勾选批量操作 / 翻页跳转, 导出 ADD.txt/CSV</li>
+      <li>带宽实测(首字节计时算法, 档位 50MB×15s, 可配自建 Worker 测速域名) + 机房/国家地区识别</li>
+      <li>手动测: 延迟返回 TCP/TLS 双口径, 带宽择优重测, 勾选复制最优 N 条</li>
+      <li>本地IP列表: 列排序 / 机房等多条件筛选 / 勾选批量操作 / 翻页跳转, 导出 ADD.txt/CSV</li>
+      <li>总览分布图: 机房/国家全量显示可滚动, 延迟/带宽直方图</li>
+      <li>日志自动轮转: 启动与运行期间超限自动截断, 长期运行不膨胀</li>
     </ul>
     <h3>版本</h3>
     <p>服务端 v<span id="ver2">?</span> &nbsp;|&nbsp; 后端地址: 官方 / 电信 / 联通 / 移动优选段</p>

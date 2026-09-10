@@ -241,6 +241,9 @@ def build_where(q):
 
 def build_order(q):
     sort = q.get("sort", [""])[0]
+    if sort == "geo":
+        return ("ROW_NUMBER() OVER (PARTITION BY colo ORDER BY "
+                "(CASE WHEN ok_count > 0 THEN 0 ELSE 1 END), latency_ms ASC, ip ASC), latency_ms ASC")
     if sort == "lat":
         return "latency_ms ASC"
     if sort == "colo":
@@ -1362,6 +1365,7 @@ button.stop{background:linear-gradient(135deg,#fb7185,#e11d48);box-shadow:0 3px 
 button.stop:hover{box-shadow:0 8px 26px rgba(244,63,94,.5)}
 button.ghost{background:var(--panel2);border:1px solid var(--line);color:var(--txt);box-shadow:none;font-weight:600}
 button.ghost:hover{border-color:var(--acc);color:var(--acc);box-shadow:0 0 14px rgba(96,165,250,.25)}
+button.ghost.on{background:var(--grad);color:#fff;border-color:transparent;box-shadow:0 0 14px rgba(96,165,250,.35)}
 button:disabled{opacity:.38;cursor:not-allowed;filter:none;transform:none;box-shadow:none}
 
 .chk{display:flex;align-items:center;gap:6px;font-size:13px;padding-bottom:8px}
@@ -1726,6 +1730,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <div class="chk"><input type="checkbox" id="f_hasbw"><label for="f_hasbw">仅有带宽</label></div>
     <div class="chk"><input type="checkbox" id="f_v4"><label for="f_v4">仅IPv4</label></div>
     <div class="chk"><input type="checkbox" id="f_v6"><label for="f_v6">仅IPv6</label></div>
+    <button class="ghost" id="btnGeo" onclick="toggleGeo()" title="按机房交错排序, 每机房各取一台再轮换, 取前N条可覆盖多个地区">🌐 地区均衡</button>
     <button class="ghost" onclick="exportF('txt')">导出 ADD.txt</button>
     <button class="ghost" onclick="exportF('csv')">导出 CSV</button>
   </div>
@@ -2126,7 +2131,9 @@ function renderTable(data){
   if(ca)ca.checked=rows.length>0&&rows.every(r=>SEL.has(r.ip));
   updateSelUI();
 }
-function sortBy(k){SORT=k;OFFSET=0;loadTable()}
+function sortBy(k){SORT=k;OFFSET=0;syncGeo();loadTable()}
+function toggleGeo(){SORT=(SORT==="geo")?"bw":"geo";OFFSET=0;syncGeo();loadTable()}
+function syncGeo(){const b=document.getElementById("btnGeo");if(b)b.classList.toggle("on",SORT==="geo")}
 function unpin(){PIN="";PIN_TS=0;loadTable()}
 function page(d){OFFSET=Math.max(0,OFFSET+d*LIMIT);loadTable()}
 function loadTable(){

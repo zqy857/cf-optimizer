@@ -276,39 +276,20 @@ def _compute_stats(db):
 
     lat_buckets = [0] * 8
     lat_labels = ["<50", "50-100", "100-200", "200-300", "300-500", "500-800", "800-1500", ">1500"]
-    for (lat,) in q_rows(db, "SELECT latency_ms FROM ips WHERE ok_count>0 AND latency_ms IS NOT NULL"):
-        if lat < 50:
-            lat_buckets[0] += 1
-        elif lat < 100:
-            lat_buckets[1] += 1
-        elif lat < 200:
-            lat_buckets[2] += 1
-        elif lat < 300:
-            lat_buckets[3] += 1
-        elif lat < 500:
-            lat_buckets[4] += 1
-        elif lat < 800:
-            lat_buckets[5] += 1
-        elif lat < 1500:
-            lat_buckets[6] += 1
-        else:
-            lat_buckets[7] += 1
+    for (b, c) in q_rows(db, "SELECT CASE WHEN latency_ms < 50 THEN 0 WHEN latency_ms < 100 THEN 1 "
+                              "WHEN latency_ms < 200 THEN 2 WHEN latency_ms < 300 THEN 3 "
+                              "WHEN latency_ms < 500 THEN 4 WHEN latency_ms < 800 THEN 5 "
+                              "WHEN latency_ms < 1500 THEN 6 ELSE 7 END, COUNT(*) "
+                              "FROM ips WHERE ok_count>0 AND latency_ms IS NOT NULL GROUP BY 1"):
+        lat_buckets[b] = c
 
     bw_buckets = [0] * 6
     bw_labels = ["0-50", "50-100", "100-200", "200-400", "400-800", ">800"]
-    for (bw,) in q_rows(db, "SELECT bw_last_mbps FROM ips WHERE bw_last_mbps IS NOT NULL AND bw_last_mbps>0"):
-        if bw < 50:
-            bw_buckets[0] += 1
-        elif bw < 100:
-            bw_buckets[1] += 1
-        elif bw < 200:
-            bw_buckets[2] += 1
-        elif bw < 400:
-            bw_buckets[3] += 1
-        elif bw < 800:
-            bw_buckets[4] += 1
-        else:
-            bw_buckets[5] += 1
+    for (b, c) in q_rows(db, "SELECT CASE WHEN bw_last_mbps < 50 THEN 0 WHEN bw_last_mbps < 100 THEN 1 "
+                              "WHEN bw_last_mbps < 200 THEN 2 WHEN bw_last_mbps < 400 THEN 3 "
+                              "WHEN bw_last_mbps < 800 THEN 4 ELSE 5 END, COUNT(*) "
+                              "FROM ips WHERE bw_last_mbps IS NOT NULL AND bw_last_mbps>0 GROUP BY 1"):
+        bw_buckets[b] = c
 
     from collections import defaultdict
     c_agg = defaultdict(int)
@@ -396,7 +377,7 @@ def export_body(db, q, fmt):
     if fmt == "csv":
         lines = ["rank,ip,port,latency_ms,bandwidth_mbps,colo,loc"]
         for i, (ip, p, c, l, lat, bw) in enumerate(rows, 1):
-            lines.append(f"{i},{ip},{p},{lat if lat is not None else ''},{bw if bw is not None else ''},{c or ''},{l or ''},{rclass or ''}")
+            lines.append(f"{i},{ip},{p},{lat if lat is not None else ''},{bw if bw is not None else ''},{c or ''},{l or ''}")
         return "\n".join(lines) + "\n", "text/csv", "cf_optimizer.csv"
     lines = []
     for i, (ip, p, c, l, lat, bw) in enumerate(rows, 1):
@@ -647,6 +628,29 @@ def _wp_loop():
 
 MANUAL_HOLD = {}  # ip -> 保护截止时间戳
 
+# 手动测速共用事件循环: 避免每次 asyncio.run 新建事件循环 + 阻塞 handler 线程
+_TEST_LOOP = {"loop": None, "thread": None}
+
+
+def _test_loop():
+    if _TEST_LOOP["loop"] is None:
+        loop = asyncio.new_event_loop()
+
+        def runner():
+            asyncio.set_event_loop(loop)
+            loop.run_forever()
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+        _TEST_LOOP["loop"] = loop
+        _TEST_LOOP["thread"] = t
+    return _TEST_LOOP["loop"]
+
+
+def _run_on_test_loop(coro, timeout=20):
+    loop = _test_loop()
+    fut = asyncio.run_coroutine_threadsafe(coro, loop)
+    return fut.result(timeout)
+
 
 def test_ip(db, params):
     ip = (params.get("ip") or "").strip()
@@ -658,7 +662,7 @@ def test_ip(db, params):
     if not ip:
         return {"ok": False, "error": "缺少 ip"}
     if act not in ("lat", "bw"):
-        return {"ok": False, "error": "action 只能是 lat/bw/route"}
+        return {"ok": False, "error": "action 只能是 lat/bw"}
     log_event(f"手动测试: {ip}:{port}")
     try:
         if act == "lat":
@@ -667,7 +671,7 @@ def test_ip(db, params):
                     cf_db.tcp_latency(ip, port, 3.0),
                     cf_db.tls_probe(ip, port, 4.0))
                 return tcp, tls
-            tcp, tls = asyncio.run(_probe())
+            tcp, tls = _run_on_test_loop(_probe(), timeout=12)
             if tcp is None and tls is None:
                 return {"ok": False, "error": "连接失败或超时"}
             store_lat = tcp if tcp is not None else tls
@@ -682,7 +686,7 @@ def test_ip(db, params):
                                        bench_host=(params.get("bench_host")
                                                    or load_settings().get("bench_host")
                                                    or cf_db.SPEED_HOST))
-            bw = asyncio.run(cf_db.bench_bandwidth(ip, port, ns))
+            bw = _run_on_test_loop(cf_db.bench_bandwidth(ip, port, ns), timeout=22)
             if bw is None:
                 return {"ok": False, "error": "测速失败"}
             upsert_test(db, ip, port, bandwidth=bw)
@@ -783,7 +787,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(401)
         if www_auth:
             self.send_header("WWW-Authenticate", 'Basic realm="cf-optimizer"')
-        self._send(401, b'{"error":"unauthorized"}') if False else None
         body = b'{"error":"unauthorized"}'
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -828,15 +831,6 @@ class Handler(BaseHTTPRequestHandler):
         path = u.path
         q = parse_qs(u.query)
         db = get_state()["db"] or DB or "cf_ips.db"
-        if path in ("/", "/api/status"):
-            cm = re.search(r"(?:^|;\s*)s=([^;]+)", self.headers.get("Cookie", ""))
-            tok = cm.group(1) if cm else ""
-            try:
-                sok = bool(tok) and _session_ok(tok)
-            except Exception:
-                sok = "ERR"
-            ba = "authorization" in (k.lower() for k in self.headers.keys())
-            print(f"[REQ] {path} cookie={'有' if tok else '无'} 会话有效={sok} BasicAuth={ba} UA={self.headers.get('User-Agent','')[:40]}", flush=True)
         if path == "/login":
             self._send(200, _login_page().encode("utf-8"), "text/html; charset=utf-8")
             return
@@ -886,10 +880,11 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self._send(404, b"", "text/plain")
             elif path == "/zashboard" or path.startswith("/zashboard/"):
-                fp = path.replace("/zashboard", "") or "/index.html"
-                fp = os.path.join(os.path.expanduser("~/cf-work/zashboard"), fp.lstrip("/"))
-                if not os.path.isfile(fp):
-                    fp = os.path.join(os.path.expanduser("~/cf-work/zashboard"), "index.html")
+                zp = os.path.realpath(os.path.expanduser("~/cf-work/zashboard"))
+                rel = path.replace("/zashboard", "", 1).lstrip("/") or "index.html"
+                fp = os.path.realpath(os.path.join(zp, rel))
+                if not (fp == zp or fp.startswith(zp + os.sep)) or not os.path.isfile(fp):
+                    fp = os.path.join(zp, "index.html")
                 ctype = "text/html"
                 if fp.endswith(".js"): ctype = "application/javascript"
                 elif fp.endswith(".css"): ctype = "text/css"

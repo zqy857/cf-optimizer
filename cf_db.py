@@ -103,6 +103,9 @@ CREATE TABLE IF NOT EXISTS ips(
 CREATE INDEX IF NOT EXISTS idx_ips_score ON ips(latency_ms, verified_at, bandwidth_mbps);
 CREATE INDEX IF NOT EXISTS idx_ips_tested ON ips(tested_at);
 CREATE INDEX IF NOT EXISTS idx_ips_dead ON ips(tested_at) WHERE ok_count = 0;
+CREATE INDEX IF NOT EXISTS idx_ips_colo ON ips(colo);
+CREATE INDEX IF NOT EXISTS idx_ips_alive ON ips(ok_count) WHERE ok_count > 0;
+CREATE INDEX IF NOT EXISTS idx_ips_bw ON ips(bandwidth_mbps) WHERE bandwidth_mbps > 0;
 CREATE TABLE IF NOT EXISTS graveyard(
   ip TEXT PRIMARY KEY,
   buried_at REAL
@@ -206,6 +209,16 @@ async def fetch(url, timeout=10):
             if not chunk:
                 break
             body += chunk
+        if clen is None:
+            # 无 Content-Length(chunked/keep-alive): 读到连接关闭为止
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(reader.read(65536), timeout)
+                    if not chunk:
+                        break
+                    body += chunk
+                except asyncio.TimeoutError:
+                    break
         return body
     finally:
         writer.close()
@@ -215,24 +228,38 @@ async def fetch(url, timeout=10):
             pass
 
 
+# 国家聚合配额缓存: 扫描高频写路径, 每次 upsert 都做全表聚合太贵,
+# 但扫描周期是秒级, 1.5s 内的旧结果几乎不影响均衡判断.
+_QUOTA_AGG = {"at": 0.0, "alive": 0, "agg": {}}
+
+
+def _quota_agg(conn):
+    now = time.time()
+    if now - _QUOTA_AGG["at"] < 1.5:
+        return _QUOTA_AGG["alive"], _QUOTA_AGG["agg"]
+    alive = conn.execute("SELECT COUNT(*) FROM ips WHERE ok_count > 0").fetchone()[0]
+    rows = conn.execute("SELECT colo, COUNT(*) FROM ips "
+                        "WHERE colo IS NOT NULL AND ok_count > 0 "
+                        "GROUP BY colo").fetchall()
+    agg = {}
+    for colo, cnt in rows:
+        c = _country(colo)
+        if c:
+            agg[c] = agg.get(c, 0) + cnt
+    _QUOTA_AGG["at"] = now
+    _QUOTA_AGG["alive"] = alive
+    _QUOTA_AGG["agg"] = agg
+    return alive, agg
+
+
 def _quota_ok(conn, country, pct):
     """单国家占比配额: 该国家(colos 映射聚合)活跃数占比 >= pct% 则拒绝新增该国家新IP。
     冷启动(<2个活跃国家)时不设限, 保证首批能收集到多种地区."""
     if not country:
         return True
     try:
-        alive = conn.execute("SELECT COUNT(*) FROM ips WHERE ok_count > 0").fetchone()[0]
-        if alive < 2:
-            return True
-        rows = conn.execute("SELECT colo, COUNT(*) FROM ips "
-                            "WHERE colo IS NOT NULL AND ok_count > 0 "
-                            "GROUP BY colo").fetchall()
-        agg = {}
-        for colo, cnt in rows:
-            c = _country(colo)
-            if c:
-                agg[c] = agg.get(c, 0) + cnt
-        if len(agg) < 2:
+        alive, agg = _quota_agg(conn)
+        if len(agg) < 2 or alive < 2:
             return True
         cnt = agg.get(country, 0)
         return cnt * 100 < alive * pct
@@ -973,12 +1000,20 @@ async def run_session(nets, known, q, args, stop, nets6=None):
 
     async def discovery_cycle():
         nonlocal verified
+        have_bw = set() if args.bench > 0 else None
         try:
             conn_v = sqlite3.connect(args.db)
-            verified = {r[0] for r in conn_v.execute("SELECT ip FROM ips WHERE ok_count>0")}
+            verified = set()
+            for ip, okc, bw in conn_v.execute(
+                    "SELECT ip, ok_count, bandwidth_mbps FROM ips"):
+                if okc and okc > 0:
+                    verified.add(ip)
+                if have_bw is not None and bw is not None:
+                    have_bw.add(ip)
             conn_v.close()
         except Exception:
             verified = set()
+            have_bw = set() if have_bw is not None else None
         hot24 = fetch_hot24(args.db) if args.exploit > 0 else []
         cands = discover(nets, hot24, args.count, ports, known, args.cooldown, args.exploit)
         if nets6:
@@ -1017,13 +1052,7 @@ async def run_session(nets, known, q, args, stop, nets6=None):
                        "latency": lat, "tested_at": n})
         alive_list.sort(key=lambda r: (0 if r[3] else 1, r[2]))
         pend = [(ip, p, lat) for ip, p, lat, _ in alive_list[: args.verify]]
-        if args.bench > 0:
-            try:
-                conn_hb = sqlite3.connect(args.db)
-                have_bw = {r[0] for r in conn_hb.execute("SELECT ip FROM ips WHERE bandwidth_mbps IS NOT NULL")}
-                conn_hb.close()
-            except Exception:
-                have_bw = set()
+        if args.bench > 0 and have_bw is not None:
             pend = ([x for x in pend if x[0] not in have_bw] + [x for x in pend if x[0] in have_bw])
         return ok, pend
 

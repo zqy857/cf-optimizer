@@ -493,7 +493,7 @@ def scan_args(params, db):
         cooldown=max(1, num("cooldown", 3600)),
         max_ips_v4=max(0, int(num("max_ips_v4", 0, int))),
         max_ips_v6=max(0, int(num("max_ips_v6", 0, int))),
-        colo_max_pct=max(0, int(num("colo_max_pct", 0, int))),
+        colo_max_pct=max(0, int(num("colo_max_pct", 30, int))),
         bench_size=int(max(1_000_000, min(num("bench_size", 30_000_000, int), 80_000_000))),
         bench_timeout=max(1, num("bench_timeout", 10)),
         bench_parallel=max(1, int(num("bench_parallel", 6, int))),
@@ -750,7 +750,7 @@ def upsert_test(db, ip, port, latency=None, bandwidth=None):
         rec = {"ip": ip, "port": port, "ok": True,
                "latency": latency, "bandwidth": bandwidth,
                "tested_at": time.time()}
-        cf_db.upsert(conn, rec, int(load_settings().get("colo_max_pct", 0) or 0))
+        cf_db.upsert(conn, rec, int(load_settings().get("colo_max_pct", 30) or 30))
         conn.commit()
         conn.close()
     except Exception:

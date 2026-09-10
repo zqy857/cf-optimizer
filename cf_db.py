@@ -312,7 +312,8 @@ def prune_ips(conn, max_v4, max_v6, colo_max_pct=0):
     colo_max_pct>0 时先做地区均衡裁剪: 每机房(colo)活跃数超过占比上限的超额
     部分按分数剪掉, 使库整体覆盖更多地区, 再执行原有全库剪枝.
     """
-    if (not max_v4 or int(max_v4) <= 0) and (not max_v6 or int(max_v6) <= 0):
+    if (not max_v4 or int(max_v4) <= 0) and (not max_v6 or int(max_v6) <= 0) \
+            and (not colo_max_pct or int(colo_max_pct) <= 0):
         return 0
     now = time.time()
     try:
@@ -336,8 +337,6 @@ def prune_ips(conn, max_v4, max_v6, colo_max_pct=0):
     _purge_dead()
     pruned = 0
     for is_v6, limit in [(False, max_v4), (True, max_v6)]:
-        if not limit or int(limit) <= 0:
-            continue
         proto = "ip LIKE '%:%'" if is_v6 else "ip NOT LIKE '%:%'"
         alive_cond = f"{proto} AND ok_count > 0"
         alive = conn.execute(f"SELECT COUNT(*) FROM ips WHERE {alive_cond}").fetchone()[0]
@@ -348,15 +347,23 @@ def prune_ips(conn, max_v4, max_v6, colo_max_pct=0):
             conn.execute(f"DELETE FROM ips WHERE {proto} AND ok_count = 0")
             pruned += dead
 
-        # 阶段0: 地区均衡裁剪 —— 每机房超过占比上限(colof_max_pct)的部分, 低分先删
+        # 阶段0: 地区均衡裁剪 —— 每机房超过占比上限(colo_max_pct)的部分, 低分先删。
+        # 不依赖库容上限(max_v4/max_v6), 只要开了均衡就每轮强制生效。
+        # cap 一次按"本轮裁剪前总量"快照计算, 逐轮扫描会向 30% 收敛, 避免过量删除。
         if colo_max_pct and int(colo_max_pct) > 0:
-            alive = conn.execute(f"SELECT COUNT(*) FROM ips WHERE {alive_cond}").fetchone()[0]
+            alive = conn.execute(
+                f"SELECT COUNT(*) FROM ips WHERE {alive_cond}").fetchone()[0]
+            cap = max(1, int(alive * int(colo_max_pct) / 100))
             rows = conn.execute(f"SELECT colo, COUNT(*) FROM ips "
                                 f"WHERE {alive_cond} GROUP BY colo").fetchall()
-            for colo, cnt in rows:
-                cap = max(0, int(alive * int(colo_max_pct) / 100))
-                n_del = cnt - cap
-                if colo and n_del > 0:
+            overs = [(colo, cnt - cap) for colo, cnt in rows
+                     if colo and cnt > cap]
+            has_gap = any((cnt if colo else 0) < cap for colo, cnt in rows) or \
+                any(not colo for colo, _ in rows)
+            # 只有当仍有"闲余"空间(未超限机房或未归类IP)时才裁剪, 否则所有机房都满,
+            # 已是最优分布(总量=各机房之和, 无法继续降占比), 停了避免慢性删光.
+            if overs and has_gap:
+                for colo, n_del in overs:
                     conn.execute(
                         f"DELETE FROM ips WHERE {alive_cond} AND colo=:c AND ip IN "
                         f"(SELECT ip FROM (SELECT ip FROM ips "
@@ -365,19 +372,20 @@ def prune_ips(conn, max_v4, max_v6, colo_max_pct=0):
                         {"now": now, "n": n_del, "c": colo})
                     pruned += n_del
 
-        # 第二: 存活数超限时按分数剪枝
-        alive = conn.execute(f"SELECT COUNT(*) FROM ips WHERE {alive_cond}").fetchone()[0]
-        excess = alive - int(limit)
-        if excess > 0:
-            conn.execute("CREATE TEMP TABLE IF NOT EXISTS victims"
-                         "(ip TEXT PRIMARY KEY)")
-            conn.execute("DELETE FROM victims")
-            conn.execute(f"INSERT INTO victims(ip) SELECT ip FROM ips "
-                         f"WHERE {alive_cond} "
-                         f"ORDER BY {PRUNE_SCORE_SQL} LIMIT :n",
-                         {"now": now, "n": int(excess)})
-            conn.execute("DELETE FROM ips WHERE ip IN (SELECT ip FROM victims)")
-            pruned += excess
+        # 第二: 存活数超限时按分数剪枝(只有超库容上限才需要)
+        if int(limit) > 0:
+            alive = conn.execute(f"SELECT COUNT(*) FROM ips WHERE {alive_cond}").fetchone()[0]
+            excess = alive - int(limit)
+            if excess > 0:
+                conn.execute("CREATE TEMP TABLE IF NOT EXISTS victims"
+                             "(ip TEXT PRIMARY KEY)")
+                conn.execute("DELETE FROM victims")
+                conn.execute(f"INSERT INTO victims(ip) SELECT ip FROM ips "
+                             f"WHERE {alive_cond} "
+                             f"ORDER BY {PRUNE_SCORE_SQL} LIMIT :n",
+                             {"now": now, "n": int(excess)})
+                conn.execute("DELETE FROM ips WHERE ip IN (SELECT ip FROM victims)")
+                pruned += excess
 
     remaining = conn.execute("SELECT COUNT(*) FROM ips").fetchone()[0]
     try:
@@ -1121,7 +1129,7 @@ def main():
                     help="IPv4 库上限(0=不限)")
     ap.add_argument("--max-ips-v6", type=int, default=0, dest="max_ips_v6",
                     help="IPv6 库上限(0=不限)")
-    ap.add_argument("--colo-max-pct", type=int, default=0, dest="colo_max_pct",
+    ap.add_argument("--colo-max-pct", type=int, default=30, dest="colo_max_pct",
                     help="单机房(colo)活跃占比上限% (0=关闭均衡). 超过上限的新IP不吸收, 超限时该机房低分IP先裁剪")
     ap.add_argument("--gap", type=float, default=5, help="轮间间隔秒(默认5)")
     ap.add_argument("--once", action="store_true", help="只扫描一轮(发现+验证预算)后退出")

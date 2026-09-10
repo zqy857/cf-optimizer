@@ -102,7 +102,7 @@ COLO_COUNTRY = {
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cf_settings.json")
 SETTINGS_KEYS = ["operator", "ports", "count", "concurrency", "verify", "bench",
                  "bench_parallel", "backfill", "recheck", "exploit", "max_latency", "tls_check",
-                                   "bench_host", "ipv6", "max_ips_v4", "max_ips_v6"]
+                                 "bench_host", "ipv6", "max_ips_v4", "max_ips_v6", "colo_max_pct"]
 
 
 def load_settings():
@@ -493,6 +493,7 @@ def scan_args(params, db):
         cooldown=max(1, num("cooldown", 3600)),
         max_ips_v4=max(0, int(num("max_ips_v4", 0, int))),
         max_ips_v6=max(0, int(num("max_ips_v6", 0, int))),
+        colo_max_pct=max(0, int(num("colo_max_pct", 0, int))),
         bench_size=int(max(1_000_000, min(num("bench_size", 30_000_000, int), 80_000_000))),
         bench_timeout=max(1, num("bench_timeout", 10)),
         bench_parallel=max(1, int(num("bench_parallel", 6, int))),
@@ -532,7 +533,7 @@ def scanner_worker(args):
                 mt = MANUAL_HOLD.get(rec.get("ip"))
                 if mt and time.time() < mt:
                     rec = {k: v for k, v in rec.items() if k not in ("latency", "bandwidth")}
-                cf_db.upsert(conn, rec)
+                cf_db.upsert(conn, rec, getattr(args, "colo_max_pct", 0))
                 pend_count += 1
                 if pend_count >= 200:
                     flush()
@@ -545,7 +546,8 @@ def scanner_worker(args):
             elif t == "cycle_end":
                 flush()
                 try:
-                    _n = cf_db.prune_ips(conn, args.max_ips_v4, args.max_ips_v6)
+                    _n = cf_db.prune_ips(conn, args.max_ips_v4, args.max_ips_v6,
+                                  getattr(args, "colo_max_pct", 0))
                     if _n:
                         conn.commit()
                         log_event(f"库内超限清理: 已剔除 {_n} 个低质量IP")
@@ -748,7 +750,7 @@ def upsert_test(db, ip, port, latency=None, bandwidth=None):
         rec = {"ip": ip, "port": port, "ok": True,
                "latency": latency, "bandwidth": bandwidth,
                "tested_at": time.time()}
-        cf_db.upsert(conn, rec)
+        cf_db.upsert(conn, rec, int(load_settings().get("colo_max_pct", 0) or 0))
         conn.commit()
         conn.close()
     except Exception:
@@ -1698,6 +1700,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <div class="f"><label>最大延迟ms<span class="tip">?<span class="pop">延迟超过该值的IP不算"达标", 不会被送去做验证和测速</span></span></label><input id="max_latency" type="number" value="2000"></div>
         <div class="f"><label>IPv4库上限<span class="tip">?<span class="pop">IPv4超限后按质量剔除</span></span></label><input id="max_ips_v4" type="number" value="0"></div>
     <div class="f"><label>IPv6库上限<span class="tip">?<span class="pop">IPv6超限后按质量剔除</span></span></label><input id="max_ips_v6" type="number" value="0"></div>
+    <div class="f"><label>单地区占比上限%<span class="tip">?<span class="pop">单个机房(colo)活跃IP最多占库的百分比, 让优选结果覆盖更多地区. 0=关闭(按原样全收). 超过上限后该地区新IP不再新增, 超限时按质量先裁剪该地区</span></span></label><input id="colo_max_pct" type="number" value="30"></div>
     <div class="chk"><input type="checkbox" id="tls_check" checked><label for="tls_check">TLS二次确认<span class="tip">?<span class="pop">TCP能连后还要TLS握手(SNI=cloudflare.com)成功才算存活, 过滤假IP. 首次验证的新IP才做(能滤掉约1/4假IP), 复核已达标IP只做TCP不重复握手, 省CPU</span></span></label></div>
     <div class="chk"><input type="checkbox" id="ipv6"><label for="ipv6">同时扫描IPv6<span class="tip">?<span class="pop">IPv6 池 = 公开优选 v6 列表(优先测, 命中率高) + CF官方大段(随机发现新地址). 本机需有IPv6网络</span></span></label></div>
     <button id="startBtn" onclick="control('start')">开始扫描</button>
@@ -2173,6 +2176,7 @@ function saveSet(){
     max_latency:$("max_latency").value,bench_parallel:$("bench_parallel").value,
     bench_host:$("bench_host").value,
     max_ips_v4:$("max_ips_v4").value,max_ips_v6:$("max_ips_v6").value,
+    colo_max_pct:$("colo_max_pct").value,
     tls_check:$("tls_check").checked?"1":"0",
     ipv6:$("ipv6").checked?"1":"0"};
   fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},
@@ -2185,7 +2189,7 @@ function loadSet(){
     if(!d||!Object.keys(d).length)return;
     if(d.operator!==undefined)$("operator").value=d.operator||"";
     ["ports","count","concurrency","verify","bench","bench_parallel","bench_host",
-     "backfill","recheck","exploit","max_latency","max_ips_v4","max_ips_v6"].forEach(k=>{
+     "backfill","recheck","exploit","max_latency","max_ips_v4","max_ips_v6","colo_max_pct"].forEach(k=>{
        const v=d[k];
        if(v!==undefined&&v!==null&&v!=="")$(k).value=v;
     });

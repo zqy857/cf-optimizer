@@ -215,13 +215,34 @@ async def fetch(url, timeout=10):
             pass
 
 
-def upsert(conn, rec):
+def _quota_ok(conn, colo, pct):
+    """单地区占比配额: 该 colo 活跃数占比 >= pct% 则拒绝新增该地区新IP。
+    冷启动(<2个活跃地区)时不设限, 保证首批能收集到多种地区."""
+    try:
+        nc = conn.execute("SELECT COUNT(DISTINCT colo) FROM ips "
+                          "WHERE colo IS NOT NULL AND ok_count > 0").fetchone()[0]
+        if nc < 2:
+            return True
+        alive = conn.execute("SELECT COUNT(*) FROM ips WHERE ok_count > 0").fetchone()[0]
+        cc = conn.execute("SELECT COUNT(*) FROM ips WHERE colo=? AND ok_count > 0",
+                          (colo,)).fetchone()[0]
+        return cc * 100 < alive * pct
+    except Exception:
+        return True
+
+
+def upsert(conn, rec, colo_pct=0):
+    """写入一条 IP 记录. colo_pct>0 时按单地区占比上限吸收新IP(均衡地区).
+    配额拒绝时返回 'refused', 不新增(已有 IP 仍会正常更新)."""
     if rec.get("ip") is None:
-        return
+        return None
     ok = 1 if rec.get("ok") else 0
     fail = 0 if ok else 1
     is_new = conn.execute("SELECT 1 FROM ips WHERE ip=? LIMIT 1",
                           (rec["ip"],)).fetchone() is None
+    if is_new and ok and rec.get("colo") and colo_pct and colo_pct > 0:
+        if not _quota_ok(conn, rec["colo"], colo_pct):
+            return "refused"
     conn.execute(
         """
         INSERT INTO ips(ip,port,colo,loc,latency_ms,bandwidth_mbps,
@@ -285,11 +306,11 @@ def _grave_ts(now):
     return now + GRAVE_DAYS * 86400 - 3600
 
 
-def prune_ips(conn, max_v4, max_v6):
+def prune_ips(conn, max_v4, max_v6, colo_max_pct=0):
     """IPv4/IPv6 分别按上限剪枝, 返回总剔除数. limit<=0 不限该协议.
 
-    被淘汰的"从未成功"的死IP写入 graveyard 墓碑, 静默期内不再被抽中;
-    墓碑过期自动清理且总量封顶.
+    colo_max_pct>0 时先做地区均衡裁剪: 每机房(colo)活跃数超过占比上限的超额
+    部分按分数剪掉, 使库整体覆盖更多地区, 再执行原有全库剪枝.
     """
     if (not max_v4 or int(max_v4) <= 0) and (not max_v6 or int(max_v6) <= 0):
         return 0
@@ -327,7 +348,25 @@ def prune_ips(conn, max_v4, max_v6):
             conn.execute(f"DELETE FROM ips WHERE {proto} AND ok_count = 0")
             pruned += dead
 
+        # 阶段0: 地区均衡裁剪 —— 每机房超过占比上限(colof_max_pct)的部分, 低分先删
+        if colo_max_pct and int(colo_max_pct) > 0:
+            alive = conn.execute(f"SELECT COUNT(*) FROM ips WHERE {alive_cond}").fetchone()[0]
+            rows = conn.execute(f"SELECT colo, COUNT(*) FROM ips "
+                                f"WHERE {alive_cond} GROUP BY colo").fetchall()
+            for colo, cnt in rows:
+                cap = max(0, int(alive * int(colo_max_pct) / 100))
+                n_del = cnt - cap
+                if colo and n_del > 0:
+                    conn.execute(
+                        f"DELETE FROM ips WHERE {alive_cond} AND colo=:c AND ip IN "
+                        f"(SELECT ip FROM (SELECT ip FROM ips "
+                        f"WHERE {alive_cond} AND colo=:c "
+                        f"ORDER BY {PRUNE_SCORE_SQL} LIMIT :n))",
+                        {"now": now, "n": n_del, "c": colo})
+                    pruned += n_del
+
         # 第二: 存活数超限时按分数剪枝
+        alive = conn.execute(f"SELECT COUNT(*) FROM ips WHERE {alive_cond}").fetchone()[0]
         excess = alive - int(limit)
         if excess > 0:
             conn.execute("CREATE TEMP TABLE IF NOT EXISTS victims"
@@ -1082,6 +1121,8 @@ def main():
                     help="IPv4 库上限(0=不限)")
     ap.add_argument("--max-ips-v6", type=int, default=0, dest="max_ips_v6",
                     help="IPv6 库上限(0=不限)")
+    ap.add_argument("--colo-max-pct", type=int, default=0, dest="colo_max_pct",
+                    help="单机房(colo)活跃占比上限% (0=关闭均衡). 超过上限的新IP不吸收, 超限时该机房低分IP先裁剪")
     ap.add_argument("--gap", type=float, default=5, help="轮间间隔秒(默认5)")
     ap.add_argument("--once", action="store_true", help="只扫描一轮(发现+验证预算)后退出")
     ap.add_argument("--reverify", type=int, metavar="N", default=0,
@@ -1169,7 +1210,7 @@ def main():
             except queue.Empty:
                 continue
             if rec["type"] == "result":
-                upsert(conn, rec)
+                upsert(conn, rec, getattr(args, "colo_max_pct", 0))
                 pend += 1
                 if pend >= 200:
                     conn.commit()
@@ -1178,12 +1219,13 @@ def main():
                 conn.commit()
                 pend = 0
                 print(banner(), f"| 本轮达标 {rec['ok']}", flush=True)
-                if getattr(args, "max_ips", 0):
+                if getattr(args, "max_ips_v4", 0) or getattr(args, "max_ips_v6", 0):
                     try:
-                        npruned = prune_ips(conn, args.max_ips_v4, args.max_ips_v6)
+                        npruned = prune_ips(conn, args.max_ips_v4, args.max_ips_v6,
+                                            getattr(args, "colo_max_pct", 0))
                         conn.commit()
                         if npruned:
-                            print(f"库内超限清理: 剔除 {npruned} 个低质量IP",
+                            print(f"库内超限清理(地区均衡): 剔除 {npruned} 个低质量IP",
                                   flush=True)
                     except Exception as e:
                         print(f"库清理失败: {e}", flush=True)

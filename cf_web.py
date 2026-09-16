@@ -2907,6 +2907,8 @@ def child_main(args):
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)
     try:
+        with open(args.pidfile, "w") as fh:
+            fh.write(str(os.getpid()))
         while True:
             ok = serve_forever(args, args.host, args.port)
             if not ok:

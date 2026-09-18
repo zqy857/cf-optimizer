@@ -19,7 +19,7 @@ CF 优选IP 扫描管理台 (Web 图形界面)
   GET  /api/table       结果表数据 (?sort=&region=&minbw=&maxlat=&verified=&q=&port=&limit=)
   GET  /api/export      导出 (?fmt=txt|csv&...)
   GET  /api/service     systemd 服务状态
-  POST /api/service     服务控制 {action:restart|stop|start|enable|disable}
+  POST /api/service     服务控制 {action:restart|stop|start|enable|disable|install, sudo_pass?}
 """
 import argparse
 import asyncio
@@ -42,6 +42,11 @@ import secrets
 import string
 import shutil
 import subprocess
+try:
+    import pwd
+    import grp
+except ImportError:
+    pwd = grp = None
 from collections import OrderedDict, defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -1004,7 +1009,7 @@ class Handler(BaseHTTPRequestHandler):
                 saved = save_settings(params)
                 self._send(200, json.dumps({"ok": True, "saved": saved}).encode("utf-8"))
             elif path == "/api/service":
-                out = service_action(params.get("action"))
+                out = service_action(params.get("action"), params.get("sudo_pass"))
                 self._send(200, json.dumps(out, ensure_ascii=False).encode("utf-8"))
             elif path == "/api/test":
                 out = test_ip(db, params)
@@ -1731,6 +1736,12 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
           <button id="svcStop" class="stop" onclick="svcAct('stop')">⏹ 停止服务</button>
           <button id="svcAuto" class="ghost" onclick="svcAutoToggle()">开机自启</button>
           <button class="ghost" onclick="loadService()">刷新状态</button>
+          <button id="svcInstall" class="ghost" onclick="svcInstallAsk()" style="display:none">⬆️ 注册为系统服务</button>
+        </div>
+        <div id="svcInstallBox" class="row" style="display:none;margin-top:10px">
+          <div class="f" id="svcPassWrap"><label>sudo 密码</label><input type="password" id="svcSudoPass" autocomplete="current-password" placeholder="当前用户密码(已免密 sudo 可留空)" style="min-width:230px"></div>
+          <button class="ghost" onclick="svcInstallGo()">确认注册</button>
+          <button class="ghost" onclick="svcInstallCancel()">取消</button>
         </div>
         <div id="svcHint" class="sub" style="margin-top:12px"></div>
       </div>
@@ -2048,7 +2059,35 @@ function renderService(){
   if(rb)rb.disabled=false;
   if(sb)sb.disabled=false;
   if(ab){ab.disabled=!can;ab.textContent=d.enabled?"关闭开机自启":"开启开机自启";}
+  const ib=$("svcInstall");
+  if(ib)ib.style.display=(!d.can_control&&d.can_register)?"":"none";
+  const box=$("svcInstallBox");
+  if(box&&can)box.style.display="none";
   if(h)h.textContent=d.message||"";
+}
+function svcInstallAsk(){
+  const box=$("svcInstallBox");if(!box)return;
+  const pw=$("svcPassWrap");
+  if(pw)pw.style.display=(SVC&&SVC.need_sudo===false)?"none":"";
+  box.style.display="";
+  const p=$("svcSudoPass");
+  if(p&&(!pw||pw.style.display!=="none")){p.value="";p.focus();}
+}
+function svcInstallCancel(){const b=$("svcInstallBox");if(b)b.style.display="none";}
+function svcInstallGo(){
+  if(!confirm("将本程序注册为 systemd 服务并开启开机自启, 同时授予当前用户免密控制该服务的 sudo 权限。\n\n该操作需要 root 权限。\n安全提示: 若通过 HTTP 明文访问, 提交的 sudo 密码可能被网络窃听, 建议仅在可信网络下操作。\n\n确定继续?"))return;
+  const p=$("svcSudoPass");
+  const body={action:"install"};
+  if(p&&(!$("svcPassWrap")||$("svcPassWrap").style.display!=="none"))body.sudo_pass=p.value;
+  const btn=$("svcInstall");if(btn)btn.disabled=true;
+  fetch("/api/service",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})
+    .then(r=>r.json()).then(r=>{
+      if(p)p.value="";
+      if(!r.ok){toast("注册失败: "+(r.error||"未知错误"),"err");if(btn)btn.disabled=false;return;}
+      toast(r.message||"已注册为系统服务","ok");
+      const b=$("svcInstallBox");if(b)b.style.display="none";
+      setTimeout(()=>location.reload(),9000);
+    }).catch(e=>{if(p)p.value="";toast("请求失败: "+e,"err");if(btn)btn.disabled=false;});
 }
 function svcAutoToggle(){
   if(!SVC)return;
@@ -2874,15 +2913,143 @@ def _can_control(unit):
     return True
 
 
+def _run_user():
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        return os.environ.get("USER") or "root"
+
+
+def _run_group():
+    try:
+        return grp.getgrgid(os.getgid()).gr_name
+    except Exception:
+        return os.environ.get("USER") or "root"
+
+
+def _abs_in_base(p):
+    return p if os.path.isabs(p) else os.path.join(BASE, p)
+
+
+def _unit_text():
+    """依据当前运行参数生成本服务对应的 systemd 单元内容."""
+    a = RUN_ARGS
+    py = sys.executable or "/usr/bin/python3"
+    script = os.path.abspath(__file__)
+    db = _abs_in_base(getattr(a, "db", "cf_ips.db") if a else "cf_ips.db")
+    host = getattr(a, "host", "0.0.0.0") if a else "0.0.0.0"
+    port = getattr(a, "port", 8787) if a else 8787
+    log = _abs_in_base(getattr(a, "log", DEFAULT_LOGFILE) if a else DEFAULT_LOGFILE)
+    pid = _abs_in_base(getattr(a, "pidfile", DEFAULT_PIDFILE) if a else DEFAULT_PIDFILE)
+    return (
+        "[Unit]\n"
+        "Description=CF Optimizer Web Service\n"
+        "After=local-fs.target network.target\n"
+        "Wants=local-fs.target\n\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"WorkingDirectory={BASE}\n"
+        f"ExecStartPre=/bin/sh -c 'while [ ! -f \"{db}\" ]; do echo \"Waiting for volume...\"; sleep 3; done'\n"
+        f"ExecStart={py} {script} --db {db} --host {host} --port {port} "
+        f"--log {log} --pidfile {pid} --no-browser --child\n"
+        f"ExecStop={py} {script} --pidfile {pid} --stop\n"
+        "Restart=on-failure\n"
+        "RestartSec=12\n"
+        f"User={_run_user()}\n"
+        f"Group={_run_group()}\n"
+        f"StandardOutput=append:{log}\n"
+        f"StandardError=append:{log}\n\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+
+
+def _sudoers_text():
+    """生成 sudoers 白名单: 允许当前用户无密码启停/开关本服务."""
+    user = _run_user()
+    sc = _systemctl_path()
+    paths = {sc}
+    try:
+        paths.add(os.path.realpath(sc))
+    except OSError:
+        pass
+    lines = [f"# cf-optimizer 管理台: 允许 {user} 免密控制本服务 (仅限以下命令)"]
+    for binp in sorted(paths):
+        cmds = ", ".join(f"{binp} {v} {SERVICE_NAME}" for v in _SERVICE_VERBS)
+        lines.append(f"{user} ALL=(root) NOPASSWD: {cmds}")
+    return "\n".join(lines) + "\n"
+
+
+def service_register(sudo_pass=None):
+    """在网页端一键注册 systemd 服务 + 开机自启 + sudoers 白名单(需 root).
+
+    优先使用已配置的免密 sudo; 否则用调用方提供的一次性 sudo 密码(不落盘).
+    """
+    if pwd is None or sys.platform == "win32":
+        return {"ok": False, "error": "当前系统不支持 systemd 注册"}
+    if not os.path.isdir("/run/systemd/system"):
+        return {"ok": False, "error": "当前系统未使用 systemd, 无法注册开机自启"}
+    unit_file = os.path.join(BASE, SERVICE_NAME)
+    sudoers_file = os.path.join(BASE, "cf-optimizer.sudoers")
+    try:
+        with open(unit_file, "w", encoding="utf-8") as fh:
+            fh.write(_unit_text())
+        with open(sudoers_file, "w", encoding="utf-8") as fh:
+            fh.write(_sudoers_text())
+    except OSError as e:
+        return {"ok": False, "error": f"写入部署目录失败: {e}"}
+    script = (
+        "set -e\n"
+        f"cp '{unit_file}' /etc/systemd/system/{SERVICE_NAME}\n"
+        "if command -v visudo >/dev/null 2>&1; then\n"
+        f"  visudo -cf '{sudoers_file}'\n"
+        f"  install -m 0440 '{sudoers_file}' /etc/sudoers.d/cf-optimizer\n"
+        "else\n"
+        "  echo '警告: 未找到 visudo, 跳过 sudoers 授权'\n"
+        "fi\n"
+        "systemctl daemon-reload\n"
+        f"systemctl enable {SERVICE_NAME}\n"
+        "( setsid sh -c 'sleep 0.5; for i in $(seq 1 120); do "
+        f"systemctl start {SERVICE_NAME} && break; sleep 0.5; done' >/dev/null 2>&1 & )\n"
+        "echo CF_OPT_INSTALL_OK\n"
+    )
+    try:
+        if os.geteuid() == 0:
+            p = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=40)
+            rc, out, err = p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+        else:
+            sudo_bin = shutil.which("sudo")
+            if not sudo_bin:
+                return {"ok": False, "error": "未找到 sudo 命令, 请手动运行 cf_autostart_install.sh"}
+            p = subprocess.run([sudo_bin, "-S", "bash", "-c", script],
+                               input=(sudo_pass or "") + "\n",
+                               capture_output=True, text=True, timeout=40)
+            rc, out, err = p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "sudo 执行超时"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    if rc != 0 or "CF_OPT_INSTALL_OK" not in out:
+        low = (err or "").lower()
+        if "password" in low or "sorry" in low or "incorrect" in low or "auth" in low:
+            return {"ok": False, "error": "sudo 密码错误或为空"}
+        return {"ok": False, "error": (err or out or "注册失败")[-400:]}
+    threading.Thread(target=_delayed_exit, daemon=True).start()
+    return {"ok": True, "action": "install",
+            "message": "已注册为 systemd 服务并开启开机自启, 正在切换到托管模式, 页面数秒后自动恢复..."}
+
+
 def service_info():
     unit = detect_service_unit()
     info = {"managed": bool(unit), "unit": unit, "active": True, "enabled": None,
-            "can_control": False, "systemctl": _systemctl_path(), "message": ""}
+            "can_control": False, "systemctl": _systemctl_path(), "message": "",
+            "need_sudo": (hasattr(os, "geteuid") and os.geteuid() != 0),
+            "can_register": bool(pwd is not None and os.path.isdir("/run/systemd/system"))}
     if not unit:
         # 非 systemd 托管: 本进程即在运行(正在响应本请求), 但无法管理开机自启
-        info["message"] = ("当前以手动/--daemon 方式运行, 未由 systemd 托管: 无法在网页设置开机自启, "
-                           "重启/停止按钮直接作用于当前进程。如需开机自启, 请在部署目录运行 "
-                           "bash cf_autostart_install.sh 注册为 systemd 服务")
+        info["message"] = ("当前以手动/--daemon 方式运行, 未由 systemd 托管: 无法设置开机自启, "
+                           "重启/停止按钮直接作用于当前进程。可点击「注册为系统服务」由网页自动注册"
+                           "(需 root 权限); 也可在部署目录运行 bash cf_autostart_install.sh")
         return info
     _rc, out, _err = _run_ctl("is-active", unit)
     info["active"] = out == "active"
@@ -2918,7 +3085,9 @@ def _delayed_exit():
     os._exit(0)
 
 
-def service_action(action):
+def service_action(action, sudo_pass=None):
+    if action == "install":
+        return service_register(sudo_pass)
     unit = detect_service_unit()
     can = _can_control(unit) if unit else False
     if action in ("enable", "disable"):
@@ -3069,7 +3238,7 @@ def child_main(args):
 
 
 def main():
-    global DB, PIDFILE
+    global DB, PIDFILE, RUN_ARGS
     ap = argparse.ArgumentParser(description="CF 优选IP 扫描管理台 (Web图形界面, 数据库驱动)")
     ap.add_argument("--db", default="cf_ips.db", help="SQLite 数据库路径(默认 cf_ips.db)")
     ap.add_argument("--host", default="0.0.0.0",
@@ -3083,6 +3252,7 @@ def main():
     ap.add_argument("--pidfile", default=DEFAULT_PIDFILE)
     ap.add_argument("--log", default=DEFAULT_LOGFILE)
     args = ap.parse_args()
+    RUN_ARGS = args
     DB = args.db
     PIDFILE = args.pidfile
     if args.stop:
@@ -3118,6 +3288,7 @@ def main():
 
 DB = None
 PIDFILE = None
+RUN_ARGS = None
 
 
 if __name__ == "__main__":

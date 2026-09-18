@@ -1112,11 +1112,11 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;background:var(--scrim
 /* ================= 点击特效: ba-click-fx (MIT) ================= */
 
 /* ================= 特效设置面板 ================= */
-#v-fx .fr{display:flex;align-items:center;gap:12px;margin-bottom:10px;font-size:13px}
-#v-fx .fr label:first-child{flex:0 0 92px;color:var(--dim)}
-#v-fx .fr output{flex:0 0 44px;text-align:right;font-variant-numeric:tabular-nums;color:var(--txt);font-size:12.5px}
-#v-fx input[type=range]{flex:1;accent-color:var(--acc);max-width:340px}
-#v-fx input[type=color]{width:42px;height:26px;border:1px solid var(--line);border-radius:6px;background:none;padding:0;cursor:pointer}
+#v-system .fr{display:flex;align-items:center;gap:12px;margin-bottom:10px;font-size:13px}
+#v-system .fr label:first-child{flex:0 0 92px;color:var(--dim)}
+#v-system .fr output{flex:0 0 44px;text-align:right;font-variant-numeric:tabular-nums;color:var(--txt);font-size:12.5px}
+#v-system input[type=range]{flex:1;accent-color:var(--acc);max-width:340px}
+#v-system input[type=color]{width:42px;height:26px;border:1px solid var(--line);border-radius:6px;background:none;padding:0;cursor:pointer}
 
 /* ================= 壁纸(Ken Burns 缓慢呼吸) ================= */
 .wallpaper{position:fixed;inset:-3.5%;z-index:-2;pointer-events:none;
@@ -1220,7 +1220,7 @@ body.side-mini .collapse-btn{transform:rotate(180deg)}
 /* ---------- 玻璃卡片 ---------- */
 .card{
   position:relative;
-  background:var(--glass-fill);-webkit-
+  background:var(--glass-fill);
   border:1px solid var(--edge);border-radius:12px;padding:18px;margin-bottom:16px;
   box-shadow:var(--rim), 0 4px 12px rgba(0,0,0,var(--shadow-a));
   transition:border-color .2s ease,box-shadow .25s ease,transform .25s ease;
@@ -1561,10 +1561,10 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
   #toast{bottom:20px;padding:12px 20px;font-size:13.5px;max-width:90vw}
 
   /* 特效设置 */
-  #v-fx .fr{flex-wrap:wrap;gap:8px}
-  #v-fx .fr label{flex:0 0 100%;margin-bottom:2px}
-  #v-fx input[type=range]{width:100%;min-width:0}
-  #v-fx input[type=color]{width:50px;height:32px}
+  #v-system .fr{flex-wrap:wrap;gap:8px}
+  #v-system .fr label{flex:0 0 100%;margin-bottom:2px}
+  #v-system input[type=range]{width:100%;min-width:0}
+  #v-system input[type=color]{width:50px;height:32px}
 }
 
 /* 超小屏(≤380px) */
@@ -1588,8 +1588,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <a class="nv on" data-v="overview"><i>🏠</i><span>总览看板</span></a>
     <a class="nv" data-v="scan"><i>🛰️</i><span>扫描控制</span></a>
     <a class="nv" data-v="table"><i>📋</i><span>IP 列表</span></a>
-    <a class="nv" data-v="service"><i>⚙️</i><span>服务管理</span></a>
-    <a class="nv" data-v="fx"><i>✨</i><span>点击特效</span></a>
+    <a class="nv" data-v="system"><i>⚙️</i><span>系统设置</span></a>
   </nav>
   <div class="side-foot">
     <button class="sbtn theme-btn" id="themeBtn" title="主题: 自动(跟随设备) → 浅色 → 深色"></button>
@@ -1719,8 +1718,8 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
 
 
     </section>
-    <section class="view" id="v-service">
-      <div class="sub page-sub">后台服务进程管理: 重启 / 停止 / 开机自启 &nbsp;|&nbsp; 适用于 systemd 托管部署(systemctl)</div>
+    <section class="view" id="v-system">
+      <div class="sub page-sub">管理控制台: 后台服务(重启 / 停止 / 开机自启) + 界面点击特效</div>
       <div class="card">
         <div class="h">⚙️ 服务管理<span class="sub">systemd 单元: <b id="svcUnit">—</b></span></div>
         <div class="row">
@@ -1730,14 +1729,11 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
         <div class="row" style="margin-top:10px">
           <button id="svcRestart" class="ghost" onclick="svcAct('restart')">🔄 重启服务</button>
           <button id="svcStop" class="stop" onclick="svcAct('stop')">⏹ 停止服务</button>
-          <button id="svcEnable" class="ghost" onclick="svcAct('enable')">⏱️ 开启开机自启</button>
-          <button id="svcDisable" class="ghost" onclick="svcAct('disable')">⌛ 关闭开机自启</button>
+          <button id="svcAuto" class="ghost" onclick="svcAutoToggle()">开机自启</button>
           <button class="ghost" onclick="loadService()">刷新状态</button>
         </div>
         <div id="svcHint" class="sub" style="margin-top:12px"></div>
       </div>
-    </section>
-    <section class="view" id="v-fx">
       <div class="card">
         <div class="h">✨ 点击特效设置<span class="sub">蔚蓝档案风格点击特效与光标拖尾 · 调整即时生效并自动保存</span></div>
         <div class="row">
@@ -2048,18 +2044,21 @@ function renderService(){
   if(a){a.textContent=d.active?"运行中":"已停止";a.className="pill "+(d.active?"run":"stop");}
   if(e){e.textContent=d.enabled?"已开启":"已关闭";e.className="pill "+(d.enabled?"run":"idle");}
   const can=!!(d.managed&&d.can_control);
-  const rb=$("svcRestart"),sb=$("svcStop"),eb=$("svcEnable"),db=$("svcDisable");
+  const rb=$("svcRestart"),sb=$("svcStop"),ab=$("svcAuto");
   if(rb)rb.disabled=false;
   if(sb)sb.disabled=false;
-  if(eb)eb.disabled=!can||d.enabled;
-  if(db)db.disabled=!can||!d.enabled;
+  if(ab){ab.disabled=!can;ab.textContent=d.enabled?"关闭开机自启":"开启开机自启";}
   if(h)h.textContent=d.message||"";
+}
+function svcAutoToggle(){
+  if(!SVC)return;
+  svcAct(SVC.enabled?"disable":"enable");
 }
 function svcAct(action){
   const names={restart:"重启服务",stop:"停止服务",enable:"开启开机自启",disable:"关闭开机自启"};
   if(action==="restart"&&!confirm("确定重启后台服务? 网页会短暂断开, 约数秒后自动恢复。"))return;
   if(action==="stop"&&!confirm("确定停止后台服务? 停止后本网页将无法访问, 需到设备上手动启动或重启设备(已开启自启时)才能恢复。"))return;
-  const map={restart:"svcRestart",stop:"svcStop",enable:"svcEnable",disable:"svcDisable"};
+  const map={restart:"svcRestart",stop:"svcStop",enable:"svcAuto",disable:"svcAuto"};
   const btn=$(map[action]);if(btn)btn.disabled=true;
   fetch("/api/service",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:action})})
     .then(r=>r.json()).then(r=>{
@@ -2406,17 +2405,17 @@ scrollGuardSetup();
 poll();
 
 /* ================= 布局: 视图导航 / 侧栏 / 主题 ================= */
-const VIEWS={overview:"总览看板",scan:"扫描控制",table:"IP 列表",service:"服务管理",fx:"点击特效"};
+const VIEWS={overview:"总览看板",scan:"扫描控制",table:"IP 列表",system:"系统设置"};
 function showView(v){
   document.querySelectorAll(".nv").forEach(a=>a.classList.toggle("on",a.dataset.v===v));
   document.querySelectorAll(".view").forEach(s=>s.classList.toggle("on",s.id==="v-"+v));
   $("crumb").textContent=VIEWS[v]||v;
   localStorage.setItem("view",v);
   if(v==="overview")requestAnimationFrame(redrawCharts);
-  if(v==="service")loadService();
+  if(v==="system")loadService();
 }
 document.querySelectorAll(".nv").forEach(a=>a.addEventListener("click",()=>{showView(a.dataset.v);closeSide();}));
-setInterval(()=>{const s=$("v-service");if(s&&s.classList.contains("on"))loadService();},12000);
+setInterval(()=>{const s=$("v-system");if(s&&s.classList.contains("on"))loadService();},12000);
 function redrawCharts(){
   document.querySelectorAll("canvas").forEach(cv=>{const d=cv._data;if(!d)return;
     d.type==="bar"?barChart(cv.id,d.items,d.color):histChart(cv.id,d.labels,d.data,d.color)});
@@ -2557,7 +2556,8 @@ function fxReset(){
   location.reload();
 }
 
-showView(localStorage.getItem("view")||"overview");
+const _sv=localStorage.getItem("view");
+showView((_sv==="service"||_sv==="fx")?"system":(VIEWS[_sv]?_sv:"overview"));
 applyTheme();
 
 </script>

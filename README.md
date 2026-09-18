@@ -12,6 +12,7 @@
 - 🌍 **地区识别**: 自动识别机房 (colo) 与国家/地区,支持按地区筛选导出
 - 📋 **结果表**: 可排序 / 多条件筛选 / 勾选批量操作,一键导出 `ADD.txt` / `CSV`
 - ⚙️ **灵活配置**: 扫描参数随时通过 Web 界面调整并热重启
+- 🧭 **服务管理**: 网页端一键重启 / 停止服务、开启 / 关闭开机自启(需 systemd 托管部署, 安装脚本自动配置 sudoers 授权)
 - 💾 **断点续扫**: 所有结果累积进 SQLite,随时退出,下次继续; 库上限+墓碑机制控制体积
 - 🖱️ **BA 点击特效**: 蔚蓝档案风格点击特效与光标拖尾(ba-click-fx, MIT), 面板可视化调参, 桌面/手机触屏均生效
 - 🌗 **现代界面**: 左侧可折叠导航 + 多视图布局, 深浅色主题(自动跟随系统/手动切换), NASA 每日一图壁纸, 移动端完整适配
@@ -22,6 +23,7 @@
 |---|---|
 | `cf_db.py` | 核心扫描引擎(命令行工具) |
 | `cf_web.py` | Web 管理台(内置调用 cf_db) |
+| `cf_autostart_install.sh` | systemd 开机自启安装脚本(生成服务单元 + sudoers 授权) |
 | `cf_speedtest_worker.js` | 自建测速 Cloudflare Worker(可选) |
 | `cf_settings.json` | Web 界面保存的参数(可选,缺失时用默认值) |
 | `vendor/ba-click-fx.js` | 点击特效库 ba-click-fx(MIT, 本地自托管) |
@@ -74,7 +76,7 @@ python3 cf_db.py --seed myadd.txt     # 把现有优选名单导入数据库作�
 
 ## 🖥️ Web 管理台使用说明
 
-界面为**左侧可折叠导航**(移动端变抽屉)+ 右侧内容区, 共 4 个视图, 右上角 🌓 按钮切换主题(**自动跟随系统 → 浅色 → 深色** 循环):
+界面为**左侧可折叠导航**(移动端变抽屉)+ 右侧内容区, 共 5 个视图, 右上角 🌓 按钮切换主题(**自动跟随系统 → 浅色 → 深色** 循环):
 
 1. **总览看板**: 统计卡片("已测试IP"为**历史累计**, 含已被清理的IP; 库内保留数见悬浮明细) + 机房 / 国家 / 延迟 / 带宽四类图表, 悬停看明细。
 2. **扫描控制**: 地址源(官方全网 / CF官方 / 电信 / 联通 / 移动优选段)、端口、抽样数/轮、并发、验证预算、测带宽/轮、测速并连数、测速域名、地区补全、复核、优质 C 段比例、最大延迟、库上限, 以及 TLS 二次确认 / 同时扫描 IPv6 开关。参数保存后热生效, 「开始扫描 / 停止」随时切换。
@@ -83,9 +85,38 @@ python3 cf_db.py --seed myadd.txt     # 把现有优选名单导入数据库作�
    - **排序**: 点击列头(带宽 / 延迟 / IP / 端口 / 机房 / 最近测试)
    - **勾选**: 复制选中(格式 `ip:端口#地区`) / 导出选中 txt / 清空选中, 跨页保留
    - **翻页跳转**, 一键导出 `ADD.txt` / `CSV`(跟随当前筛选条件)
-4. **✨ 点击特效**: 蔚蓝档案风格点击特效与光标拖尾开关、特效大小 / 不透明度 / 拖尾与点击速度滑杆、颜色跟随明暗主题或自定义; 所有调整即时生效并保存在浏览器本地。桌面与手机触屏均生效。
+4. **⚙️ 服务管理**: 查看服务运行状态与开机自启状态, 一键 **重启服务** / **停止服务**, 以及 **开启 / 关闭开机自启**。systemd 托管部署且已由安装脚本授予 sudo 权限时全部可用; 非托管(手动 / 容器)或未授权时, 开机自启开关会被禁用, 重启 / 停止退化为进程内操作(重启 = 自重启, 停止 = 退出进程, 停止后需到设备上重新启动或重启设备恢复)。
+5. **✨ 点击特效**: 蔚蓝档案风格点击特效与光标拖尾开关、特效大小 / 不透明度 / 拖尾与点击速度滑杆、颜色跟随明暗主题或自定义; 所有调整即时生效并保存在浏览器本地。桌面与手机触屏均生效。
 
 > **壁纸**: NASA 每日一图(APOD)自动解析并缓存在服务端(`apod_bg.jpg`), 访客直接加载本地图; 当日为视频时自动取最近图片日, 接口失败沿用旧图。可选在 `cf_settings.json` 加 `"nasa_api_key": "你的key"` 提升接口配额([api.nasa.gov](https://api.nasa.gov) 免费申请, DEMO_KEY 限 50 次/天)。
+
+## 🖥️ 开机自启与常驻(systemd)
+
+推荐用安装脚本把管理台注册为 systemd 服务(开机自启 + 崩溃自动重启), 并同时授予网页端「服务管理」所需的 sudo 权限:
+
+```bash
+# 在部署目录(cf_web.py / cf_ips.db 同目录)执行; 需要 sudo 权限
+bash cf_autostart_install.sh
+# 若当前用户不能免密 sudo: SUDO_PASS='你的密码' bash cf_autostart_install.sh
+# 指定运行用户/组(默认当前用户): RUN_USER=zqy RUN_GROUP=Administrators bash cf_autostart_install.sh
+```
+
+脚本会:
+
+1. 生成 `cf-optimizer.service`(部署目录), 复制到 `/etc/systemd/system/` 并 `enable` + `restart`;
+2. 生成 `cf-optimizer.sudoers`, 经 `visudo -cf` 校验后安装到 `/etc/sudoers.d/cf-optimizer`(权限 `0440`), 仅允许运行用户 **无密码** 对本服务执行 `systemctl {start,stop,restart,enable,disable,is-active,is-enabled}`, 供网页端按钮调用;
+3. 校验服务状态并测试登录接口。
+
+> 「服务管理」视图中重启 / 停止 / 开机自启开关依赖上述 sudoers 授权; 未授权(或非 systemd 环境)时重启 / 停止仍可用(进程内兜底: 重启=自重启, 停止=退出进程), 开机自启开关不可用。
+>
+> 停止服务后网页将无法访问; 若已开启开机自启, 重启设备即可恢复, 否则需到设备上手动 `sudo systemctl start cf-optimizer.service`。
+
+手动管理(不使用脚本):
+
+```bash
+sudo systemctl start|stop|restart|enable|disable cf-optimizer.service
+sudo systemctl status cf-optimizer.service
+```
 
 ## 🔌 Web API
 
@@ -98,6 +129,8 @@ python3 cf_db.py --seed myadd.txt     # 把现有优选名单导入数据库作�
 | `GET /api/copy` | 按 IP 列表返回 `ip:端口#地区` 格式(用于批量复制) |
 | `GET /api/export?fmt=txt\|csv` | 导出 ADD.txt / CSV(跟随筛选条件) |
 | `POST /api/control` | 开始 / 停止扫描 |
+| `GET /api/service` | 服务状态(systemd 单元 / 运行 / 自启 / 可否控制) |
+| `POST /api/service` | 服务控制(`{"action":"restart\|stop\|start\|enable\|disable"}`) |
 | `POST /api/settings` | 保存设置 |
 | `POST /api/test` | 单 IP 手动测 延迟 / 带宽 |
 

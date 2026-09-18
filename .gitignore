@@ -30,6 +30,10 @@ apod_bg.*
 # 本地运行配置
 cf_settings.json
 
+# 安装脚本生成的 systemd/sudoers 文件
+cf-optimizer.service
+cf-optimizer.sudoers
+
 # IDE
 .vscode/
 .idea/

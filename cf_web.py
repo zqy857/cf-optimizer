@@ -18,6 +18,8 @@ CF 优选IP 扫描管理台 (Web 图形界面)
   GET  /api/stats       数据库统计 + 图表数据
   GET  /api/table       结果表数据 (?sort=&region=&minbw=&maxlat=&verified=&q=&port=&limit=)
   GET  /api/export      导出 (?fmt=txt|csv&...)
+  GET  /api/service     systemd 服务状态
+  POST /api/service     服务控制 {action:restart|stop|start|enable|disable}
 """
 import argparse
 import asyncio
@@ -38,6 +40,7 @@ import hmac
 import urllib.request
 import secrets
 import string
+import shutil
 import subprocess
 from collections import OrderedDict, defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -906,6 +909,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps(api_table(db, q)).encode("utf-8"))
             elif path == "/api/settings":
                 self._send(200, json.dumps(load_settings()).encode("utf-8"))
+            elif path == "/api/service":
+                self._send(200, json.dumps(service_info(), ensure_ascii=False).encode("utf-8"))
             elif path == "/api/ports":
                 self._send(200, json.dumps(api_ports(db)).encode("utf-8"))
             elif path == "/api/export":
@@ -998,6 +1003,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/settings":
                 saved = save_settings(params)
                 self._send(200, json.dumps({"ok": True, "saved": saved}).encode("utf-8"))
+            elif path == "/api/service":
+                out = service_action(params.get("action"))
+                self._send(200, json.dumps(out, ensure_ascii=False).encode("utf-8"))
             elif path == "/api/test":
                 out = test_ip(db, params)
                 self._send(200, json.dumps(out).encode("utf-8"))
@@ -1231,6 +1239,8 @@ body.side-mini .collapse-btn{transform:rotate(180deg)}
 .pill::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--dim);transition:all .3s ease}
 .pill.run{color:#7ef0c8;background:rgba(47,214,163,.10);border-color:rgba(47,214,163,.42)}
 .pill.run::before{background:var(--acc2);box-shadow:0 0 10px var(--acc2);animation:pulse 1.6s ease infinite}
+.pill.stop{color:#fda4af;background:rgba(244,63,94,.10);border-color:rgba(244,63,94,.42)}
+.pill.stop::before{background:#fb7185}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.78)}}
 
 /* ---------- 统计卡 ---------- */
@@ -1578,6 +1588,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <a class="nv on" data-v="overview"><i>🏠</i><span>总览看板</span></a>
     <a class="nv" data-v="scan"><i>🛰️</i><span>扫描控制</span></a>
     <a class="nv" data-v="table"><i>📋</i><span>IP 列表</span></a>
+    <a class="nv" data-v="service"><i>⚙️</i><span>服务管理</span></a>
     <a class="nv" data-v="fx"><i>✨</i><span>点击特效</span></a>
   </nav>
   <div class="side-foot">
@@ -1707,6 +1718,24 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
 </div>
 
 
+    </section>
+    <section class="view" id="v-service">
+      <div class="sub page-sub">后台服务进程管理: 重启 / 停止 / 开机自启 &nbsp;|&nbsp; 适用于 systemd 托管部署(systemctl)</div>
+      <div class="card">
+        <div class="h">⚙️ 服务管理<span class="sub">systemd 单元: <b id="svcUnit">—</b></span></div>
+        <div class="row">
+          <div class="f"><label>运行状态</label><span id="svcActive" class="pill idle">—</span></div>
+          <div class="f"><label>开机自启</label><span id="svcEnabled" class="pill idle">—</span></div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button id="svcRestart" class="ghost" onclick="svcAct('restart')">🔄 重启服务</button>
+          <button id="svcStop" class="stop" onclick="svcAct('stop')">⏹ 停止服务</button>
+          <button id="svcEnable" class="ghost" onclick="svcAct('enable')">⏱️ 开启开机自启</button>
+          <button id="svcDisable" class="ghost" onclick="svcAct('disable')">⌛ 关闭开机自启</button>
+          <button class="ghost" onclick="loadService()">刷新状态</button>
+        </div>
+        <div id="svcHint" class="sub" style="margin-top:12px"></div>
+      </div>
     </section>
     <section class="view" id="v-fx">
       <div class="card">
@@ -2008,6 +2037,42 @@ function control(act){
     $("startBtn").disabled=false; });
 }
 
+let SVC=null;
+function loadService(){
+  fetch("/api/service").then(r=>r.json()).then(d=>{SVC=d;renderService();}).catch(()=>{});
+}
+function renderService(){
+  const d=SVC;if(!d)return;
+  const u=$("svcUnit"),a=$("svcActive"),e=$("svcEnabled"),h=$("svcHint");
+  if(u)u.textContent=d.unit||"未托管";
+  if(a){a.textContent=d.active?"运行中":"已停止";a.className="pill "+(d.active?"run":"stop");}
+  if(e){e.textContent=d.enabled?"已开启":"已关闭";e.className="pill "+(d.enabled?"run":"idle");}
+  const can=!!(d.managed&&d.can_control);
+  const rb=$("svcRestart"),sb=$("svcStop"),eb=$("svcEnable"),db=$("svcDisable");
+  if(rb)rb.disabled=false;
+  if(sb)sb.disabled=false;
+  if(eb)eb.disabled=!can||d.enabled;
+  if(db)db.disabled=!can||!d.enabled;
+  if(h)h.textContent=d.message||"";
+}
+function svcAct(action){
+  const names={restart:"重启服务",stop:"停止服务",enable:"开启开机自启",disable:"关闭开机自启"};
+  if(action==="restart"&&!confirm("确定重启后台服务? 网页会短暂断开, 约数秒后自动恢复。"))return;
+  if(action==="stop"&&!confirm("确定停止后台服务? 停止后本网页将无法访问, 需到设备上手动启动或重启设备(已开启自启时)才能恢复。"))return;
+  const map={restart:"svcRestart",stop:"svcStop",enable:"svcEnable",disable:"svcDisable"};
+  const btn=$(map[action]);if(btn)btn.disabled=true;
+  fetch("/api/service",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:action})})
+    .then(r=>r.json()).then(r=>{
+      if(!r.ok){toast("操作失败: "+(r.error||"未知错误"),"err");if(btn)btn.disabled=false;return;}
+      toast(r.message||(names[action]+"指令已发送"),"ok");
+      if(action==="restart"){setTimeout(()=>location.reload(),7000);return;}
+      if(action==="stop"){
+        setTimeout(()=>{document.body.innerHTML='<div style="padding:40px;font-family:sans-serif;opacity:.85">后台服务已停止。<br>请在设备上重新启动服务, 或重启设备(需已开启开机自启)。</div>';},1500);
+        return;
+      }
+      setTimeout(loadService,900);
+    }).catch(err=>{toast("请求失败: "+err,"err");if(btn)btn.disabled=false;});
+}
 function tableParams(){
   const region=($("f_region").value||"").split(",").map(s=>s.trim()).filter(Boolean);
   const p=new URLSearchParams();
@@ -2341,15 +2406,17 @@ scrollGuardSetup();
 poll();
 
 /* ================= 布局: 视图导航 / 侧栏 / 主题 ================= */
-const VIEWS={overview:"总览看板",scan:"扫描控制",table:"IP 列表",fx:"点击特效"};
+const VIEWS={overview:"总览看板",scan:"扫描控制",table:"IP 列表",service:"服务管理",fx:"点击特效"};
 function showView(v){
   document.querySelectorAll(".nv").forEach(a=>a.classList.toggle("on",a.dataset.v===v));
   document.querySelectorAll(".view").forEach(s=>s.classList.toggle("on",s.id==="v-"+v));
   $("crumb").textContent=VIEWS[v]||v;
   localStorage.setItem("view",v);
   if(v==="overview")requestAnimationFrame(redrawCharts);
+  if(v==="service")loadService();
 }
 document.querySelectorAll(".nv").forEach(a=>a.addEventListener("click",()=>{showView(a.dataset.v);closeSide();}));
+setInterval(()=>{const s=$("v-service");if(s&&s.classList.contains("on"))loadService();},12000);
 function redrawCharts(){
   document.querySelectorAll("canvas").forEach(cv=>{const d=cv._data;if(!d)return;
     d.type==="bar"?barChart(cv.id,d.items,d.color):histChart(cv.id,d.labels,d.data,d.color)});
@@ -2441,8 +2508,6 @@ function fxBuildAdv(){
   }
 }
 document.addEventListener("fxready",fxBuildAdv);
-function fxCfg(){try{return JSON.parse(localStorage.getItem("fxcfg")||"{}")}catch(e){return {}}}
-function fxSave(c){localStorage.setItem("fxcfg",JSON.stringify(c))}
 function fxSync(){
   const c=fxCfg();
   $("fxClick").checked=c.clickEnabled!==false;
@@ -2754,6 +2819,137 @@ def daemon_status(pidfile):
         print("未在运行")
 
 
+# ------------------------------------------------------- systemd 服务管理
+SERVICE_NAME = os.environ.get("CF_SERVICE_UNIT", "cf-optimizer.service")
+_SERVICE_VERBS = ("start", "stop", "restart", "enable", "disable", "is-active", "is-enabled")
+
+
+def _systemctl_path():
+    return shutil.which("systemctl") or "/usr/bin/systemctl"
+
+
+def detect_service_unit():
+    """探测当前进程所属 systemd 单元; 非 systemd 环境返回 None."""
+    env_unit = os.environ.get("CF_SERVICE_UNIT")
+    if env_unit:
+        return env_unit
+    if not os.path.isdir("/run/systemd/system"):
+        return None
+    try:
+        with open("/proc/self/cgroup", "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.endswith(".service"):
+                    return line.rsplit("/", 1)[-1]
+    except Exception:
+        pass
+    if os.path.exists(os.path.join("/etc/systemd/system", SERVICE_NAME)):
+        return SERVICE_NAME
+    return None
+
+
+def _run_ctl(verb, unit, sudo=False, timeout=12):
+    if verb not in _SERVICE_VERBS:
+        return 1, "", "invalid verb"
+    cmd = (["sudo", "-n"] if sudo else []) + [_systemctl_path(), verb, unit]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+    except FileNotFoundError:
+        return 127, "", "systemctl not found"
+    except subprocess.TimeoutExpired:
+        return 124, "", "systemctl timeout"
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def _can_control(unit):
+    """能否无密码 sudo 调用 systemctl (安装脚本可配置 sudoers 白名单)."""
+    if not unit:
+        return False
+    rc, _out, err = _run_ctl("is-active", unit, sudo=True)
+    low = (err or "").lower()
+    if rc == 127 or "password is required" in low or "no tty present" in low:
+        return False
+    return True
+
+
+def service_info():
+    unit = detect_service_unit()
+    info = {"managed": bool(unit), "unit": unit, "active": False, "enabled": False,
+            "can_control": False, "systemctl": _systemctl_path(), "message": ""}
+    if not unit:
+        info["message"] = "当前非 systemd 托管运行(手动/容器), 无法设置开机自启; 重启/停止将作用于本进程"
+        return info
+    _rc, out, _err = _run_ctl("is-active", unit)
+    info["active"] = out == "active"
+    _rc2, out2, _err2 = _run_ctl("is-enabled", unit)
+    info["enabled"] = out2 in ("enabled", "enabled-runtime", "alias", "static")
+    info["can_control"] = _can_control(unit)
+    if not info["can_control"]:
+        info["message"] = ("未授予无密码 systemctl 权限, 开机自启开关不可用; "
+                           "重启/停止将退化为进程内操作. 可重跑 cf_autostart_install.sh 授权")
+    return info
+
+
+def _delayed_ctl(verb, unit):
+    time.sleep(0.6)
+    _run_ctl(verb, unit, sudo=True, timeout=25)
+
+
+def _delayed_execv():
+    time.sleep(0.6)
+    argv = list(sys.argv)
+    if argv and not os.path.isabs(argv[0]):
+        argv[0] = os.path.abspath(argv[0])
+    os.execv(sys.executable, [sys.executable] + argv)
+
+
+def _delayed_exit():
+    time.sleep(0.6)
+    try:
+        if PIDFILE and str(os.getpid()) == str(get_pid(PIDFILE)):
+            os.remove(PIDFILE)
+    except OSError:
+        pass
+    os._exit(0)
+
+
+def service_action(action):
+    unit = detect_service_unit()
+    can = _can_control(unit) if unit else False
+    if action in ("enable", "disable"):
+        if not unit:
+            return {"ok": False, "error": "当前非 systemd 托管运行, 无法设置开机自启"}
+        if not can:
+            return {"ok": False, "error": "未授予无密码 systemctl 权限, 请重跑 cf_autostart_install.sh"}
+        rc, out, err = _run_ctl(action, unit, sudo=True)
+        if rc != 0:
+            return {"ok": False, "error": err or out or f"systemctl {action} 失败"}
+        return {"ok": True, "action": action,
+                "message": "已开启开机自启" if action == "enable" else "已关闭开机自启"}
+    if action == "start":
+        if not unit:
+            return {"ok": False, "error": "当前非 systemd 托管运行"}
+        if not can:
+            return {"ok": False, "error": "未授予无密码 systemctl 权限"}
+        rc, out, err = _run_ctl("start", unit, sudo=True)
+        return {"ok": rc == 0, "action": action, "error": None if rc == 0 else (err or out)}
+    if action not in ("restart", "stop"):
+        return {"ok": False, "error": "unknown action"}
+    # restart / stop: 必须先把 HTTP 响应送出去, 再异步动服务
+    if unit and can:
+        threading.Thread(target=_delayed_ctl, args=(action, unit), daemon=True).start()
+        msg = "服务重启中, 数秒后自动恢复..." if action == "restart" else "服务正在停止..."
+    elif action == "restart":
+        threading.Thread(target=_delayed_execv, daemon=True).start()
+        msg = "服务重启中(进程内自重启)..."
+    else:
+        threading.Thread(target=_delayed_exit, daemon=True).start()
+        msg = "服务正在停止..."
+    return {"ok": True, "action": action, "message": msg}
+
+
 SECRET_FILE = os.path.join(BASE, "cf_secret.json")
 SECRET = None
 
@@ -2870,7 +3066,7 @@ def child_main(args):
 
 
 def main():
-    global DB
+    global DB, PIDFILE
     ap = argparse.ArgumentParser(description="CF 优选IP 扫描管理台 (Web图形界面, 数据库驱动)")
     ap.add_argument("--db", default="cf_ips.db", help="SQLite 数据库路径(默认 cf_ips.db)")
     ap.add_argument("--host", default="0.0.0.0",
@@ -2885,6 +3081,7 @@ def main():
     ap.add_argument("--log", default=DEFAULT_LOGFILE)
     args = ap.parse_args()
     DB = args.db
+    PIDFILE = args.pidfile
     if args.stop:
         daemon_stop(args.pidfile)
         return
@@ -2917,6 +3114,7 @@ def main():
 
 
 DB = None
+PIDFILE = None
 
 
 if __name__ == "__main__":

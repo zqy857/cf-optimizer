@@ -77,7 +77,10 @@ def save_settings(d):
     cur = load_settings()
     for k in SETTINGS_KEYS:
         if k in d:
-            cur[k] = d[k]
+            v = d[k]
+            if isinstance(v, str) and k in ("bench_host", "operator"):
+                v = v.strip()
+            cur[k] = v
     with open(SETTINGS_FILE, "w") as fh:
         json.dump(cur, fh, ensure_ascii=False, indent=2)
     return cur
@@ -689,11 +692,12 @@ def test_ip(db, params):
                     "tcp": round(tcp, 1) if tcp is not None else None,
                     "tls": round(tls, 1) if tls is not None else None}
         elif act == "bw":
+            _bh = (params.get("bench_host")
+                   or load_settings().get("bench_host")
+                   or cf_db.SPEED_HOST)
             ns = types.SimpleNamespace(bench_size=50_000_000, bench_timeout=15,
                                        bench_parallel=6,
-                                       bench_host=(params.get("bench_host")
-                                                   or load_settings().get("bench_host")
-                                                   or cf_db.SPEED_HOST))
+                                       bench_host=str(_bh).strip() or cf_db.SPEED_HOST)
             bw = _run_on_test_loop(cf_db.bench_bandwidth(ip, port, ns), timeout=22)
             if bw is None:
                 return {"ok": False, "error": "测速失败"}

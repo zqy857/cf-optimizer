@@ -21,6 +21,12 @@ __pycache__/
 # 登录凭据(含密码, 严禁提交)
 cf_secret.json
 
+# TLS 证书/私钥(严禁提交)
+*.pem
+
+# 运行时生成的壁纸缓存
+apod_bg.*
+
 # 本地运行配置
 cf_settings.json
 

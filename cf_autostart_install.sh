@@ -6,6 +6,8 @@
 set -euo pipefail
 SERVICE="cf-optimizer.service"
 DEPLOY_DIR="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+RUN_USER="${RUN_USER:-$(id -un)}"
+RUN_GROUP="${RUN_GROUP:-$(id -gn)}"
 cd "$DEPLOY_DIR"
 
 echo "1. 停止现有服务（如有）"
@@ -27,8 +29,8 @@ ExecStart=/usr/bin/python3 $DEPLOY_DIR/cf_web.py --db cf_ips.db --host 0.0.0.0 -
 ExecStop=/usr/bin/python3 $DEPLOY_DIR/cf_web.py --pidfile $DEPLOY_DIR/cf_web.pid --stop
 Restart=on-failure
 RestartSec=12
-User=zqy
-Group=Administrators
+User=$RUN_USER
+Group=$RUN_GROUP
 StandardOutput=append:$DEPLOY_DIR/cf_web.log
 StandardError=append:$DEPLOY_DIR/cf_web.log
 
@@ -55,8 +57,15 @@ echo "4. 服务状态"
 $SUDO systemctl is-enabled "$SERVICE"
 $SUDO systemctl is-active "$SERVICE"
 echo "5. 验证访问(login cookie)"
-curl -sk -c /tmp/cj -m 6 -o /dev/null -X POST -d 'user=zqy' -d 'pass=PLACEHOLDER' \
-    'https://127.0.0.1:8787/api/login' -w 'login:%{http_code}\n' \
-    && curl -sk -b /tmp/cj -m 6 -o /dev/null -w 'export:%{http_code}\n' \
-    'https://127.0.0.1:8787/api/export?fmt=csv&top=3' || echo "提示: 按实际账号密码测试"
+CRED_USER="$(python3 -c "import json;print(json.load(open('cf_secret.json'))['user'])" 2>/dev/null || echo admin)"
+CRED_PASS="$(python3 -c "import json;print(json.load(open('cf_secret.json'))['pass'])" 2>/dev/null || echo '')"
+if [ -n "$CRED_PASS" ]; then
+    curl -s -c /tmp/cj -m 6 -o /dev/null -X POST \
+        --data-urlencode "user=$CRED_USER" --data-urlencode "pass=$CRED_PASS" \
+        'http://127.0.0.1:8787/api/login' -w 'login:%{http_code}\n' \
+        && curl -s -b /tmp/cj -m 6 -o /dev/null -w 'export:%{http_code}\n' \
+        'http://127.0.0.1:8787/api/export?fmt=csv&top=3'
+else
+    echo "提示: 未找到 cf_secret.json, 请按实际账号密码测试"
+fi
 echo "已完成: systemd 开机自启 + 崩溃自动重启(Restart=on-failure)"

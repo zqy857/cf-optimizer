@@ -426,7 +426,8 @@ def scan_args(params, db):
         bench_size=int(max(1_000_000, min(num("bench_size", 30_000_000, int), 80_000_000))),
         bench_timeout=max(1, num("bench_timeout", 10)),
         bench_parallel=max(1, int(num("bench_parallel", 6, int))),
-        bench_host=str(flat.get("bench_host", "")).strip() or cf_db.SPEED_HOST,        ipv6=str(flat.get("ipv6", "0")) not in ("0", "false", ""),
+        bench_host=str(flat.get("bench_host", "")).strip() or cf_db.SPEED_HOST,
+        ipv6=str(flat.get("ipv6", "0")) not in ("0", "false", ""),
         cycles=0, gap=max(1, num("gap", 5)), once=False, reverify=0,
     )
 
@@ -612,7 +613,6 @@ def refresh_wallpaper(force=False):
             print(f"[WP] cached OK fallback={used_fallback}", flush=True)
             WP_STATE["date"] = today
             WP_STATE["fallback"] = used_fallback
-            WP_STATE["fallback"] = used_fallback
             return True
     except Exception as e:
         print(f"[WP] download fail: {type(e).__name__} {e}", flush=True)
@@ -787,6 +787,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(401)
         if www_auth:
             self.send_header("WWW-Authenticate", 'Basic realm="cf-optimizer"')
+        self.send_header("Set-Cookie", "s=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
         body = b'{"error":"unauthorized"}'
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -809,7 +810,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send(self, code, body, ctype="application/json; charset=utf-8", fname=None):
         self.send_response(code)
-        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Type", ctype)
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         self.send_header("Pragma", "no-cache")
@@ -864,6 +864,7 @@ class Handler(BaseHTTPRequestHandler):
             if human and not has_basic:
                 self.send_response(302)
                 self.send_header("Location", "/login")
+                self.send_header("Set-Cookie", "s=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
@@ -953,11 +954,11 @@ class Handler(BaseHTTPRequestHandler):
             if okc:
                 LOGIN_FAILS.pop(ip, None)
                 tok = _session_token()
-                secure = "; Secure" if SECRET.get("https") else ""
+                new = f"s={tok}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL}"
                 if is_json:
                     body = b'{"ok":true}'
                     self.send_response(200)
-                    self.send_header("Set-Cookie", f"s={tok}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL}{secure}")
+                    self.send_header("Set-Cookie", new)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
@@ -965,7 +966,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self.send_response(302)
                     self.send_header("Location", "/")
-                    self.send_header("Set-Cookie", f"s={tok}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL}{secure}")
+                    self.send_header("Set-Cookie", new)
                     self.send_header("Content-Length", "0")
                     self.end_headers()
             else:
@@ -1548,7 +1549,6 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
   /* 弹窗与提示 */
   .modal{width:94%;padding:16px 14px;border-radius:14px}
   #toast{bottom:20px;padding:12px 20px;font-size:13.5px;max-width:90vw}
-  .route-hint{padding:8px 10px;font-size:11.5px}
 
   /* 特效设置 */
   #v-fx .fr{flex-wrap:wrap;gap:8px}
@@ -2755,8 +2755,6 @@ def daemon_status(pidfile):
 
 
 SECRET_FILE = os.path.join(BASE, "cf_secret.json")
-CERT_FILE = os.path.join(BASE, "cf_https_cert.pem")
-KEY_FILE = os.path.join(BASE, "cf_https_key.pem")
 SECRET = None
 
 
@@ -2778,7 +2776,7 @@ def init_secret():
     if SECRET:
         return SECRET
     pw = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))
-    SECRET = {"user": "admin", "pass": pw, "https": True}
+    SECRET = {"user": "admin", "pass": pw}
     try:
         with open(SECRET_FILE, "w", encoding="utf-8") as fh:
             json.dump(SECRET, fh, ensure_ascii=False)
@@ -2789,41 +2787,9 @@ def init_secret():
     print(f"首次启动, 已生成管理台登录凭据 (保存于 {SECRET_FILE})", flush=True)
     print(f"  用户名: {SECRET['user']}", flush=True)
     print(f"  密码:   {SECRET['pass']}", flush=True)
-    print("  需改密码直接编辑该文件; 关闭加密把 https 设为 false", flush=True)
+    print("  需改密码直接编辑该文件并重启", flush=True)
     print("=" * 60, flush=True)
     return SECRET
-
-
-def ensure_cert():
-    """生成自签名 HTTPS 证书 (需 openssl); 失败返回 None 则退回 http."""
-    if os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE):
-        return CERT_FILE
-    try:
-        subprocess.run(
-            ["openssl", "req", "-x509", "-newkey", "rsa:2048",
-             "-keyout", KEY_FILE, "-out", CERT_FILE, "-days", "3650",
-             "-nodes", "-subj", "/CN=cf-optimizer", "-sha256"],
-            check=True, capture_output=True, timeout=90,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
-        os.chmod(KEY_FILE, 0o600)
-        return CERT_FILE
-    except Exception as e:
-        print(f"HTTPS 证书生成失败(需要 openssl 命令): {e}", file=sys.stderr)
-        return None
-
-
-def build_ssl_ctx():
-    cert = ensure_cert()
-    if not cert:
-        return None
-    try:
-        import ssl
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.load_cert_chain(cert, KEY_FILE)
-        return ctx
-    except Exception as e:
-        print(f"HTTPS 初始化失败, 退回 http: {e}", file=sys.stderr)
-        return None
 
 
 def serve_forever(args, host, port):
@@ -2850,27 +2816,6 @@ def serve_forever(args, host, port):
             bind_host = "::"
         except OSError:
             bind_host = "0.0.0.0"
-    scheme = "http"
-    ssl_ctx = None
-    if SECRET and SECRET.get("https"):
-        ssl_ctx = build_ssl_ctx()
-    if ssl_ctx is not None:
-        class SecureServer(server_cls):
-            def get_request(self):
-                sock, addr = super().get_request()
-                try:
-                    sock.settimeout(5)
-                    s = ssl_ctx.wrap_socket(sock, server_side=True)
-                    s.settimeout(None)
-                except Exception:
-                    try:
-                        sock.close()
-                    except Exception:
-                        pass
-                    raise
-                return s, addr
-        server_cls = SecureServer
-        scheme = "https"
     try:
         srv = server_cls((bind_host, port), Handler)
     except OSError as e:
@@ -2880,12 +2825,12 @@ def serve_forever(args, host, port):
     port = srv.server_address[1]
     local = "127.0.0.1" if bind_host in ("0.0.0.0", "::", "") else bind_host
     print(f"CF 优选IP 扫描管理台已启动  数据库: {os.path.abspath(args.db)}", flush=True)
-    print(f"  访问: {scheme}://{local}:{port}/   (需登录, 用户名: {SECRET['user'] if SECRET else '无'})", flush=True)
+    print(f"  访问: http://{local}:{port}/   (需登录, 用户名: {SECRET['user'] if SECRET else '无'})", flush=True)
     for ip in lan_ips():
         disp = "[%s]" % ip if ":" in ip else ip
-        print(f"  局域网: {scheme}://{disp}:{port}/", flush=True)
+        print(f"  局域网: http://{disp}:{port}/", flush=True)
     if not args.no_browser:
-        webbrowser.open(f"{scheme}://{local}:{port}/")
+        webbrowser.open(f"http://{local}:{port}/")
     threading.Thread(target=_log_rotator, args=(args.log,), daemon=True).start()
     try:
         srv.serve_forever()

@@ -93,12 +93,7 @@ CREATE TABLE IF NOT EXISTS ips(
   verified_at REAL,
   first_seen REAL,
   ok_count INTEGER DEFAULT 0,
-  fail_count INTEGER DEFAULT 0,
-  route_as_list TEXT,
-  route_class TEXT,
-  route_hops TEXT,
-  route_at REAL,
-  route_error TEXT
+  fail_count INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_ips_score ON ips(latency_ms, verified_at, bandwidth_mbps);
 CREATE INDEX IF NOT EXISTS idx_ips_tested ON ips(tested_at);
@@ -120,9 +115,6 @@ CREATE TABLE IF NOT EXISTS meta(
 MIGRATIONS = [
     "ALTER TABLE ips ADD COLUMN bw_last_mbps REAL",
     "ALTER TABLE ips ADD COLUMN bw_last_at REAL",
-    "DROP INDEX IF EXISTS idx_ips_route",
-    "ALTER TABLE ips DROP COLUMN route",
-    "ALTER TABLE ips DROP COLUMN route_premium",
 ]
 
 N24_SQL = ("substr(ip,1,"
@@ -1236,7 +1228,7 @@ def main():
     ap.add_argument("--max-ips-v6", type=int, default=0, dest="max_ips_v6",
                     help="IPv6 库上限(0=不限)")
     ap.add_argument("--country-pct", type=int, default=30, dest="country_pct",
-                    help="单国家活跃占比上限% (0=关闭均衡). 超过上限的新IP不吸收, 超限时该国低分IP先裁剪")
+                    help="单国家活跃占比上限%% (0=关闭均衡). 超过上限的新IP不吸收, 超限时该国低分IP先裁剪")
     ap.add_argument("--gap", type=float, default=5, help="轮间间隔秒(默认5)")
     ap.add_argument("--once", action="store_true", help="只扫描一轮(发现+验证预算)后退出")
     ap.add_argument("--reverify", type=int, metavar="N", default=0,

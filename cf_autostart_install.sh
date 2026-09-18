@@ -49,12 +49,12 @@ EOF
 
 echo "4. 安装到 /etc/systemd/system 并启用开机自启"
 if [ -n "${SUDO_PASS:-}" ]; then
-    SUDO="echo $SUDO_PASS | sudo -S"
+    sudocmd() { printf '%s\n' "$SUDO_PASS" | sudo -S "$@"; }
 else
-    SUDO="sudo"
+    sudocmd() { sudo "$@"; }
 fi
 
-$SUDO bash -c "
+sudocmd bash -c "
 set -e
 cp '$DEPLOY_DIR/$SERVICE' /etc/systemd/system/$SERVICE
 if command -v visudo >/dev/null 2>&1; then
@@ -70,8 +70,8 @@ systemctl restart $SERVICE
 "
 sleep 3
 echo "5. 服务状态"
-$SUDO systemctl is-enabled "$SERVICE"
-$SUDO systemctl is-active "$SERVICE"
+sudocmd systemctl is-enabled "$SERVICE"
+sudocmd systemctl is-active "$SERVICE"
 echo "6. 验证访问(login cookie)"
 CRED_USER="$(python3 -c "import json;print(json.load(open('cf_secret.json'))['user'])" 2>/dev/null || echo admin)"
 CRED_PASS="$(python3 -c "import json;print(json.load(open('cf_secret.json'))['pass'])" 2>/dev/null || echo '')"

@@ -2041,8 +2041,8 @@ function renderService(){
   const d=SVC;if(!d)return;
   const u=$("svcUnit"),a=$("svcActive"),e=$("svcEnabled"),h=$("svcHint");
   if(u)u.textContent=d.unit||"未托管";
-  if(a){a.textContent=d.active?"运行中":"已停止";a.className="pill "+(d.active?"run":"stop");}
-  if(e){e.textContent=d.enabled?"已开启":"已关闭";e.className="pill "+(d.enabled?"run":"idle");}
+  if(a){a.textContent=d.active?(d.managed?"运行中":"运行中(非托管)"):"已停止";a.className="pill "+(d.active?"run":"stop");}
+  if(e){const un=(d.enabled===null||d.enabled===undefined);e.textContent=un?"不适用":(d.enabled?"已开启":"已关闭");e.className="pill "+(un?"idle":(d.enabled?"run":"idle"));}
   const can=!!(d.managed&&d.can_control);
   const rb=$("svcRestart"),sb=$("svcStop"),ab=$("svcAuto");
   if(rb)rb.disabled=false;
@@ -2876,10 +2876,13 @@ def _can_control(unit):
 
 def service_info():
     unit = detect_service_unit()
-    info = {"managed": bool(unit), "unit": unit, "active": False, "enabled": False,
+    info = {"managed": bool(unit), "unit": unit, "active": True, "enabled": None,
             "can_control": False, "systemctl": _systemctl_path(), "message": ""}
     if not unit:
-        info["message"] = "当前非 systemd 托管运行(手动/容器), 无法设置开机自启; 重启/停止将作用于本进程"
+        # 非 systemd 托管: 本进程即在运行(正在响应本请求), 但无法管理开机自启
+        info["message"] = ("当前以手动/--daemon 方式运行, 未由 systemd 托管: 无法在网页设置开机自启, "
+                           "重启/停止按钮直接作用于当前进程。如需开机自启, 请在部署目录运行 "
+                           "bash cf_autostart_install.sh 注册为 systemd 服务")
         return info
     _rc, out, _err = _run_ctl("is-active", unit)
     info["active"] = out == "active"

@@ -47,6 +47,9 @@ import time
 import types
 import urllib.parse
 
+import cf_health
+import cf_policy
+
 OFFICIAL_V4_URL = "https://www.cloudflare.com/ips-v4"
 FALLBACK_RANGES = [
     "104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13", "162.158.0.0/15",
@@ -59,12 +62,11 @@ FALLBACK_RANGES_V6 = [
     "2606:4700::/32", "2606:4700:3000::/48", "2606:4700:3100::/48",
     "2400:cb00::/32", "2803:f800::/32",
 ]
-# IPv6 地址池: 优先用公开「优选 v6 IP 列表」(命中率高, 体积小), 运营商列表+通用列表合并;
-# 都拉不到才回退 CF 官方 /32 大段随机采样
+# IPv6 地址池: 公开「优选 v6 IP 列表」(命中率高, 体积小) 命中率高, 还需叠加 CF 官方 v6 大段
+# 以随机发现新地址(命中率低但覆盖广)。
+# 注: addressesapi 的 ct-ipv6 / cu-ipv6 已失效(404), 故只保留 cmcc; 公共列表始终纳入。
 V6_CURATED_URLS = {
     "cmcc": "https://addressesapi.090227.xyz/cmcc-ipv6",
-    "ct": "https://addressesapi.090227.xyz/ct-ipv6",
-    "cu": "https://addressesapi.090227.xyz/cu-ipv6",
 }
 V6_CURATED_GENERAL = "https://raw.githubusercontent.com/joname1/BestCFip/refs/heads/main/ipv6.txt"
 OPERATOR_URLS = {
@@ -93,7 +95,14 @@ CREATE TABLE IF NOT EXISTS ips(
   verified_at REAL,
   first_seen REAL,
   ok_count INTEGER DEFAULT 0,
-  fail_count INTEGER DEFAULT 0
+  fail_count INTEGER DEFAULT 0,
+  last_ok_at REAL,
+  last_fail_at REAL,
+  fail_streak INTEGER DEFAULT 0,
+  lat_ewma_ms REAL,
+  bw_ewma_mbps REAL,
+  score REAL DEFAULT 0,
+  next_check_at REAL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_ips_score ON ips(latency_ms, verified_at, bandwidth_mbps);
 CREATE INDEX IF NOT EXISTS idx_ips_tested ON ips(tested_at);
@@ -115,6 +124,16 @@ CREATE TABLE IF NOT EXISTS meta(
 MIGRATIONS = [
     "ALTER TABLE ips ADD COLUMN bw_last_mbps REAL",
     "ALTER TABLE ips ADD COLUMN bw_last_at REAL",
+    # 健康度模型(见 cf_health.py)
+    "ALTER TABLE ips ADD COLUMN last_ok_at REAL",
+    "ALTER TABLE ips ADD COLUMN last_fail_at REAL",
+    "ALTER TABLE ips ADD COLUMN fail_streak INTEGER DEFAULT 0",
+    "ALTER TABLE ips ADD COLUMN lat_ewma_ms REAL",
+    "ALTER TABLE ips ADD COLUMN bw_ewma_mbps REAL",
+    "ALTER TABLE ips ADD COLUMN score REAL DEFAULT 0",
+    "ALTER TABLE ips ADD COLUMN next_check_at REAL DEFAULT 0",
+    "CREATE INDEX IF NOT EXISTS idx_ips_next ON ips(next_check_at)",
+    "CREATE INDEX IF NOT EXISTS idx_ips_quality ON ips(score)",
 ]
 
 N24_SQL = ("substr(ip,1,"
@@ -122,11 +141,18 @@ N24_SQL = ("substr(ip,1,"
            "+instr(substr(ip,instr(ip,'.')+instr(substr(ip,instr(ip,'.')+1),'.')+1),'.')-1)")
 
 
+_SSL_CTX = None
+
+
 def ssl_ctx():
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = True
-    ctx.verify_mode = ssl.CERT_REQUIRED
-    return ctx
+    """共享客户端 SSLContext: 重复创建会反复加载 CA 库, 探测高频路径下开销显著."""
+    global _SSL_CTX
+    if _SSL_CTX is None:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = True
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        _SSL_CTX = ctx
+    return _SSL_CTX
 
 
 def open_db(path):
@@ -157,7 +183,36 @@ def open_db(path):
         conn.commit()
     except Exception:
         pass
+    _health_migrate(conn)
     return conn
+
+
+def _health_migrate(conn):
+    """把存量库接入/升级到当前健康度模型: 回填 last_ok_at/last_fail_at/fail_streak,
+    重算 score 与 next_check_at. 以 meta.health_ver 记录已应用的评分版本,
+    评分公式变更(HEALTH_VERSION 提升)时自动重算一次, 无需手动干预."""
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key='health_ver'").fetchone()
+        ver = row[0] if row else 0
+    except Exception:
+        return
+    if ver == cf_health.HEALTH_VERSION:
+        return
+    now = time.time()
+    try:
+        conn.execute("UPDATE ips SET last_ok_at=tested_at "
+                     "WHERE ok_count>0 AND last_ok_at IS NULL")
+        conn.execute("UPDATE ips SET last_fail_at=tested_at "
+                     "WHERE ok_count=0 AND last_fail_at IS NULL")
+        conn.execute("UPDATE ips SET fail_streak=MIN(fail_count, 10) "
+                     "WHERE ok_count=0 AND COALESCE(fail_streak,0)=0")
+        cf_health.health_refresh(conn, now)
+        conn.execute("INSERT INTO meta(key,value) VALUES('health_ver',?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (cf_health.HEALTH_VERSION,))
+        conn.commit()
+    except Exception:
+        pass
 
 
 def load_known(conn):
@@ -259,69 +314,100 @@ def _quota_ok(conn, country, pct):
         return True
 
 
+_EXISTING_COLS = ("ok_count,fail_count,fail_streak,last_ok_at,last_fail_at,"
+                  "latency_ms,lat_ewma_ms,bandwidth_mbps,bw_last_mbps,bw_last_at,"
+                  "bw_ewma_mbps,colo,loc,verified_at,first_seen,port")
+
+
 def upsert(conn, rec, country_pct=0):
-    """写入一条 IP 记录. country_pct>0 时按单国家占比上限吸收新IP(均衡地区).
-    配额拒绝时返回 'refused', 不新增(已有 IP 仍会正常更新)."""
-    if rec.get("ip") is None:
+    """写入一条 IP 探测结果, 并据健康度模型刷新 score / next_check_at.
+
+    country_pct>0 时按单国家占比上限吸收新IP(均衡地区); 配额拒绝返回 'refused'。
+    采用显式"读-改-写", 用 Python 计算连续成功/失败、EWMA 与质量分, 取代原先
+    复杂的 ON CONFLICT CASE(仅单线程写库, 竞争极小)。
+    """
+    ip = rec.get("ip")
+    if ip is None:
         return None
+    now = rec.get("tested_at") or time.time()
     ok = 1 if rec.get("ok") else 0
     fail = 0 if ok else 1
-    is_new = conn.execute("SELECT 1 FROM ips WHERE ip=? LIMIT 1",
-                          (rec["ip"],)).fetchone() is None
-    if is_new and ok and rec.get("colo") and country_pct and country_pct > 0:
-        if not _quota_ok(conn, _country(rec["colo"]), country_pct):
-            return "refused"
-    conn.execute(
-        """
-        INSERT INTO ips(ip,port,colo,loc,latency_ms,bandwidth_mbps,
-                        bw_last_mbps,bw_last_at,
-                        tested_at,verified_at,first_seen,ok_count,fail_count)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(ip) DO UPDATE SET
-          port=CASE WHEN excluded.latency_ms IS NOT NULL AND excluded.tested_at>=ips.tested_at
-                    THEN excluded.port ELSE port END,
-          latency_ms=CASE WHEN excluded.latency_ms IS NOT NULL AND excluded.tested_at>=ips.tested_at
-                    THEN excluded.latency_ms ELSE latency_ms END,
-          tested_at=CASE WHEN excluded.tested_at>ips.tested_at THEN excluded.tested_at ELSE ips.tested_at END,
-          colo=COALESCE(excluded.colo,colo),
-          loc=COALESCE(excluded.loc,loc),
-          verified_at=COALESCE(excluded.verified_at,verified_at),
-          bandwidth_mbps=CASE WHEN excluded.bandwidth_mbps IS NOT NULL AND (bandwidth_mbps IS NULL OR excluded.bandwidth_mbps > bandwidth_mbps)
-                              THEN excluded.bandwidth_mbps ELSE bandwidth_mbps END,
-          bw_last_mbps=CASE WHEN excluded.bw_last_mbps IS NOT NULL AND excluded.tested_at>=ips.tested_at
-                       THEN excluded.bw_last_mbps ELSE bw_last_mbps END,
-          bw_last_at=CASE WHEN excluded.bw_last_mbps IS NOT NULL AND excluded.tested_at>=ips.tested_at
-                     THEN excluded.bw_last_at ELSE bw_last_at END,
-          ok_count=ok_count+excluded.ok_count,
-          fail_count=fail_count+excluded.fail_count
-        """,
-        (
-            rec.get("ip"), rec.get("port") or 443,
-            rec.get("colo"), rec.get("loc"),
-            rec.get("latency"), rec.get("bandwidth"),
-            rec.get("bandwidth"), rec.get("tested_at") if rec.get("bandwidth") is not None else None,
-            rec.get("tested_at") or time.time(),
-            rec.get("verified_at"), rec.get("first_seen") or time.time(),
-            ok, fail,
-        ),
-    )
+    row = conn.execute(f"SELECT {_EXISTING_COLS} FROM ips WHERE ip=? LIMIT 1",
+                       (ip,)).fetchone()
+    is_new = row is None
     if is_new:
+        if ok and rec.get("colo") and country_pct and country_pct > 0:
+            if not _quota_ok(conn, _country(rec["colo"]), country_pct):
+                return "refused"
+        (p_ok, p_fail, p_fs, p_lok, p_lfail, p_lat, p_latw, p_bw, p_bwlast,
+         p_bwlastat, p_bww, p_colo, p_loc, p_ver, p_first, p_port) = (
+            0, 0, 0, None, None, None, None, None, None, None, None, None, None,
+            None, now, 443)
+    else:
+        (p_ok, p_fail, p_fs, p_lok, p_lfail, p_lat, p_latw, p_bw, p_bwlast,
+         p_bwlastat, p_bww, p_colo, p_loc, p_ver, p_first, p_port) = row
+
+    ok_count = (p_ok or 0) + ok
+    fail_count = (p_fail or 0) + fail
+    fail_streak = 0 if ok else (p_fs or 0) + 1
+    last_ok_at = now if ok else p_lok
+    last_fail_at = p_lfail if ok else now
+
+    latency = rec.get("latency")
+    if ok and latency is not None:
+        latency_ms = latency
+        lat_ewma = latency if p_latw is None else round(0.7 * p_latw + 0.3 * latency, 3)
+    else:
+        latency_ms = p_lat
+        lat_ewma = p_latw
+
+    bw = rec.get("bandwidth")
+    if bw is not None:
+        best_bw = bw if p_bw is None else max(p_bw, bw)
+        bw_ewma = bw if p_bww is None else round(0.7 * p_bww + 0.3 * bw, 3)
+        bw_last = bw
+        bw_last_at = now
+    else:
+        best_bw, bw_ewma, bw_last, bw_last_at = p_bw, p_bww, p_bwlast, p_bwlastat
+
+    colo = rec.get("colo") or p_colo
+    loc = rec.get("loc") or p_loc
+    verified_at = rec.get("verified_at") or p_ver
+    if rec.get("colo") and not verified_at:
+        verified_at = now
+    port = (rec.get("port") or p_port or 443) if ok else (p_port or 443)
+    first_seen = p_first or now
+
+    lat_v = lat_ewma if lat_ewma is not None else latency_ms
+    bw_v = bw_ewma if bw_ewma is not None else best_bw
+    sc = cf_health.score(ok_count, fail_count, lat_v, bw_v, bool(colo), last_ok_at, now)
+    nxt = cf_health.next_check_at(sc, ok_count, fail_streak, last_ok_at, last_fail_at,
+                                  now, bool(colo), now)
+
+    values = (port, colo, loc, latency_ms, best_bw, bw_last, bw_last_at, now,
+              verified_at, ok_count, fail_count, last_ok_at, last_fail_at,
+              fail_streak, lat_ewma, bw_ewma, sc, nxt)
+    if is_new:
+        conn.execute(
+            "INSERT INTO ips(ip,port,colo,loc,latency_ms,bandwidth_mbps,bw_last_mbps,"
+            "bw_last_at,tested_at,verified_at,ok_count,fail_count,last_ok_at,last_fail_at,"
+            "fail_streak,lat_ewma_ms,bw_ewma_mbps,score,next_check_at,first_seen) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ip,) + values + (first_seen,))
         try:
             conn.execute(
                 "INSERT INTO meta(key,value) VALUES('tested_total',1) "
                 "ON CONFLICT(key) DO UPDATE SET value=value+1")
         except Exception:
             pass
-
-
-PRUNE_SCORE_SQL = (
-    "(CASE WHEN ok_count > 0 THEN 200 ELSE 0 END)"          # 活的基础分
-    "+ (CASE WHEN verified_at IS NOT NULL THEN 60 ELSE 0 END)"
-    "+ MAX(0, 120 - fail_count * 30)"                        # 连续失败越多越先删
-    "+ COALESCE(MIN(MAX(COALESCE(bw_last_mbps, 0), 0), 600), 0)"         # 带宽主导: 1Mbps=1分, 上限600
-    "+ MAX(0, ROUND((1000 - MIN(COALESCE(latency_ms, 9999), 1000)) * 0.4))"  # 延迟主导: 满分400
-    "+ MAX(-60, CAST((tested_at - :now) / 86400.0 AS INTEGER) * 2)"      # 越久没测到越先删
-)
+    else:
+        conn.execute(
+            "UPDATE ips SET port=?,colo=?,loc=?,latency_ms=?,bandwidth_mbps=?,"
+            "bw_last_mbps=?,bw_last_at=?,tested_at=?,verified_at=?,ok_count=?,fail_count=?,"
+            "last_ok_at=?,last_fail_at=?,fail_streak=?,lat_ewma_ms=?,bw_ewma_mbps=?,"
+            "score=?,next_check_at=? WHERE ip=?",
+            values + (ip,))
+    return "ok"
 
 
 GRAVE_DAYS = 7           # 死IP墓碑静默期(天): 期间抽样自动跳过
@@ -411,13 +497,17 @@ def prune_ips(conn, max_v4, max_v6, country_pct=0):
         pass
 
     def _purge_dead():
-        cond = ("ok_count = 0 AND fail_count >= 3 AND tested_at < :cut "
+        # 1) 从未存活且持续失败: 直接清退
+        # 2) 曾经存活但已 >HARD_TTL 无成功且连续失败: 判定失效降级, 入墓碑后由扫描重发现
+        cond = ("((ok_count = 0 AND fail_count >= 3 AND tested_at < :cut) OR "
+                "(ok_count > 0 AND fail_streak >= :fs AND COALESCE(last_ok_at,0) < :hard)) "
                 "LIMIT 50000")
+        params = {"ts": _grave_ts(now), "cut": now - 7 * 86400,
+                  "fs": cf_health.FLAP_FAIL_STREAK, "hard": now - cf_health.HARD_TTL}
         conn.execute("INSERT OR REPLACE INTO graveyard(ip, buried_at) "
-                     f"SELECT ip, :ts FROM ips WHERE {cond}",
-                     {"ts": _grave_ts(now), "cut": now - 7 * 86400})
+                     f"SELECT ip, :ts FROM ips WHERE {cond}", params)
         conn.execute(f"DELETE FROM ips WHERE ip IN (SELECT ip FROM ips WHERE {cond})",
-                     {"cut": now - 7 * 86400})
+                     params)
 
     _purge_dead()
     pruned = 0
@@ -458,13 +548,13 @@ def prune_ips(conn, max_v4, max_v6, country_pct=0):
                     colos = [colo for colo, _ in rows
                              if colo and _country(colo) == ctry]
                     ph = ",".join(":c%d" % i for i in range(len(colos)))
-                    params = {"now": now, "n": n_del}
+                    params = {"n": n_del}
                     params.update({"c%d" % i: co for i, co in enumerate(colos)})
                     conn.execute(
                         f"DELETE FROM ips WHERE {alive_cond} AND colo IN ({ph}) AND ip IN "
                         f"(SELECT ip FROM (SELECT ip FROM ips "
                         f"WHERE {alive_cond} AND colo IN ({ph}) "
-                        f"ORDER BY {PRUNE_SCORE_SQL} LIMIT :n))",
+                        f"ORDER BY score ASC, latency_ms ASC LIMIT :n))",
                         params)
                     pruned += n_del
 
@@ -478,8 +568,8 @@ def prune_ips(conn, max_v4, max_v6, country_pct=0):
                 conn.execute("DELETE FROM victims")
                 conn.execute(f"INSERT INTO victims(ip) SELECT ip FROM ips "
                              f"WHERE {alive_cond} "
-                             f"ORDER BY {PRUNE_SCORE_SQL} LIMIT :n",
-                             {"now": now, "n": int(excess)})
+                             f"ORDER BY score ASC, latency_ms ASC LIMIT :n",
+                             {"n": int(excess)})
                 conn.execute("DELETE FROM ips WHERE ip IN (SELECT ip FROM victims)")
                 pruned += excess
 
@@ -521,11 +611,30 @@ def fetch_networks(operator, port):
     return nets, label
 
 
-def fetch_networks_v6(operator=""):
+def resolve_sources(args):
+    """按 v4/ipv6 开关与各自地址源解析地址池. 返回 (nets, label, nets6).
+
+    label 为 "v4源 + v6源" 的组合描述, 供 Web/CLI 展示与日志使用。
+    """
+    nets, nets6 = [], []
+    parts = []
+    if getattr(args, "v4", True):
+        nets, v4label = fetch_networks(getattr(args, "operator", None), args.port)
+        parts.append(v4label)
+    if getattr(args, "ipv6", False):
+        nets6 = fetch_networks_v6(getattr(args, "operator_v6", "") or "",
+                                  include_official=getattr(args, "v6_official", True))
+        op6 = {"cmcc": "移动"}.get(getattr(args, "operator_v6", None), "公共")
+        off6 = "" if getattr(args, "v6_official", True) else "(不含官方大段)"
+        parts.append(f"IPv6({op6}{off6})")
+    return nets, " + ".join(parts) or "无地址源", nets6
+
+
+def fetch_networks_v6(operator="", include_official=True):
     """IPv6 地址池。
 
     公开「优选 v6 IP 列表」(运营商匹配 + 通用源合并, 均为已优选好的具体IP,
-    命中率高) + CF 官方大段(随机发现新地址, 命中率低但覆盖广) 合并返回。
+    命中率高) + (可选) CF 官方 v6 大段(随机发现新地址, 命中率低但覆盖广) 合并返回。
     返回 ip_network 列表: 优选条目是 /128 主机, 官方是大段。
     """
     def _parse(raw):
@@ -549,32 +658,36 @@ def fetch_networks_v6(operator=""):
     seeds = []
     urls = []
     if operator in V6_CURATED_URLS:
-        urls.append(V6_CURATED_URLS[operator])
-    urls.append(V6_CURATED_GENERAL)
-    for u in urls:
+        urls.append((operator, V6_CURATED_URLS[operator]))
+    urls.append(("公共", V6_CURATED_GENERAL))
+    for name, u in urls:
         try:
-            raw = asyncio.run(fetch(urllib.parse.urlparse(u)))
-            seeds.extend(_parse(raw))
-        except Exception:
-            continue
+            raw = asyncio.run(fetch(urllib.parse.urlparse(u), timeout=7))
+            got = _parse(raw)
+            if not got:
+                print(f"[源] IPv6 优选源 {name} 无有效数据: {u}", flush=True)
+            seeds.extend(got)
+        except Exception as e:
+            print(f"[源] IPv6 优选源 {name} 不可用({type(e).__name__}): {u}", flush=True)
     seeds = list(dict.fromkeys(seeds))
     nets = [ipaddress.ip_network(s, strict=False) for s in seeds] if seeds else []
-    # 官方大段也一并加入, 用于随机发现新 v6 地址(命中率低但覆盖广)
-    try:
-        raw = asyncio.run(fetch(urllib.parse.urlparse(OFFICIAL_V6_URL)))
-        for l in raw.decode().splitlines():
-            l = l.strip()
-            if "/" in l:
+    # 可选: 叠加 CF 官方 v6 大段, 用于随机发现新地址(命中率低但覆盖广)
+    if include_official:
+        try:
+            raw = asyncio.run(fetch(urllib.parse.urlparse(OFFICIAL_V6_URL), timeout=7))
+            for l in raw.decode().splitlines():
+                l = l.strip()
+                if "/" in l:
+                    try:
+                        nets.append(ipaddress.ip_network(l, strict=False))
+                    except ValueError:
+                        continue
+        except Exception:
+            for r in FALLBACK_RANGES_V6:
                 try:
-                    nets.append(ipaddress.ip_network(l, strict=False))
+                    nets.append(ipaddress.ip_network(r))
                 except ValueError:
                     continue
-    except Exception:
-        for r in FALLBACK_RANGES_V6:
-            try:
-                nets.append(ipaddress.ip_network(r))
-            except ValueError:
-                continue
     return nets
 
 
@@ -608,21 +721,37 @@ def fetch_hot24(path, limit=200, raw=False):
     return [(n, max(1, g)) for n, g, f, c in hot if g and g >= 1]
 
 
-def fetch_recheck(path, limit, cooldown):
+def fetch_due(path, limit, now=None):
+    """分层调度: 取已到复测时间(next_check_at<=now)的 IP, 最久到期者优先。
+
+    next_check_at 由 cf_health 按分数/失败退避生成——优质 IP 到期更快、复测更勤,
+    失败 IP 指数退避; 按到期时间排序保证任何 IP 都不会被无限饿死。
+    """
+    now = now or time.time()
     try:
         conn = sqlite3.connect(path)
-        cutoff = time.time() - cooldown
-        rows = conn.execute("SELECT ip, port FROM ips WHERE tested_at < ? AND ok_count>0 "
-                            "ORDER BY tested_at ASC LIMIT ?", (cutoff, limit)).fetchall()
-        out = list(rows)
-        if len(out) < limit:
-            rows2 = conn.execute("SELECT ip, port FROM ips WHERE tested_at < ? AND ok_count=0 "
-                                 "ORDER BY tested_at ASC LIMIT ?", (cutoff, limit - len(out))).fetchall()
-            out.extend(rows2)
+        rows = conn.execute(
+            "SELECT ip, port FROM ips WHERE next_check_at <= ? "
+            "ORDER BY next_check_at ASC, score DESC LIMIT ?", (now, limit)).fetchall()
         conn.close()
-        return out
+        return rows
     except Exception:
         return []
+
+
+def _maybe_refresh_health(conn, ttl=900):
+    """限频地把全库 score/next_check_at 按当前时间重算(新鲜度会随时间衰减)."""
+    now = time.time()
+    row = conn.execute("SELECT value FROM meta WHERE key='score_refreshed_at'").fetchone()
+    if row and now - row[0] < ttl:
+        return
+    try:
+        cf_health.health_refresh(conn, now)
+        conn.execute("INSERT INTO meta(key,value) VALUES('score_refreshed_at',?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (int(now),))
+        conn.commit()
+    except Exception:
+        pass
 
 
 def fetch_backfill(path, limit, cooldown):
@@ -671,15 +800,14 @@ def discover(nets, hot24, count, ports, known, cooldown, exploit_frac):
     cands = []
     n_exploit = min(count, int(count * exploit_frac)) if hot24 else 0
     exhausted = set()
+    hot_pre = [p for p, _ in hot24]
+    hot_w = [w for _, w in hot24]
+    hot_total = sum(hot_w)
 
     for _ in range(n_exploit):
-        if not hot24:
+        if hot_total <= 0:
             break
-        weights = [w for _, w in hot24]
-        total = sum(weights)
-        if total <= 0:
-            break
-        pre = random.choices([p for p, _ in hot24], weights=weights)[0]
+        pre = random.choices(hot_pre, weights=hot_w)[0]
         if pre in exhausted:
             continue
         ip = take_ip(pre, count, skip_known=False)
@@ -721,9 +849,12 @@ def discover_v6(nets6, count, ports, known, cooldown):
     seen = set()
 
     curated = [n for n in nets6 if n.prefixlen >= 64]
+    random.shuffle(curated)
     for net in curated:
+        if len(cands) >= count:
+            break
         ip = str(random_ip_in_net(net))
-        if ip in known or not eligible(ip):
+        if ip in seen or ip in known or not eligible(ip):
             continue
         known[ip] = now
         seen.add(ip)
@@ -979,23 +1110,40 @@ async def run_session(nets, known, q, args, stop, nets6=None):
             rec["verified_at"] = verified_at
         q.put(rec)
 
-    async def verify_batch(pend):
+    async def verify_batch(pend, bench=None):
         if not pend:
             return
+        if bench is None:
+            bench = args.bench
         vsem = asyncio.Semaphore(min(8, len(pend)))
 
         async def v(ip, p, lat, idx):
             async with vsem:
-                await verify_one(ip, p, lat, idx < args.bench)
+                await verify_one(ip, p, lat, idx < bench)
 
         await run_tasks([v(ip, p, lat, i) for i, (ip, p, lat) in enumerate(pend)])
 
     async def discovery_cycle():
         nonlocal verified
-        have_bw = set() if args.bench > 0 else None
+        verified = set()
+        have_bw = None
+        bud = {"count": args.count, "verify": args.verify,
+               "bench": args.bench, "recheck": args.recheck}
         try:
             conn_v = sqlite3.connect(args.db)
-            verified = set()
+            _maybe_refresh_health(conn_v)
+            # 动态平衡控制: 饱和后把预算从"发现"切到"维护"
+            mode_info = cf_policy.evaluate(
+                conn_v,
+                target_active=getattr(args, "target_active", cf_policy.TARGET_ACTIVE),
+                target_prefixes=getattr(args, "target_prefixes", cf_policy.TARGET_PREFIXES),
+                force=getattr(args, "scan_mode", "auto") or "auto")
+            bud = cf_policy.budgets(mode_info["mode"], args.count, args.verify,
+                                    args.bench, args.recheck, mode_info["active"],
+                                    base_count_v6=getattr(args, "count_v6", args.count),
+                                    has_v4=bool(nets), has_v6=bool(nets6))
+            q.put({"type": "mode", "budgets": bud, **mode_info})
+            have_bw = set() if bud["bench"] > 0 else None
             for ip, okc, bw in conn_v.execute(
                     "SELECT ip, ok_count, bandwidth_mbps FROM ips"):
                 if okc and okc > 0:
@@ -1005,14 +1153,13 @@ async def run_session(nets, known, q, args, stop, nets6=None):
             conn_v.close()
         except Exception:
             verified = set()
-            have_bw = set() if have_bw is not None else None
-        hot24 = fetch_hot24(args.db) if args.exploit > 0 else []
-        cands = discover(nets, hot24, args.count, ports, known, args.cooldown, args.exploit)
+        hot24 = fetch_hot24(args.db) if (nets and args.exploit > 0) else []
+        cands = discover(nets, hot24, bud["count"], ports, known, args.cooldown, args.exploit)
         if nets6:
-            cands.extend(discover_v6(nets6, args.count, ports, known, args.cooldown))
+            cands.extend(discover_v6(nets6, bud["count_v6"], ports, known, args.cooldown))
         backfill_ips = set()
-        if args.recheck and not args.once:
-            for ip, p in fetch_recheck(args.db, args.recheck, args.cooldown):
+        if bud["recheck"] and not args.once:
+            for ip, p in fetch_due(args.db, bud["recheck"]):
                 if ip in known:
                     known[ip] = time.time()
                 seq = [p] + [x for x in ports if x != p]
@@ -1025,7 +1172,7 @@ async def run_session(nets, known, q, args, stop, nets6=None):
                 seq = [p] + [x for x in ports if x != p]
                 cands.append((ip, tuple(seq)))
         if not cands:
-            return 0, []
+            return 0, [], bud
         q.put({"type": "cycle_start", "total": len(cands)})
         results = [r for r in await run_tasks([probe(ip, ps) for ip, ps in cands]) if r]
         ok = 0
@@ -1043,10 +1190,10 @@ async def run_session(nets, known, q, args, stop, nets6=None):
                 q.put({"type": "result", "ip": ip, "port": p, "ok": False,
                        "latency": lat, "tested_at": n})
         alive_list.sort(key=lambda r: (0 if r[3] else 1, r[2]))
-        pend = [(ip, p, lat) for ip, p, lat, _ in alive_list[: args.verify]]
-        if args.bench > 0 and have_bw is not None:
+        pend = [(ip, p, lat) for ip, p, lat, _ in alive_list[: bud["verify"]]]
+        if bud["bench"] > 0 and have_bw is not None:
             pend = ([x for x in pend if x[0] not in have_bw] + [x for x in pend if x[0] in have_bw])
-        return ok, pend
+        return ok, pend, bud
 
     async def gap_sleep():
         waited = 0.0
@@ -1072,9 +1219,9 @@ async def run_session(nets, known, q, args, stop, nets6=None):
         return
 
     if args.once:
-        ok, pend = await discovery_cycle()
+        ok, pend, bud = await discovery_cycle()
         if pend:
-            await verify_batch(pend)
+            await verify_batch(pend, bud["bench"])
         q.put({"type": "cycle_end", "ok": ok})
         return
 
@@ -1082,9 +1229,9 @@ async def run_session(nets, known, q, args, stop, nets6=None):
     while not stop.is_set():
         if args.cycles and cycles >= args.cycles:
             break
-        ok, pend = await discovery_cycle()
+        ok, pend, bud = await discovery_cycle()
         if pend:
-            await verify_batch(pend)
+            await verify_batch(pend, bud["bench"])
         q.put({"type": "cycle_end", "ok": ok})
         cycles += 1
         await gap_sleep()
@@ -1106,8 +1253,8 @@ def export_report(args):
     rows = conn.execute(
         f"SELECT ip, port, colo, loc, latency_ms, bandwidth_mbps FROM ips "
         f"WHERE {where} "
-        f"ORDER BY (CASE WHEN bandwidth_mbps IS NULL THEN 0 ELSE bandwidth_mbps END) DESC, "
-        f"latency_ms ASC LIMIT ?", params + [args.top if args.top else 100]).fetchall()
+        f"ORDER BY score DESC, latency_ms ASC LIMIT ?",
+        params + [args.top if args.top else 100]).fetchall()
     conn.close()
     lines = []
     csv_lines = ["rank,ip,port,latency_ms,bandwidth_mbps,colo,loc"]
@@ -1127,7 +1274,16 @@ def export_report(args):
 def stats_report(args):
     conn = open_db(args.db)
     total = conn.execute("SELECT COUNT(*) FROM ips").fetchone()[0]
+    row = conn.execute("SELECT value FROM meta WHERE key='tested_total'").fetchone()
+    if row and row[0]:
+        tested_all = row[0]
+    else:
+        grave = conn.execute("SELECT COUNT(*) FROM graveyard").fetchone()[0]
+        tested_all = total + grave
     ok = conn.execute("SELECT COUNT(*) FROM ips WHERE ok_count>0").fetchone()[0]
+    fresh = conn.execute(
+        "SELECT COUNT(*) FROM ips WHERE ok_count>0 AND COALESCE(last_ok_at,tested_at) > ?",
+        (time.time() - cf_health.FRESH_WINDOW,)).fetchone()[0]
     verified = conn.execute("SELECT COUNT(*) FROM ips WHERE verified_at IS NOT NULL").fetchone()[0]
     unverified = conn.execute("SELECT COUNT(*) FROM ips WHERE ok_count>0 AND verified_at IS NULL").fetchone()[0]
     with_bw = conn.execute("SELECT COUNT(*) FROM ips WHERE bandwidth_mbps IS NOT NULL AND bandwidth_mbps>0").fetchone()[0]
@@ -1142,8 +1298,10 @@ def stats_report(args):
     out = [
         f"数据库: {os.path.abspath(args.db)}",
         f"覆盖源: {label}  地址总量约: {cov:,}",
-        f"已测试IP: {total:,}  (覆盖率 {total / cov * 100 if cov else 0:.2f}%)",
-        f"存活IP:  {ok:,}  已验证地区: {verified:,}  未识别地区: {unverified:,}  有带宽数据: {with_bw:,}",
+        f"已测试IP: {tested_all:,} (历史累计)  库内保留: {total:,}  "
+        f"(覆盖率 {total / cov * 100 if cov else 0:.2f}%)",
+        f"存活IP:  {ok:,}  (1h内新鲜: {fresh:,})  已验证地区: {verified:,}  "
+        f"未识别地区: {unverified:,}  有带宽数据: {with_bw:,}",
         f"平均延迟(存活): {avg_lat}ms",
         f"常用端口: " + ", ".join(f"{p}:{c}" for p, c in port_rows),
         "机房分布(前10):",
@@ -1196,9 +1354,17 @@ def main():
     ap.add_argument("--db", default="cf_ips.db", help="SQLite 数据库路径(默认 cf_ips.db)")
     ap.add_argument("--operator", choices=["cf", "ct", "cu", "cmcc"], default=None,
                     help="地址源: 官方/电信(ct)/联通(cu)/移动(cmcc)")
+    ap.add_argument("--no-v4", dest="v4", action="store_false", default=True,
+                    help="关闭 IPv4 扫描(默认开)")
     ap.add_argument("--ipv6", action="store_true", default=False,
-                    help="同时采样 CF 官方 IPv6 地址池(需本机有IPv6网络)")
-    ap.add_argument("--count", type=int, default=5000, help="每轮发现抽样数(默认 5000)")
+                    help="同时采样 IPv6 地址池(公开优选列表 + CF官方大段, 需本机有IPv6网络)")
+    ap.add_argument("--v6-operator", dest="operator_v6", choices=["cmcc"], default=None,
+                    help="IPv6 优选列表来源: 移动(cmcc); 默认仅公共优选列表(注: 电信/联通优选源已失效)")
+    ap.add_argument("--no-v6-official", dest="v6_official", action="store_false", default=True,
+                    help="IPv6 不叠加 CF 官方 v6 大段(默认叠加, 用于随机发现新地址)")
+    ap.add_argument("--count", type=int, default=5000, help="IPv4 每轮发现抽样数(默认 5000)")
+    ap.add_argument("--count-v6", dest="count_v6", type=int, default=None,
+                    help="IPv6 每轮发现抽样数(默认与 --count 相同)")
     ap.add_argument("--verify", type=int, default=30, help="每轮验证地区预算(默认30)")
     ap.add_argument("--bench", type=int, default=40, help="每轮带宽测试预算(默认40)")
     ap.add_argument("--concurrency", type=int, default=400, help="并发拨号数")
@@ -1216,7 +1382,7 @@ def main():
     ap.add_argument("--cooldown", type=float, default=3600,
                     help="同一IP复测冷却秒数, 冷却期内不再测(默认3600)")
     ap.add_argument("--recheck", type=int, default=30,
-                    help="每轮复核库内旧IP数量(存活刷新+失败重试, 默认30; 0=关闭)")
+                    help="每轮到期复测数量(按健康度分层调度: 优质IP勤测, 失败退避; 默认30; 0=关闭)")
     ap.add_argument("--backfill", type=int, default=0,
                     help="每轮为'存活但缺地区(colo/loc)'的旧IP补全地区识别数量(默认0; GUI默认开启)")
     ap.add_argument("--bench-size", type=int, default=50_000_000)
@@ -1230,6 +1396,12 @@ def main():
     ap.add_argument("--country-pct", type=int, default=30, dest="country_pct",
                     help="单国家活跃占比上限%% (0=关闭均衡). 超过上限的新IP不吸收, 超限时该国低分IP先裁剪")
     ap.add_argument("--gap", type=float, default=5, help="轮间间隔秒(默认5)")
+    ap.add_argument("--scan-mode", dest="scan_mode", choices=["auto", "discovery", "maintenance", "recovery"],
+                    default="auto", help="扫描策略: auto=达动态平衡后自动转健康维护(默认)")
+    ap.add_argument("--target-active", type=int, default=60, dest="target_active",
+                    help="动态平衡目标: 期望保有的可用IP数(默认60)")
+    ap.add_argument("--target-prefixes", type=int, default=8, dest="target_prefixes",
+                    help="动态平衡目标: 期望覆盖的独立前缀数(默认8)")
     ap.add_argument("--once", action="store_true", help="只扫描一轮(发现+验证预算)后退出")
     ap.add_argument("--reverify", type=int, metavar="N", default=0,
                     help="复核模式: 重新探测库内现有最优的 N 个IP")
@@ -1249,6 +1421,8 @@ def main():
     if args.port and args.port not in base_ports:
         base_ports.insert(0, args.port)
     args.ports = tuple(base_ports)
+    if args.count_v6 is None:
+        args.count_v6 = args.count
 
     if args.stats:
         print(stats_report(args))
@@ -1266,8 +1440,7 @@ def main():
 
     conn = open_db(args.db)
     known = load_known(conn)
-    nets, label = fetch_networks(args.operator, args.port)
-    nets6 = fetch_networks_v6(args.operator or "") if args.ipv6 else []
+    nets, label, nets6 = resolve_sources(args)
     q = queue.Queue()
     stop = threading.Event()
 
@@ -1303,9 +1476,9 @@ def main():
     if args.reverify:
         print(f"复核模式: 重新探测库内最优 {args.reverify} 个IP", flush=True)
     else:
-        print(f"地址源: {label} | 每轮抽样 {args.count} | 验证 {args.verify} | 测带宽 {args.bench} | "
+        print(f"地址源: {label} | 抽样 v4 {args.count}/v6 {args.count_v6} | 验证 {args.verify} | 测带宽 {args.bench} | "
               f"端口 {','.join(map(str, args.ports))} | TLS确认 {'开' if args.tls_check else '关'} | "
-              f"IPv6 {'开' if args.ipv6 else '关'} | "
+              f"IPv6 {'开(' + (args.operator_v6 or '公共') + ')' if args.ipv6 else '关'} | "
               f"优质邻域 {int(args.exploit*100)}% | 复测冷却 {args.cooldown:.0f}s", flush=True)
     print("Ctrl+C 安全退出(数据已实时落库), 重跑命令即可续扫", flush=True)
     try:
@@ -1321,11 +1494,19 @@ def main():
                 if pend >= 200:
                     conn.commit()
                     pend = 0
+            elif rec["type"] == "mode":
+                mode = rec.get("mode", "?")
+                bud = rec.get("budgets", {})
+                print(f"  策略: {cf_policy.MODE_NAMES.get(mode, mode)} | 可用 {rec.get('active', 0)} "
+                      f"新鲜 {rec.get('fresh', 0)} 前缀 {rec.get('prefixes', 0)} "
+                      f"发现率 {rec.get('yield', 0):.1%} | 本轮 抽样{bud.get('count')} "
+                      f"复测{bud.get('recheck')} ({rec.get('reason', '')})", flush=True)
             elif rec["type"] == "cycle_end":
                 conn.commit()
                 pend = 0
                 print(banner(), f"| 本轮达标 {rec['ok']}", flush=True)
-                if getattr(args, "max_ips_v4", 0) or getattr(args, "max_ips_v6", 0):
+                if (getattr(args, "max_ips_v4", 0) or getattr(args, "max_ips_v6", 0)
+                        or getattr(args, "country_pct", 0)):
                     try:
                         npruned = prune_ips(conn, args.max_ips_v4, args.max_ips_v6,
                                             getattr(args, "country_pct", 0))

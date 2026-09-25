@@ -47,21 +47,25 @@ try:
     import grp
 except ImportError:
     pwd = grp = None
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import cf_db
+import cf_health
+import cf_policy
 
 COV_TOTAL = sum(1 << (32 - int(r.split("/")[1])) for r in cf_db.FALLBACK_RANGES)
-VERSION = "2.1.0"
+VERSION = "2.6.1"
 
 COLO_COUNTRY = cf_db.COLO_COUNTRY
 
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cf_settings.json")
 SETTINGS_KEYS = ["operator", "ports", "count", "concurrency", "verify", "bench",
                  "bench_parallel", "backfill", "recheck", "exploit", "max_latency", "tls_check",
-                                 "bench_host", "ipv6", "max_ips_v4", "max_ips_v6", "country_max_pct"]
+                 "bench_host", "v4", "ipv6", "operator_v6", "count_v6", "v6_official",
+                 "max_ips_v4", "max_ips_v6", "country_max_pct",
+                 "scan_mode", "target_active", "target_prefixes"]
 
 
 def load_settings():
@@ -78,7 +82,7 @@ def save_settings(d):
     for k in SETTINGS_KEYS:
         if k in d:
             v = d[k]
-            if isinstance(v, str) and k in ("bench_host", "operator"):
+            if isinstance(v, str) and k in ("bench_host", "operator", "operator_v6"):
                 v = v.strip()
             cur[k] = v
     with open(SETTINGS_FILE, "w") as fh:
@@ -104,6 +108,14 @@ STATE = {
     "probed": 0,
     "total": 0,
     "ok_now": 0,
+    "mode": "discovery",
+    "mode_name": "",
+    "active": 0,
+    "fresh": 0,
+    "prefixes": 0,
+    "mode_yield": 0.0,
+    "mode_reason": "",
+    "budgets": {},
     "log": [],
 }
 
@@ -129,10 +141,25 @@ def log_event(msg):
             del STATE["log"][:-150]
 
 
+def _ip_key(ip):
+    """IP 排序键: IPv4 按段数值补零; IPv6 保持字典序排在 v4 之后."""
+    if not ip:
+        return "2"
+    if ":" in ip:
+        return "1" + ip
+    try:
+        return "0." + ".".join("%03d" % int(p) for p in ip.split("."))
+    except ValueError:
+        return "2" + ip
+
+
 def db_conn(path, ro=False):
     if ro:
-        return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
-    return sqlite3.connect(path, timeout=10)
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+    else:
+        conn = sqlite3.connect(path, timeout=10)
+    conn.create_function("ipkey", 1, _ip_key)
+    return conn
 
 
 def q_rows(path, sql, params=()):
@@ -201,19 +228,29 @@ def build_where(q):
     return " AND ".join(where), params
 
 
+_ORDER_EXPR = {
+    "bw": "COALESCE(bw_last_mbps, bandwidth_mbps, 0)",   # 与列表显示口径一致(最近优先, 回退历史)
+    "score": "COALESCE(score, 0)",
+    "lat": "COALESCE(latency_ms, 999999)",
+    "ip": "ipkey(ip)",
+    "port": "COALESCE(port, 0)",
+    "colo": "COALESCE(colo, '')",
+    "loc": "COALESCE(loc, '')",
+    "time": "COALESCE(tested_at, 0)",
+    "fresh": "COALESCE(last_ok_at, 0)",
+    "ok": "COALESCE(ok_count, 0)",
+    "fail": "COALESCE(fail_count, 0)",
+}
+
+
 def build_order(q):
-    sort = q.get("sort", [""])[0]
+    sort = (q.get("sort", [""])[0] or "score").lower()
+    expr = _ORDER_EXPR.get(sort, _ORDER_EXPR["score"])
+    direction = "ASC" if (q.get("dir", ["desc"])[0] or "desc").lower() == "asc" else "DESC"
+    # 主排序后统一按延迟升序作次级键, 结果更稳定
     if sort == "lat":
-        return "latency_ms ASC"
-    if sort == "colo":
-        return "colo ASC, latency_ms ASC"
-    if sort == "loc":
-        return "loc ASC, latency_ms ASC"
-    if sort == "port":
-        return "port ASC, latency_ms ASC"
-    if sort == "time":
-        return "tested_at DESC"
-    return "(CASE WHEN bw_last_mbps IS NULL THEN -1 ELSE bw_last_mbps END) DESC, latency_ms ASC"
+        return f"{expr} {direction}"
+    return f"{expr} {direction}, latency_ms ASC"
 
 
 _STATS_CACHE = {"at": 0.0, "data": None}
@@ -234,49 +271,45 @@ def api_stats(db):
 
 
 def _compute_stats(db):
+    """汇总看板数据. 单连接 + 单次全表聚合扫描, 替代逐项开连接查询."""
     now = time.time()
-    total = q_one(db, "SELECT COUNT(*) FROM ips")
-    total = total[0] if total else 0
-    tested_all = None
+
+    def r1(x):
+        return round(x, 1) if x is not None else None
+
+    conn = None
     try:
-        tested_all = q_one(db, "SELECT value FROM meta WHERE key='tested_total'")
+        conn = db_conn(db, ro=True)
+        row = conn.execute(
+            "SELECT COUNT(*), "
+            "COUNT(CASE WHEN ok_count>0 THEN 1 END), "
+            "COUNT(CASE WHEN verified_at IS NOT NULL THEN 1 END), "
+            "COUNT(CASE WHEN bandwidth_mbps>0 THEN 1 END), "
+            "AVG(CASE WHEN ok_count>0 THEN latency_ms END), "
+            "MIN(CASE WHEN ok_count>0 THEN latency_ms END), "
+            "MAX(bandwidth_mbps), MAX(bw_last_mbps), "
+            "COUNT(CASE WHEN ok_count>0 AND ip NOT LIKE '%:%' THEN 1 END), "
+            "COUNT(CASE WHEN ok_count>0 AND ip LIKE '%:%' THEN 1 END), "
+            "COUNT(CASE WHEN ok_count>0 AND ip NOT LIKE '%:%' AND bandwidth_mbps>0 THEN 1 END), "
+            "COUNT(CASE WHEN ok_count>0 AND ip LIKE '%:%' AND bandwidth_mbps>0 THEN 1 END), "
+            "AVG(CASE WHEN ok_count>0 AND ip NOT LIKE '%:%' AND latency_ms IS NOT NULL THEN latency_ms END), "
+            "AVG(CASE WHEN ok_count>0 AND ip LIKE '%:%' AND latency_ms IS NOT NULL THEN latency_ms END), "
+            "COUNT(CASE WHEN ok_count>0 AND COALESCE(last_ok_at,tested_at) > ? THEN 1 END), "
+            "AVG(CASE WHEN ok_count>0 THEN score END) "
+            "FROM ips", (now - cf_health.FRESH_WINDOW,)).fetchone()
     except Exception:
-        tested_all = None
+        row = None
+    if row is None:
+        row = (0, 0, 0, 0, None, None, None, None, 0, 0, 0, 0, None, None, 0, None)
+    (total, alive, verified, withbw, avglat, minlat, bwbest, maxbw,
+     v4_alive, v6_alive, v4_bw, v6_bw, v4_lat, v6_lat, fresh, avgscore) = row
+
+    tested_all = q_one(db, "SELECT value FROM meta WHERE key='tested_total'")
     if tested_all and tested_all[0]:
         tested_all = tested_all[0]
     else:
-        try:
-            g = q_one(db, "SELECT COUNT(*) FROM graveyard")
-        except Exception:
-            g = None
+        g = q_one(db, "SELECT COUNT(*) FROM graveyard")
         tested_all = total + (g[0] if g else 0)
-    alive = q_one(db, "SELECT COUNT(*) FROM ips WHERE ok_count>0")
-    alive = alive[0] if alive else 0
-    verified = q_one(db, "SELECT COUNT(*) FROM ips WHERE verified_at IS NOT NULL")
-    verified = verified[0] if verified else 0
-    withbw = q_one(db, "SELECT COUNT(*) FROM ips WHERE bandwidth_mbps IS NOT NULL AND bandwidth_mbps>0")
-    withbw = withbw[0] if withbw else 0
-    avglat = q_one(db, "SELECT ROUND(AVG(latency_ms),1) FROM ips WHERE ok_count>0")
-    avglat = avglat[0] if avglat else None
-    maxbw = q_one(db, "SELECT ROUND(MAX(bw_last_mbps),1) FROM ips WHERE bw_last_mbps IS NOT NULL")
-    maxbw = maxbw[0] if maxbw else None
-    bwbest = q_one(db, "SELECT ROUND(MAX(bandwidth_mbps),1) FROM ips WHERE bandwidth_mbps IS NOT NULL")
-    bwbest = bwbest[0] if bwbest else None
-    minlat = q_one(db, "SELECT ROUND(MIN(latency_ms),1) FROM ips WHERE ok_count>0")
-    minlat = minlat[0] if minlat else None
-
-    v4_alive = q_one(db, "SELECT COUNT(*) FROM ips WHERE ok_count>0 AND ip NOT LIKE '%:%'")
-    v4_alive = v4_alive[0] if v4_alive else 0
-    v6_alive = q_one(db, "SELECT COUNT(*) FROM ips WHERE ip LIKE '%:%' AND ok_count>0")
-    v6_alive = v6_alive[0] if v6_alive else 0
-    v4_bw = q_one(db, "SELECT COUNT(*) FROM ips WHERE ok_count>0 AND ip NOT LIKE '%:%' AND bandwidth_mbps>0")
-    v4_bw = v4_bw[0] if v4_bw else 0
-    v6_bw = q_one(db, "SELECT COUNT(*) FROM ips WHERE ok_count>0 AND ip LIKE '%:%' AND bandwidth_mbps>0")
-    v6_bw = v6_bw[0] if v6_bw else 0
-    v4_lat = q_one(db, "SELECT ROUND(AVG(latency_ms),1) FROM ips WHERE ok_count>0 AND ip NOT LIKE '%:%' AND latency_ms IS NOT NULL")
-    v4_lat = v4_lat[0] if v4_lat else None
-    v6_lat = q_one(db, "SELECT ROUND(AVG(latency_ms),1) FROM ips WHERE ok_count>0 AND ip LIKE '%:%' AND latency_ms IS NOT NULL")
-    v6_lat = v6_lat[0] if v6_lat else None
 
     colos = q_rows(db, "SELECT colo, COUNT(*) FROM ips WHERE ok_count>0 AND colo IS NOT NULL "
                        "GROUP BY colo ORDER BY COUNT(*) DESC")
@@ -284,6 +317,8 @@ def _compute_stats(db):
                       "GROUP BY loc ORDER BY COUNT(*) DESC")
     ports = q_rows(db, "SELECT port, COUNT(*) FROM ips WHERE ok_count>0 GROUP BY port "
                        "ORDER BY COUNT(*) DESC LIMIT 8")
+    colo_list = q_rows(db, "SELECT colo FROM ips WHERE colo IS NOT NULL AND colo != '' "
+                           "AND ok_count>0 GROUP BY colo ORDER BY COUNT(*) DESC")
 
     lat_buckets = [0] * 8
     lat_labels = ["<50", "50-100", "100-200", "200-300", "300-500", "500-800", "800-1500", ">1500"]
@@ -301,8 +336,9 @@ def _compute_stats(db):
                               "WHEN bw_last_mbps < 800 THEN 4 ELSE 5 END, COUNT(*) "
                               "FROM ips WHERE bw_last_mbps IS NOT NULL AND bw_last_mbps>0 GROUP BY 1"):
         bw_buckets[b] = c
+    if conn is not None:
+        conn.close()
 
-    from collections import defaultdict
     c_agg = defaultdict(int)
     for c, n in colos:
         c_agg[country(c or "UNK")] += n
@@ -311,12 +347,14 @@ def _compute_stats(db):
     return {
         "total": total, "alive": alive, "verified": verified, "withbw": withbw,
         "tested_all": tested_all,
+        "fresh": fresh, "stale": max(0, alive - fresh), "unverified": max(0, alive - verified),
+        "avgscore": r1(avgscore),
         "v4_alive": v4_alive, "v6_alive": v6_alive,
         "v4_bw": v4_bw, "v6_bw": v6_bw,
-        "v4_lat": v4_lat, "v6_lat": v6_lat,
-        "avglat": avglat, "maxbw": maxbw, "bwbest": bwbest, "minlat": minlat,
+        "v4_lat": r1(v4_lat), "v6_lat": r1(v6_lat),
+        "avglat": r1(avglat), "maxbw": r1(maxbw), "bwbest": r1(bwbest), "minlat": r1(minlat),
         "coverage": round(total / COV_TOTAL * 100, 3) if COV_TOTAL else 0,
-        "colo_list": [{"code": r[0], "name": country(r[0])} for r in q_rows(db, "SELECT colo FROM ips WHERE colo IS NOT NULL AND colo != '' AND ok_count>0 GROUP BY colo ORDER BY COUNT(*) DESC")],
+        "colo_list": [{"code": r[0], "name": country(r[0])} for r in colo_list],
         "colos": [{"name": c or "UNK", "count": n} for c, n in colos],
         "countries": countries,
         "locs": [{"name": l or "UNK", "count": n} for l, n in locs],
@@ -347,17 +385,21 @@ def api_table(db, q):
     total_row = q_one(db, f"SELECT COUNT(*) FROM ips WHERE {where}", params)
     total = total_row[0] if total_row else 0
     sql = (f"SELECT ip, port, colo, loc, latency_ms, bandwidth_mbps, bw_last_mbps, bw_last_at, "
-           f"tested_at, ok_count, fail_count "
+           f"tested_at, ok_count, fail_count, score, last_ok_at, fail_streak "
            f"FROM ips WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?")
     rows = q_rows(db, sql, params + order_params + [limit, offset])
     out = []
-    for ip, port, colo, loc, lat, bw, bw_last, bw_last_at, tested, okc, failc in rows:
+    for (ip, port, colo, loc, lat, bw, bw_last, bw_last_at, tested, okc, failc,
+         score, last_ok, fstreak) in rows:
         out.append({"ip": ip, "port": port, "colo": colo or "UNK",
                     "country": country(colo or "UNK"), "loc": loc or "UNK",
                     "latency": round(lat, 1) if lat is not None else None,
-                    "bandwidth": bw_last if bw_last is not None else None,
+                    "bandwidth": bw_last if bw_last is not None else bw,
+                    "bw_is_last": bw_last is not None,
                     "bw_best": bw if bw is not None else None,
                     "bw_last_at": bw_last_at,
+                    "score": score, "last_ok": last_ok, "fail_streak": fstreak,
+                    "fresh": cf_health.is_fresh(last_ok),
                     "tested": tested, "ok": okc, "fail": failc})
     return {"rows": out, "total": total, "offset": offset, "limit": limit}
 
@@ -403,8 +445,10 @@ def scan_args(params, db):
     # 保证任何启动路径(界面/API/脚本)缺键时都回退到用户保存过的配置(如 max_ips)
     flat = dict(load_settings())
     for k, v in params.items():
-        if v is not None and v != "":
-            flat[k] = v
+        # operator/operator_v6 的空串是有意义的取值(官方全网/公共优选), 需允许覆盖已存设置
+        if v is None or (v == "" and k not in ("operator", "operator_v6")):
+            continue
+        flat[k] = v
 
     def num(k, d, t=float):
         try:
@@ -418,7 +462,9 @@ def scan_args(params, db):
     return types.SimpleNamespace(
         db=db,
         operator=(flat.get("operator") or None),
+        operator_v6=(flat.get("operator_v6") or None),
         count=max(1, int(num("count", 5000, int))),
+        count_v6=max(1, int(num("count_v6", num("count", 5000, int), int))),
         verify=max(0, int(num("verify", 400, int))),
         bench=max(0, int(num("bench", 20, int))),
         backfill=max(0, int(num("backfill", 300, int))),
@@ -438,7 +484,12 @@ def scan_args(params, db):
         bench_timeout=max(1, num("bench_timeout", 10)),
         bench_parallel=max(1, int(num("bench_parallel", 6, int))),
         bench_host=str(flat.get("bench_host", "")).strip() or cf_db.SPEED_HOST,
+        v4=str(flat.get("v4", "1")) not in ("0", "false", ""),
         ipv6=str(flat.get("ipv6", "0")) not in ("0", "false", ""),
+        v6_official=str(flat.get("v6_official", "1")) not in ("0", "false", ""),
+        scan_mode=str(flat.get("scan_mode", "auto") or "auto"),
+        target_active=max(1, int(num("target_active", 60, int))),
+        target_prefixes=max(1, int(num("target_prefixes", 8, int))),
         cycles=0, gap=max(1, num("gap", 5)), once=False, reverify=0,
     )
 
@@ -451,13 +502,13 @@ def scanner_worker(args):
     try:
         conn = cf_db.open_db(args.db)
         known = cf_db.load_known(conn)
-        nets, label = cf_db.fetch_networks(args.operator, args.port)
-        nets6 = cf_db.fetch_networks_v6(args.operator or "") if args.ipv6 else []
+        nets, label, nets6 = cf_db.resolve_sources(args)
         set_state(label=label, db=os.path.abspath(args.db),
-                  msg=f"已启动: {label} | 抽样{args.count} 并发{args.concurrency} | "
-                      f"端口{','.join(map(str, args.ports))} | TLS确认{'开' if args.tls_check else '关'} | "
-                      f"IPv6{'开' if args.ipv6 else '关'} | "
-                      f"V4{'开' if args.max_ips_v4 else '关'}({args.max_ips_v4}) V6{'开' if args.max_ips_v6 else '关'}({args.max_ips_v6})")
+                  msg=f"已启动: {label} | v4抽样{args.count}"
+                      + (f" v6抽样{args.count_v6}" if args.ipv6 else "")
+                      + f" 并发{args.concurrency} | 端口{','.join(map(str, args.ports))}"
+                      f" | TLS确认{'开' if args.tls_check else '关'}"
+                      f" | 库上限 V4:{args.max_ips_v4 or '-'} V6:{args.max_ips_v6 or '-'}")
 
         pend_count = 0
 
@@ -482,6 +533,17 @@ def scanner_worker(args):
                     STATE["probed"] = STATE.get("probed", 0) + 1
                     if rec.get("ok"):
                         STATE["ok_now"] = STATE.get("ok_now", 0) + 1
+            elif t == "mode":
+                mode = rec.get("mode", "discovery")
+                bud = rec.get("budgets", {})
+                set_state(mode=mode, mode_name=cf_policy.MODE_NAMES.get(mode, mode),
+                          active=rec.get("active", 0), fresh=rec.get("fresh", 0),
+                          prefixes=rec.get("prefixes", 0), mode_yield=rec.get("yield", 0.0),
+                          mode_reason=rec.get("reason", ""), budgets=bud)
+                log_event(f"策略: {cf_policy.MODE_NAMES.get(mode, mode)} "
+                          f"(可用{rec.get('active', 0)}/新鲜{rec.get('fresh', 0)}/"
+                          f"前缀{rec.get('prefixes', 0)}/发现率{rec.get('yield', 0):.1%}) "
+                          f"本轮 抽样{bud.get('count')} 复测{bud.get('recheck')}")
             elif t == "cycle_start":
                 set_state(stage="probe", total=rec.get("total", 0), probed=0, ok_now=0)
             elif t == "cycle_end":
@@ -548,11 +610,16 @@ def start_scan(params, db):
     args = scan_args(params, db)
     op_name = ({None: "官方全网", "": "官方全网", "cf": "CF官方优选",
                 "ct": "电信优选", "cu": "联通优选", "cmcc": "移动优选"}.get(args.operator, args.operator))
+    v4_name = op_name if args.v4 else "IPv4关"
+    v6_name = ("IPv6关" if not args.ipv6
+               else "IPv6:" + ({"cmcc": "移动", "ct": "电信", "cu": "联通"}.get(args.operator_v6) or "公共"))
+    label = f"{v4_name} + {v6_name}"
     set_state(running=True, stop=threading.Event(), round=0, last_ok=0,
               started_at=time.time(), last_cycle=None, msg="启动中...",
-              stage="start", total=0, probed=0, ok_now=0, label=op_name)
-    log_event(f"开始扫描: {op_name} | 抽样{args.count} 并发{args.concurrency}"
-              f" | 端口{','.join(map(str, args.ports))} | TLS {args.tls_check}")
+              stage="start", total=0, probed=0, ok_now=0, label=label)
+    log_event(f"开始扫描: {label} | v4抽样{args.count}"
+              + (f" v6抽样{args.count_v6}" if args.ipv6 else "")
+              + f" 并发{args.concurrency} | 端口{','.join(map(str, args.ports))} | TLS {args.tls_check}")
     threading.Thread(target=scanner_worker, args=(args,), daemon=True).start()
     return {"ok": True}
 
@@ -1102,11 +1169,11 @@ html[data-theme="light"]{color-scheme:light}
 body{
   background-color:var(--bg);
   position:relative;
-}
-body::before{content:"";position:fixed;inset:0;z-index:-1;background:var(--scrim);pointer-events:none}
   color:var(--txt);
   font-family:"Inter","HarmonyOS Sans SC","PingFang SC","Segoe UI","Microsoft YaHei",system-ui,sans-serif;
   font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;
+}
+body::before{content:"";position:fixed;inset:0;z-index:-1;background:var(--scrim);pointer-events:none}
 
 ::selection{background:rgba(99,148,255,.30)}
 ::-webkit-scrollbar{width:9px;height:9px}
@@ -1143,7 +1210,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;background:var(--scrim
   position:fixed;left:0;top:0;bottom:0;width:236px;z-index:70;
   display:flex;flex-direction:column;
   background:var(--glass-side);
-  box-shadow:inset -1px 0 0 var(--edge);-webkit-
+  box-shadow:inset -1px 0 0 var(--edge);
   border-right:1px solid var(--line);
   transition:width .3s cubic-bezier(.2,.7,.3,1),transform .32s cubic-bezier(.2,.7,.3,1);
 }
@@ -1197,7 +1264,7 @@ body.side-mini .collapse-btn{transform:rotate(180deg)}
 .topbar{
   position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:12px;
   padding:12px clamp(14px,2.5vw,26px);
-  background:var(--tb-bg);-webkit-
+  background:var(--tb-bg);
   border-bottom:1px solid var(--line);
 }
 .crumb{font-size:16px;font-weight:750;letter-spacing:.3px}
@@ -1258,7 +1325,7 @@ body.side-mini .collapse-btn{transform:rotate(180deg)}
   position:relative;overflow:hidden;cursor:default;
   background:var(--glass-fill);
   border:1px solid var(--edge);border-radius:10px;padding:14px 14px 12px;
-  box-shadow:var(--rim);-webkit-
+  box-shadow:var(--rim);
   transition:transform .18s ease,box-shadow .18s ease;
 }
 
@@ -1335,6 +1402,28 @@ button:disabled{opacity:.38;cursor:not-allowed;filter:none;transform:none;box-sh
 
 .chk{display:flex;align-items:center;gap:6px;font-size:13px;padding-bottom:8px}
 .chk input{accent-color:var(--acc);width:16px;height:16px;cursor:pointer}
+
+/* 协议分栏 + 开关 */
+.scan-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media (max-width:720px){.scan-grid{grid-template-columns:1fr}}
+.proto{border:1px solid var(--line);border-radius:10px;padding:12px 12px 2px;
+  background:color-mix(in srgb,var(--panel2) 50%,transparent);
+  transition:opacity .22s ease,border-color .22s ease}
+.proto.off{opacity:.45}
+.proto.off .row{pointer-events:none}
+.proto .row{margin-bottom:0}
+.proto-note{font-size:11.5px;color:var(--dim);margin:2px 0 10px}
+.switch{display:inline-flex;align-items:center;gap:9px;cursor:pointer;font-size:13.5px;font-weight:700;
+  margin-bottom:10px;user-select:none}
+.switch input{position:absolute;opacity:0;width:0;height:0}
+.switch .track{width:38px;height:21px;border-radius:12px;background:var(--line2);position:relative;
+  transition:background .2s ease;flex:0 0 auto}
+.switch .knob{position:absolute;top:2px;left:2px;width:17px;height:17px;border-radius:50%;
+  background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.4);
+  transition:transform .24s cubic-bezier(.34,1.56,.64,1)}
+.switch input:checked + .track{background:var(--acc)}
+.switch input:checked + .track .knob{transform:translateX(17px)}
+.switch:hover .track{box-shadow:0 0 0 3px color-mix(in srgb,var(--acc) 22%,transparent)}
 #f_hasbw:checked+label,#f_v4:checked+label,#f_v6:checked+label{color:var(--acc2);font-weight:700}
 .pin{color:var(--acc2);font-size:13px;font-weight:700;cursor:pointer;user-select:none}
 .pin:hover{text-decoration:underline}
@@ -1384,9 +1473,16 @@ canvas{width:100%;height:250px}
 .toolbar .f input{min-width:76px}
 table{width:100%;border-collapse:collapse;font-size:14px}
 th,td{padding:8px 12px;text-align:left;border-bottom:1px solid rgba(148,163,184,.10);white-space:nowrap}
-th{color:var(--dim);font-weight:600;cursor:pointer;user-select:none;
+th{color:var(--dim);font-weight:600;user-select:none;
   background:var(--thead-bg);position:sticky;top:0;z-index:4}
-th:hover{color:var(--acc)}
+th.nosort{cursor:default}
+th.sortable{cursor:pointer}
+th.sortable:hover{color:var(--acc)}
+th.sortable::after{content:"⇅";font-size:9px;opacity:.28;margin-left:3px;letter-spacing:0}
+th.sortable.sorted{color:var(--acc)}
+th.sortable.sorted::after{opacity:.9}
+th.sortable.sorted.desc::after{content:"▼"}
+th.sortable.sorted.asc::after{content:"▲"}
 tr:hover td{background:color-mix(in srgb,var(--acc) 6%,transparent)}
 tbody td{position:relative}
 tbody tr{transition:transform .18s cubic-bezier(.2,.7,.3,1.2),box-shadow .18s ease}
@@ -1399,8 +1495,11 @@ tbody tr:hover{transform:scale(1.012);box-shadow:0 2px 16px rgba(2,6,18,.45);z-i
 .bw.muted{color:var(--dim);font-weight:400}
 .lat{color:var(--warn);font-variant-numeric:tabular-nums}
 .colo{font-weight:700;color:var(--purp)}
-  background:var(--panel2);border:1px dashed var(--line);border-radius:8px;
-  padding:8px 12px;margin:0 0 14px
+.score{font-weight:700;font-variant-numeric:tabular-nums}
+.score.sc-hi{color:var(--acc2)} .score.sc-mid{color:var(--warn)} .score.sc-lo{color:var(--dim)}
+.fresh-dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px;
+  background:var(--line2);vertical-align:middle}
+.fresh-dot.on{background:var(--acc2);box-shadow:0 0 7px var(--acc2)}
 .dead{color:var(--dim);text-align:center;padding:20px;font-size:13px}
 #tabWrap{max-height:560px;overflow-y:auto;overflow-x:auto}
 .mini{font-size:12px;padding:4px 10px;border-radius:6px;box-shadow:none}
@@ -1423,8 +1522,6 @@ footer{margin-top:auto;padding:14px;color:var(--dim);font-size:12px;text-align:c
 
 /* ---------- 消息 / 横幅 ---------- */
 #msg{color:var(--warn);font-size:13px;min-height:18px;margin:8px 0}
-  font-size:12.5px;padding:9px 13px;border-radius:8px;margin:6px 0;line-height:1.6
-  font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all
 .pin-bar{display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:700;color:#0d9488;
   background:linear-gradient(90deg,rgba(47,214,163,.30),rgba(47,214,163,.10));
   border:1px solid rgba(13,148,136,.60);padding:8px 13px;
@@ -1619,6 +1716,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
   <div class="stats">
     <div class="stat"><div class="v" id="st_total">0</div><div class="l">已测试IP</div></div>
     <div class="stat"><div class="v g" id="st_alive">0</div><div class="l">存活IP</div></div>
+    <div class="stat"><div class="v g" id="st_fresh">0</div><div class="l">新鲜存活(1h)</div></div>
     <div class="stat"><div class="v p" id="st_verified">0</div><div class="l">已验证地区</div></div>
     <div class="stat"><div class="v" id="st_bw">0</div><div class="l">有带宽数据</div></div>
     <div class="stat"><div class="v w" id="st_avglat">-</div><div class="l">平均延迟ms</div></div>
@@ -1641,43 +1739,79 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
 
     </section>
     <section class="view" id="v-scan">
-      <div class="sub page-sub">多端口 + TLS确认 + 优质C段加权 + 地区补全 + 带宽实测 &nbsp;|&nbsp; 数据实时落库 SQLite</div>
+      <div class="sub page-sub">多端口 + TLS确认 + 优质C段加权 + 地区补全 + 带宽实测 &nbsp;|&nbsp; 动态平衡: 饱和后自动转入健康维护</div>
+
       <div class="card">
-  <div class="row">
-    <div class="f"><label>地址源<span class="tip">?<span class="pop">官方全网=扫CF全部公布网段; CF官方/电信/联通/移动=只扫各运营商官方优选网段</span></span></label>
-      <select id="operator">
-      <option value="">官方全网</option><option value="cf">CF官方优选</option>
-      <option value="ct">电信优选</option><option value="cu">联通优选</option>
-      <option value="cmcc">移动优选</option></select></div>
-    <div class="f"><label>端口<span class="tip">?<span class="pop">逗号分隔多个端口, 每个IP按顺序尝试. 常用: 443,2053,2083,8443</span></span></label><input id="ports" value="443,2053,2083,8443"></div>
-    <div class="f"><label>抽样数/轮<span class="tip">?<span class="pop">每轮随机抽样探测的IP数量. 越大覆盖越广但每轮耗时越长</span></span></label><input id="count" type="number" value="5000"></div>
-    <div class="f"><label>并发<span class="tip">?<span class="pop">同时探测的连接数. 越大扫得越快, 越吃CPU和带宽. NAS建议100-200</span></span></label><input id="concurrency" type="number" value="400"></div>
-    <div class="f"><label>验证预算/轮<span class="tip">?<span class="pop">每轮对达标IP做地区识别(访问/cdn-cgi/trace)的数量上限</span></span></label><input id="verify" type="number" value="400"></div>
-    <div class="f"><label>测带宽/轮<span class="tip">?<span class="pop">每轮实测带宽的IP数量. 很耗带宽和CPU, 想省资源调小或设0</span></span></label><input id="bench" type="number" value="20"></div>
-    <div class="f"><label>测速并连数<span class="tip">?<span class="pop">测速时同时开的下载连接数. 6条基本能测满本机线路</span></span></label><input id="bench_parallel" type="number" value="6"></div>
-    <div class="f"><label>测速域名<span class="tip">?<span class="pop">带宽实测用的测速服务域名. 默认 speed.cloudflare.com(会被限流); 可填自己的CF Worker域名如 myspeedtest.workers.dev, 不受公共限流</span></span></label><input id="bench_host" value="speed.cloudflare.com" style="min-width:220px"></div>
-    <div class="f"><label>地区补全/轮<span class="tip">?<span class="pop">对还没有地区信息的旧IP补做识别. 修复历史遗留数据</span></span></label><input id="backfill" type="number" value="300"></div>
-    <div class="f"><label>复核/轮<span class="tip">?<span class="pop">对冷却期已过的最旧IP重新探测, 防止IP失效后仍留在列表</span></span></label><input id="recheck" type="number" value="200"></div>
-    <div class="f"><label>优质C段比例<span class="tip">?<span class="pop">抽样时0-1比例的IP从历史优质C段(邻居表现好)里选. 0.6=6成优质邻域+4成随机</span></span></label><input id="exploit" type="number" step="0.1" value="0.6"></div>
-    <div class="f"><label>最大延迟ms<span class="tip">?<span class="pop">延迟超过该值的IP不算"达标", 不会被送去做验证和测速</span></span></label><input id="max_latency" type="number" value="2000"></div>
-        <div class="f"><label>IPv4库上限<span class="tip">?<span class="pop">IPv4超限后按质量剔除</span></span></label><input id="max_ips_v4" type="number" value="0"></div>
-    <div class="f"><label>IPv6库上限<span class="tip">?<span class="pop">IPv6超限后按质量剔除</span></span></label><input id="max_ips_v6" type="number" value="0"></div>
-    <div class="f"><label>单国家占比上限%<span class="tip">?<span class="pop">同一个国家(按CF机房归属映射, 美国/香港/日本等)活跃IP最多占库的百分比, 让优选结果覆盖更多地区. 0=关闭(按原样全收). 超过上限后该国家新IP不再新增, 超限时按质量先裁剪该国</span></span></label><input id="country_max_pct" type="number" value="30"></div>
-    <div class="chk"><input type="checkbox" id="tls_check" checked><label for="tls_check">TLS二次确认<span class="tip">?<span class="pop">TCP能连后还要TLS握手(SNI=cloudflare.com)成功才算存活, 过滤假IP. 首次验证的新IP才做(能滤掉约1/4假IP), 复核已达标IP只做TCP不重复握手, 省CPU</span></span></label></div>
-    <div class="chk"><input type="checkbox" id="ipv6"><label for="ipv6">同时扫描IPv6<span class="tip">?<span class="pop">IPv6 池 = 公开优选 v6 列表(优先测, 命中率高) + CF官方大段(随机发现新地址). 本机需有IPv6网络</span></span></label></div>
-    <button id="startBtn" onclick="control('start')">开始扫描</button>
-    <button id="stopBtn" class="stop" onclick="control('stop')" disabled>停止</button>
-    <button class="ghost" onclick="saveSet()">保存设置</button>
-  </div>
-  <div id="msg"></div>
-  <div class="prog">
-    <div class="bar"><div class="fill" id="progFill"></div></div>
-    <div class="plabel" id="progLabel">—</div>
-  </div>
-  <div class="logbox" id="logbox"><div class="logline"><span class="t">HH:MM:SS</span><span class="m">等待事件...</span></div></div>
-</div>
+        <div class="h">🌐 地址源与协议<span class="sub">IPv4 / IPv6 可分别启用, 各自选择来源与抽样数</span></div>
+        <div class="scan-grid">
+          <div class="proto" id="protoV4">
+            <label class="switch"><input type="checkbox" id="v4_on" checked><span class="track"><span class="knob"></span></span><b>IPv4 扫描</b></label>
+            <div class="row">
+              <div class="f"><label>地址源<span class="tip">?<span class="pop">官方全网=扫CF全部公布网段; CF官方/电信/联通/移动=只扫各运营商官方优选网段</span></span></label>
+                <select id="operator">
+                <option value="">官方全网</option><option value="cf">CF官方优选</option>
+                <option value="ct">电信优选</option><option value="cu">联通优选</option>
+                <option value="cmcc">移动优选</option></select></div>
+              <div class="f"><label>抽样数/轮<span class="tip">?<span class="pop">每轮随机抽样探测的 IPv4 数量. 越大覆盖越广但每轮耗时越长</span></span></label><input id="count" type="number" value="5000"></div>
+            </div>
+          </div>
+          <div class="proto" id="protoV6">
+            <label class="switch"><input type="checkbox" id="ipv6"><span class="track"><span class="knob"></span></span><b>IPv6 扫描</b></label>
+            <div class="row">
+              <div class="f"><label>优选列表<span class="tip">?<span class="pop">公开优选 v6 列表(已优选好的具体地址, 命中率高). 公共列表始终纳入; 移动优选源可用, 电信/联通官方源已失效故移除</span></span></label>
+                <select id="operator_v6">
+                <option value="">公共优选</option><option value="cmcc">移动优选</option></select></div>
+              <div class="f"><label>抽样数/轮<span class="tip">?<span class="pop">每轮随机抽样探测的 IPv6 数量, 独立于 IPv4</span></span></label><input id="count_v6" type="number" value="5000"></div>
+            </div>
+            <div class="chk"><input type="checkbox" id="v6_official" checked><label for="v6_official">叠加 CF 官方 v6 大段<span class="tip">?<span class="pop">CF 官方公布的 v6 大段(2606:4700::/32 等), 从中随机发现新地址. 命中率低于优选列表但覆盖更广; 关掉则只扫优选列表</span></span></label></div>
+            <div class="proto-note">需本机具备 IPv6 网络; 关闭时仅扫描 IPv4</div>
+          </div>
+        </div>
+      </div>
 
+      <div class="card">
+        <div class="h">📡 探测与验证</div>
+        <div class="row">
+          <div class="f"><label>端口<span class="tip">?<span class="pop">逗号分隔多个端口, 每个IP按顺序尝试. 常用: 443,2053,2083,8443</span></span></label><input id="ports" value="443,2053,2083,8443"></div>
+          <div class="f"><label>并发<span class="tip">?<span class="pop">同时探测的连接数. 越大扫得越快, 越吃CPU和带宽. 家宽/NAS 建议 50-200, 过高会把路由NAT打满造成假阴性</span></span></label><input id="concurrency" type="number" value="400"></div>
+          <div class="f"><label>最大延迟ms<span class="tip">?<span class="pop">延迟超过该值的IP不算"达标", 不会被送去做验证和测速</span></span></label><input id="max_latency" type="number" value="2000"></div>
+          <div class="chk"><input type="checkbox" id="tls_check" checked><label for="tls_check">TLS二次确认<span class="tip">?<span class="pop">TCP能连后还要TLS握手(SNI=cloudflare.com)成功才算存活, 过滤假IP. 首次验证的新IP才做, 复核已达标IP只做TCP不重复握手, 省CPU</span></span></label></div>
+          <div class="f"><label>验证预算/轮<span class="tip">?<span class="pop">每轮对达标IP做地区识别(访问/cdn-cgi/trace)的数量上限</span></span></label><input id="verify" type="number" value="400"></div>
+          <div class="f"><label>测带宽/轮<span class="tip">?<span class="pop">每轮实测带宽的IP数量. 很耗带宽和CPU, 想省资源调小或设0</span></span></label><input id="bench" type="number" value="20"></div>
+          <div class="f"><label>测速并连数<span class="tip">?<span class="pop">测速时同时开的下载连接数. 6条基本能测满本机线路</span></span></label><input id="bench_parallel" type="number" value="6"></div>
+          <div class="f"><label>测速域名<span class="tip">?<span class="pop">带宽实测用的测速服务域名. 默认 speed.cloudflare.com(会被限流); 可填自己的CF Worker域名如 myspeedtest.workers.dev, 不受公共限流</span></span></label><input id="bench_host" value="speed.cloudflare.com" style="min-width:220px"></div>
+        </div>
+      </div>
 
+      <div class="card">
+        <div class="h">♻️ 复测保养与库策略</div>
+        <div class="row">
+          <div class="f"><label>地区补全/轮<span class="tip">?<span class="pop">对还没有地区信息的旧IP补做识别. 修复历史遗留数据</span></span></label><input id="backfill" type="number" value="300"></div>
+          <div class="f"><label>复测/轮<span class="tip">?<span class="pop">每轮到期复测数量. 按健康度分层调度: 优质IP勤测、失败IP指数退避, 保证名单常新</span></span></label><input id="recheck" type="number" value="200"></div>
+          <div class="f"><label>优质C段比例<span class="tip">?<span class="pop">抽样时0-1比例的IP从历史优质C段(邻居表现好)里选. 0.6=6成优质邻域+4成随机</span></span></label><input id="exploit" type="number" step="0.1" value="0.6"></div>
+          <div class="f"><label>IPv4库上限<span class="tip">?<span class="pop">IPv4超限后按健康分低者先剔除; 0=不限</span></span></label><input id="max_ips_v4" type="number" value="0"></div>
+          <div class="f"><label>IPv6库上限<span class="tip">?<span class="pop">IPv6超限后按健康分低者先剔除; 0=不限</span></span></label><input id="max_ips_v6" type="number" value="0"></div>
+          <div class="f"><label>单国家占比上限%<span class="tip">?<span class="pop">同一个国家(按CF机房归属映射)活跃IP最多占库的百分比, 让结果覆盖更多地区. 0=关闭; 超限后该国新IP不再新增, 并按质量先裁剪该国</span></span></label><input id="country_max_pct" type="number" value="30"></div>
+          <div class="f"><label>扫描策略<span class="tip">?<span class="pop">auto=库达到动态平衡(可用数/前缀数达标且边际发现率低)后自动从"发现"转向"健康维护", 只做小比例探索+到期复测, 不空烧家宽; 也可手动固定为发现/维护/恢复</span></span></label>
+            <select id="scan_mode"><option value="auto">自动(平衡后转维护)</option><option value="discovery">强制发现</option><option value="maintenance">强制维护</option><option value="recovery">强制恢复</option></select></div>
+          <div class="f"><label>目标可用IP数<span class="tip">?<span class="pop">动态平衡目标: 期望保有的质量分达标IP数量</span></span></label><input id="target_active" type="number" value="60"></div>
+          <div class="f"><label>目标前缀数<span class="tip">?<span class="pop">动态平衡目标: 期望覆盖的独立前缀(/24或/64)数, 用于抗单机房/单路由故障</span></span></label><input id="target_prefixes" type="number" value="8"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row" style="align-items:center">
+          <button id="startBtn" onclick="control('start')">开始扫描</button>
+          <button id="stopBtn" class="stop" onclick="control('stop')" disabled>停止</button>
+          <button class="ghost" onclick="saveSet()">保存设置</button>
+        </div>
+        <div id="msg"></div>
+        <div class="prog">
+          <div class="bar"><div class="fill" id="progFill"></div></div>
+          <div class="plabel" id="progLabel">—</div>
+        </div>
+        <div class="logbox" id="logbox"><div class="logline"><span class="t">HH:MM:SS</span><span class="m">等待事件...</span></div></div>
+      </div>
     </section>
     <section class="view" id="v-table">
       <div class="card">
@@ -1702,12 +1836,18 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <div id="pinBar" class="pin-bar" style="display:none"></div>
     <table>
       <thead><tr>
-        <th style="width:26px"><input type="checkbox" id="ckAll" title="全选本页" onclick="togglePageSel(this)"></th>
-        <th>#</th><th onclick="sortBy('bw')">带宽Mbps</th><th onclick="sortBy('lat')">延迟ms</th>
-        <th onclick="sortBy('ip')">IP</th><th onclick="sortBy('port')">端口</th>
-        <th onclick="sortBy('colo')">机房</th><th>国家/地区</th>
-        
-        <th onclick="sortBy('time')">最近测试</th><th>存活/失败</th><th>操作</th></thead>
+        <th class="nosort" style="width:26px"><input type="checkbox" id="ckAll" title="全选本页" onclick="togglePageSel(this)"></th>
+        <th class="nosort">#</th>
+        <th class="sortable" data-k="bw" onclick="sortBy('bw')" title="按带宽排序(点击切换升降序)">带宽Mbps</th>
+        <th class="sortable" data-k="lat" onclick="sortBy('lat')" title="按延迟排序">延迟ms</th>
+        <th class="sortable" data-k="ip" onclick="sortBy('ip')" title="按IP排序">IP</th>
+        <th class="sortable" data-k="port" onclick="sortBy('port')" title="按端口排序">端口</th>
+        <th class="sortable" data-k="colo" onclick="sortBy('colo')" title="按机房排序">机房</th>
+        <th class="nosort">国家/地区</th>
+        <th class="sortable" data-k="time" onclick="sortBy('time')" title="按最近测试时间排序">最近测试</th>
+        <th class="nosort">存活/失败</th>
+        <th class="sortable" data-k="score" onclick="sortBy('score')" title="综合可用率/延迟/带宽/地区验证/新鲜度">健康分</th>
+        <th class="nosort">操作</th></thead>
       <tbody id="tbody"></tbody>
     </table>
     <div class="dead" id="emptyTip">暂无数据 — 点击"开始扫描"</div>
@@ -1808,7 +1948,8 @@ window.addEventListener("error",e=>{
     setTimeout(()=>t.remove(),8000);
   }catch(_){/* noop */}
 });
-let SORT="bw";
+let SORT="score",SORT_DIR="desc";
+const SORT_DEF_DIR={bw:"desc",score:"desc",time:"desc",lat:"asc",ip:"asc",port:"asc",colo:"asc"};
 let OFFSET=0;
 const LIMIT=100;
 let PIN="",PIN_TS=0;
@@ -2037,6 +2178,11 @@ function control(act){
       exploit:$("exploit").value,max_latency:$("max_latency").value,
       bench_parallel:$("bench_parallel").value,
       bench_host:$("bench_host").value,
+      scan_mode:$("scan_mode").value,target_active:$("target_active").value,
+      target_prefixes:$("target_prefixes").value,
+      v4:$("v4_on").checked?"1":"0",
+      operator_v6:$("operator_v6").value,count_v6:$("count_v6").value,
+      v6_official:$("v6_official").checked?"1":"0",
       tls_check:$("tls_check").checked?"1":"0",
       ipv6:$("ipv6").checked?"1":"0"})}).then(r=>r.json()).then(r=>{
     $("startBtn").textContent="开始扫描";
@@ -2047,6 +2193,16 @@ function control(act){
     $("msg").textContent="请求失败, 请重开网页或重启程序: "+e;
     $("startBtn").disabled=false; });
 }
+function syncProtoUI(){
+  const v4=$("v4_on"),v6=$("ipv6");
+  const p4=$("protoV4"),p6=$("protoV6");
+  if(p4)p4.classList.toggle("off",!v4.checked);
+  if(p6)p6.classList.toggle("off",!v6.checked);
+  ["operator","count"].forEach(id=>{const el=$(id);if(el)el.disabled=!v4.checked;});
+  ["operator_v6","count_v6"].forEach(id=>{const el=$(id);if(el)el.disabled=!v6.checked;});
+}
+$("v4_on").addEventListener("change",syncProtoUI);
+$("ipv6").addEventListener("change",syncProtoUI);
 
 let SVC=null;
 function loadService(){
@@ -2127,15 +2283,16 @@ function tableParams(){
   if($("f_v4").checked)p.set("v4","1");
   if($("f_v6").checked)p.set("v6","1");
   p.set("sort",SORT);
+  p.set("dir",SORT_DIR);
   p.set("offset",OFFSET);
   if(PIN&&Date.now()-PIN_TS<30000)p.set("top",PIN);
   return p;
 }
 
 function bwCellHtml(r){
-  if(r.bandwidth==null)return '<span class="bw muted">待测</span>';
+  if(r.bandwidth==null)return '<span class="bw muted" title="尚未实测过带宽, 健康分按数据完整度打折">待测</span>';
   const data=JSON.stringify({
-    bw:r.bandwidth,
+    bw:r.bandwidth, isLast:!!r.bw_is_last,
     best:r.bw_best!=null?r.bw_best.toFixed(1):"—",
     lastAt:r.bw_last_at?new Date(r.bw_last_at*1000).toLocaleString("zh-CN",{hour12:false}):"未知",
     lat:r.latency!=null?r.latency+" ms":"—",
@@ -2170,10 +2327,16 @@ function renderTable(data){
     const tr=document.createElement("tr");
     if(r.ip===PIN&&Date.now()-PIN_TS<30000)tr.classList.add("just-tested");
     const ck=SEL.has(r.ip);
+    const score=r.score==null?"-":(+r.score).toFixed(1);
+    const scCls=r.score==null?"":(r.score>=60?"sc-hi":(r.score>=35?"sc-mid":"sc-lo"));
+    const bwKnown=r.bw_best!=null;
+    const scoreTitle=(bwKnown?"":"未测带宽(分数按数据完整度打折) · ")+(r.fresh?"新鲜: 1小时内确认存活":"陈旧: 超过1小时未确认");
+    const dot='<span class="fresh-dot'+(r.fresh?" on":"")+'" title="'+(r.fresh?"新鲜":"陈旧")+'"></span>';
     tr.innerHTML=`<td class="ck"><input type="checkbox" class="ck" data-ip="${esc(r.ip)}" ${ck?"checked":""} onchange="rowSelChange(this)"></td>`+
       `<td>${data.offset+i+1}</td><td>${bwCell}</td><td>${lat}</td><td>${esc(r.ip)}</td><td>${r.port}</td>`+
       `<td class="colo">${esc(r.colo)}</td><td>${esc(r.country)}</td><td>${tt}</td>`+
       `<td>${fmt(r.ok)}/<span style="color:var(--err)">${r.fail}</span></td>`+
+      `<td class="score ${scCls}" title="${scoreTitle}">${dot}${score}</td>`+
       `<td>${latBtn}${bwBtn}</td>`;
     tr.classList.add("rowIn");
     tr.style.animationDelay=Math.min(i*20,420)+"ms";
@@ -2183,7 +2346,19 @@ function renderTable(data){
   if(ca)ca.checked=rows.length>0&&rows.every(r=>SEL.has(r.ip));
   updateSelUI();
 }
-function sortBy(k){SORT=k;OFFSET=0;loadTable()}
+function markSort(){
+  document.querySelectorAll("th.sortable").forEach(th=>{
+    const on=th.dataset.k===SORT;
+    th.classList.toggle("sorted",on);
+    th.classList.toggle("asc",on&&SORT_DIR==="asc");
+    th.classList.toggle("desc",on&&SORT_DIR==="desc");
+  });
+}
+function sortBy(k){
+  if(k===SORT)SORT_DIR=SORT_DIR==="asc"?"desc":"asc";
+  else{SORT=k;SORT_DIR=SORT_DEF_DIR[k]||"desc";}
+  markSort();OFFSET=0;loadTable();
+}
 function unpin(){PIN="";PIN_TS=0;loadTable()}
 function page(d){OFFSET=Math.max(0,OFFSET+d*LIMIT);loadTable()}
 function loadTable(){
@@ -2224,6 +2399,11 @@ function saveSet(){
     bench_host:$("bench_host").value,
     max_ips_v4:$("max_ips_v4").value,max_ips_v6:$("max_ips_v6").value,
     country_max_pct:$("country_max_pct").value,
+    scan_mode:$("scan_mode").value,target_active:$("target_active").value,
+    target_prefixes:$("target_prefixes").value,
+    v4:$("v4_on").checked?"1":"0",
+    operator_v6:$("operator_v6").value,count_v6:$("count_v6").value,
+    v6_official:$("v6_official").checked?"1":"0",
     tls_check:$("tls_check").checked?"1":"0",
     ipv6:$("ipv6").checked?"1":"0"};
   fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},
@@ -2236,12 +2416,16 @@ function loadSet(){
     if(!d||!Object.keys(d).length)return;
     if(d.operator!==undefined)$("operator").value=d.operator||"";
     ["ports","count","concurrency","verify","bench","bench_parallel","bench_host",
-     "backfill","recheck","exploit","max_latency","max_ips_v4","max_ips_v6","country_max_pct"].forEach(k=>{
+     "backfill","recheck","exploit","max_latency","max_ips_v4","max_ips_v6","country_max_pct",
+     "scan_mode","target_active","target_prefixes","operator_v6","count_v6"].forEach(k=>{
        const v=d[k];
        if(v!==undefined&&v!==null&&v!=="")$(k).value=v;
     });
     if(d.tls_check!==undefined)$("tls_check").checked=d.tls_check!=="0";
+    if(d.v4!==undefined)$("v4_on").checked=d.v4!=="0"&&d.v4!==false;
     if(d.ipv6!==undefined)$("ipv6").checked=d.ipv6!=="0"&&d.ipv6!==false;
+    if(d.v6_official!==undefined)$("v6_official").checked=d.v6_official!=="0"&&d.v6_official!==false;
+    syncProtoUI();
     $("srcHost").textContent=$("bench_host").value||"speed.cloudflare.com";
 }).catch(e=>{});
 fetch("/api/ports").then(r=>r.json()).then(ports=>{
@@ -2292,23 +2476,26 @@ async function poll(){
     const st=await (await fetch("/api/status")).json();
     $("dbpath").textContent=st.db||""; $("ver").textContent=st.version||"?";
     const pill=$("pill");
-    if(st.running){pill.className="pill run";pill.textContent="扫描中 · 第"+st.round+"轮 · 本轮达标 "+st.last_ok;
+    const mname=st.mode_name?" · "+st.mode_name:"";
+    if(st.running){pill.className="pill run";pill.textContent="扫描中"+mname+" · 第"+st.round+"轮 · 本轮达标 "+st.last_ok;
       $("startBtn").disabled=true;$("stopBtn").disabled=false;}
     else{pill.className=st.msg.startsWith("错误")?"pill stop":"pill idle";
       pill.textContent=st.msg;$("startBtn").disabled=false;$("stopBtn").disabled=true;}
     const pf=$("progFill"), pl=$("progLabel");
+    const mstat=st.running?" · 可用"+st.active+"/新鲜"+st.fresh+"/前缀"+st.prefixes+" · 发现率"+(100*(st.mode_yield||0)).toFixed(1)+"%":"";
     if(st.running&&st.total>0){
       const pct=Math.min(100,Math.round(st.probed/st.total*100));
       pf.style.width=(pct||0.6)+"%";
       pl.textContent=(pct||0)+"% · 第"+(st.round+1)+"轮 已探测 "+st.probed+" / "+st.total+
-        " · 本轮达标 "+st.ok_now;
-    }else if(st.running){pf.style.width="3%";pl.textContent="第"+(st.round+1)+"轮 准备中(发现IP/构造地址池)...";}
+        " · 本轮达标 "+st.ok_now+mstat;
+    }else if(st.running){pf.style.width="3%";pl.textContent="第"+(st.round+1)+"轮 准备中(发现IP/构造地址池)..."+mstat;}
     else{pf.style.width="0";pl.textContent="当前未在扫描";}
     renderLog(st.log||[]);
     const s=await (await fetch("/api/stats")).json();
     STATS=s;
     countTo("st_total",s.tested_all??s.total,true);
     countTo("st_alive",s.alive,true);
+    countTo("st_fresh",s.fresh??0,true);
     countTo("st_verified",s.verified,true);
     countTo("st_bw",s.withbw,true);
     countTo("st_avglat",s.avglat,false);
@@ -2344,9 +2531,14 @@ function statTipSetup(){
       ["── 汇总 ──","var(--c-emph)"],["累计测试",s.tested_all??s.total,"var(--c-emph)"],["库内保留",s.total,"var(--acc2)"],["覆盖率",s.coverage+"%","var(--acc2)"]]},
     st_alive:{t:"存活IP",c:"var(--acc2)",rows:s=>{
       const v4a=s.v4_alive??0, v6a=s.v6_alive??0, dead=s.total-s.alive;
-      return [["IPv4 存活",v4a,"var(--acc2)"],["IPv6 存活",v6a,"var(--cyan)"],
+      return [["新鲜(1h内)",s.fresh??0,"var(--acc2)"],["陈旧",s.stale??0,"var(--dim)"],
+              ["IPv4 存活",v4a,"var(--acc2)"],["IPv6 存活",v6a,"var(--cyan)"],
               ["不可用",dead,"var(--err)"],
               ["存活率",s.total?Math.round(s.alive/s.total*100)+"%":"-","var(--c-emph)"]]}},
+    st_fresh:{t:"新鲜存活",c:"var(--acc2)",rows:s=>[
+      ["新鲜(1h内)",s.fresh??0,"var(--acc2)"],["陈旧存活",s.stale??0,"var(--dim)"],
+      ["已识别地区",s.verified??0,"var(--purp)"],["地区未识别",s.unverified??0,"var(--c-emph)"],
+      ["平均健康分",s.avgscore??"-","var(--acc)"]]},
     st_verified:{t:"已验证地区",c:"var(--purp)",rows:s=>[["已验证",s.verified,"var(--purp)"],["累计测试",s.tested_all??s.total,"var(--c-emph)"]]},
     st_bw:{t:"有带宽数据",c:"var(--acc)",rows:s=>[
       ["IPv4 有带宽",s.v4_bw??0,"var(--acc2)"],["IPv6 有带宽",s.v6_bw??0,"var(--cyan)"],
@@ -2398,7 +2590,7 @@ function bwTipSetup(){
     TIP.querySelector(".t-title").textContent="带宽详情";
     TIP.querySelector(".t-title").style.borderLeftColor="var(--acc2)";
     TIP.querySelector(".t-body").innerHTML=
-      '<div class="t-row"><span class="k">当前带宽</span><span class="v">'+esc(d.bw)+' Mbps</span></div>'+
+      '<div class="t-row"><span class="k">'+(d.isLast?"当前带宽":"历史带宽(最近未测)")+'</span><span class="v">'+esc(d.bw)+' Mbps</span></div>'+
       '<div class="t-row"><span class="k">历史最高</span><span class="v">'+esc(d.best)+' Mbps</span></div>'+
       (diff?'<div class="t-row"><span class="k">较最高</span><span class="v" style="color:'+(diff<0?'var(--err)':'var(--ok)')+'">'+(diff>0?'+':'')+diff+' Mbps</span></div>':'')+
       '<div class="t-row"><span class="k">最近测于</span><span class="v">'+esc(d.lastAt)+'</span></div>'+
@@ -2428,6 +2620,8 @@ function bwTipSetup(){
   $(id).addEventListener("change",()=>{OFFSET=0;loadTable()});
 });
 loadSet();
+syncProtoUI();
+markSort();
 fetch("/api/stats").then(r=>r.json()).then(d=>{
   const sel=document.getElementById("coloSelect");
   if(sel&&d.colo_list)sel.innerHTML='<option value="" disabled selected>📋 选择</option>'+d.colo_list.map(c=>`<option value="${c.code}">${c.code} · ${c.name}</option>`).join("");

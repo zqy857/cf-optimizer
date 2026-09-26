@@ -56,7 +56,7 @@ import cf_health
 import cf_policy
 
 COV_TOTAL = sum(1 << (32 - int(r.split("/")[1])) for r in cf_db.FALLBACK_RANGES)
-VERSION = "2.6.1"
+VERSION = "2.8.2"
 
 COLO_COUNTRY = cf_db.COLO_COUNTRY
 
@@ -110,6 +110,7 @@ STATE = {
     "ok_now": 0,
     "mode": "discovery",
     "mode_name": "",
+    "modes": {},
     "active": 0,
     "fresh": 0,
     "prefixes": 0,
@@ -480,7 +481,7 @@ def scan_args(params, db):
         max_ips_v4=max(0, int(num("max_ips_v4", 0, int))),
         max_ips_v6=max(0, int(num("max_ips_v6", 0, int))),
         country_max_pct=max(0, int(num("country_max_pct", 30, int))),
-        bench_size=int(max(1_000_000, min(num("bench_size", 30_000_000, int), 80_000_000))),
+        bench_size=int(max(1_000_000, min(num("bench_size", 12_000_000, int), 80_000_000))),
         bench_timeout=max(1, num("bench_timeout", 10)),
         bench_parallel=max(1, int(num("bench_parallel", 6, int))),
         bench_host=str(flat.get("bench_host", "")).strip() or cf_db.SPEED_HOST,
@@ -534,16 +535,22 @@ def scanner_worker(args):
                     if rec.get("ok"):
                         STATE["ok_now"] = STATE.get("ok_now", 0) + 1
             elif t == "mode":
-                mode = rec.get("mode", "discovery")
                 bud = rec.get("budgets", {})
-                set_state(mode=mode, mode_name=cf_policy.MODE_NAMES.get(mode, mode),
+                modes = rec.get("modes") or {}
+                parts, brief = [], []
+                for _p in ("v4", "v6"):
+                    _mi = modes.get(_p) or {}
+                    _nm = cf_policy.MODE_NAMES.get(_mi.get("mode"), _mi.get("mode", "?"))
+                    parts.append(f"{_p} {_nm}(可用{_mi.get('active', 0)}/"
+                                 f"新鲜{_mi.get('fresh', 0)}/前缀{_mi.get('prefixes', 0)})")
+                    brief.append(f"{_p} {_nm}")
+                set_state(mode=rec.get("mode", "discovery"), mode_name=" · ".join(brief),
+                          modes=modes,
                           active=rec.get("active", 0), fresh=rec.get("fresh", 0),
                           prefixes=rec.get("prefixes", 0), mode_yield=rec.get("yield", 0.0),
                           mode_reason=rec.get("reason", ""), budgets=bud)
-                log_event(f"策略: {cf_policy.MODE_NAMES.get(mode, mode)} "
-                          f"(可用{rec.get('active', 0)}/新鲜{rec.get('fresh', 0)}/"
-                          f"前缀{rec.get('prefixes', 0)}/发现率{rec.get('yield', 0):.1%}) "
-                          f"本轮 抽样{bud.get('count')} 复测{bud.get('recheck')}")
+                log_event(f"策略: {' | '.join(parts)} 本轮 抽样 "
+                          f"v4:{bud.get('count')} v6:{bud.get('count_v6')} 复测:{bud.get('recheck')}")
             elif t == "cycle_start":
                 set_state(stage="probe", total=rec.get("total", 0), probed=0, ok_now=0)
             elif t == "cycle_end":
@@ -1637,9 +1644,17 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
   .chk label{font-size:13.5px}
 
   /* 进度条与日志 */
-  .prog{gap:8px;margin-top:10px}
-  .prog .bar{height:18px;border-radius:10px}
-  .prog .plabel{font-size:12px}
+  /* 进度条: 移动端标签可能很长, 让 bar 与 label 各占整行, 避免溢出/挤压 */
+  .prog{flex-wrap:wrap;gap:6px 8px;margin-top:10px}
+  .prog .bar{flex:1 1 100%;height:18px;border-radius:10px}
+  .prog .plabel{flex:1 1 100%;white-space:normal;font-size:12px;line-height:1.5}
+  /* 顶部状态药丸: 移动端改横向滚动(可左右滑动查看完整文字), 不再截断 */
+  #dbpath{display:none}
+  #pill{max-width:62vw;min-width:0;overflow-x:auto;overflow-y:hidden;white-space:nowrap;
+    -webkit-overflow-scrolling:touch;overscroll-behavior-x:contain;
+    scrollbar-width:none;-ms-overflow-style:none}
+  #pill::-webkit-scrollbar{display:none}
+  #pill::before{flex:0 0 auto}
   .logbox{height:160px;font-size:12px;padding:10px;border-radius:10px;margin-top:8px}
   .logline{line-height:1.7}
 

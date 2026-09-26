@@ -57,7 +57,7 @@ import cf_lifecycle
 import cf_policy
 
 COV_TOTAL = sum(1 << (32 - int(r.split("/")[1])) for r in cf_db.FALLBACK_RANGES)
-VERSION = "2.9.4"
+VERSION = "2.9.7"
 
 COLO_COUNTRY = cf_db.COLO_COUNTRY
 
@@ -510,11 +510,11 @@ def scanner_worker(args):
         known = cf_db.load_known(conn)
         nets, label, nets6 = cf_db.resolve_sources(args)
         set_state(label=label, db=os.path.abspath(args.db),
-                  msg=f"已启动: {label} | v4抽样{args.count}"
-                      + (f" v6抽样{args.count_v6}" if args.ipv6 else "")
-                      + f" 并发{args.concurrency} | 端口{','.join(map(str, args.ports))}"
-                      f" | TLS确认{'开' if args.tls_check else '关'}"
-                      f" | 库上限 V4:{args.max_ips_v4 or '-'} V6:{args.max_ips_v6 or '-'}")
+                  msg=f"扫描中 · {label}｜v4抽样 {args.count}"
+                      + (f" v6抽样 {args.count_v6}" if args.ipv6 else "")
+                      + f"｜并发 {args.concurrency}｜端口 {','.join(map(str, args.ports))}"
+                      + f"｜TLS {'开' if args.tls_check else '关'}"
+                      + f"｜库上限 v4 {args.max_ips_v4 or '不限'}/v6 {args.max_ips_v6 or '不限'}")
 
         pend_count = 0
 
@@ -523,6 +523,8 @@ def scanner_worker(args):
             if pend_count:
                 conn.commit()
                 pend_count = 0
+
+        logstate = {"mode": "", "stock": "", "stock_at": 0.0, "mon_at": 0.0}
 
         def handle(rec):
             nonlocal pend_count
@@ -542,26 +544,29 @@ def scanner_worker(args):
             elif t == "mode":
                 bud = rec.get("budgets", {})
                 modes = rec.get("modes") or {}
-                parts, brief = [], []
+                brief, stock = [], []
                 for _p in ("v4", "v6"):
                     _mi = modes.get(_p) or {}
                     _nm = cf_policy.MODE_NAMES.get(_mi.get("mode"), _mi.get("mode", "?"))
-                    parts.append(f"{_p} {_nm}(可用{_mi.get('active', 0)}/"
-                                 f"新鲜{_mi.get('fresh', 0)}/前缀{_mi.get('prefixes', 0)})")
                     brief.append(f"{_p} {_nm}")
+                    stock.append(f"{_p} 可用 {_mi.get('active', 0)}")
                 set_state(mode=rec.get("mode", "discovery"), mode_name=" · ".join(brief),
-                          modes=modes,
-                          active=rec.get("active", 0), fresh=rec.get("fresh", 0),
+                          modes=modes, active=rec.get("active", 0), fresh=rec.get("fresh", 0),
                           prefixes=rec.get("prefixes", 0), mode_yield=rec.get("yield", 0.0),
                           mode_reason=rec.get("reason", ""), budgets=bud)
-                log_event(f"策略: {' | '.join(parts)} 本轮 抽样 "
-                          f"v4:{bud.get('count')} v6:{bud.get('count_v6')} 复测:{bud.get('recheck')}")
+                sig = "|".join(brief)
+                if sig != logstate["mode"]:            # 只在模式变化时记一条
+                    log_event(f"模式 · {'，'.join(brief)}（{'，'.join(stock)}）")
+                    logstate["mode"] = sig
             elif t == "cycle_start":
                 set_state(stage="probe", total=rec.get("total", 0), probed=0, ok_now=0)
             elif t == "monitor":
-                # 值守监控: 一批到期 IP; 不计"轮"
                 set_state(stage="monitor", total=rec.get("checking", 0), probed=0,
                           ok_now=0, monitor_due=rec.get("due", 0))
+                if time.time() - logstate["mon_at"] >= 120:   # 值守日志限频
+                    log_event(f"值守监控 · 本批检查 {rec.get('checking', 0)} 个"
+                              f"（还有 {rec.get('due', 0)} 个到期）")
+                    logstate["mon_at"] = time.time()
             elif t == "monitor_end":
                 set_state(stage="monitor", probed=0, ok_now=0)
             elif t in ("cycle_end", "lifecycle"):
@@ -575,27 +580,31 @@ def scanner_worker(args):
                         getattr(args, "per48_max", None))
                     conn.commit()
                     ev = sum(stats.values())
-                    if ev:
-                        log_event(f"生命周期剔除: 失效{stats['dead']} 去重{stats['dedup']} "
-                                  f"均衡{stats['balanced']} 超容{stats['capped']}")
+                    if ev:                             # 只有真清理了才记
+                        log_event(f"清理库存 · 失效 {stats['dead']}｜重复 {stats['dedup']}｜"
+                                  f"地区均衡 {stats['balanced']}｜超容量 {stats['capped']}")
                     d4 = deficits.get("v4", {})
                     d6 = deficits.get("v6", {})
                     set_state(lifecycle={"v4": d4, "v6": d6})
+                    dsig = (f"{d4.get('active')}/{d4.get('reserve')}/{d4.get('deficit_reserve')}"
+                            f"|{d6.get('active')}/{d6.get('reserve')}/{d6.get('deficit_reserve')}")
+                    if dsig != logstate["stock"] or time.time() - logstate["stock_at"] >= 300:
+                        log_event(f"库存 · v4 可用 {d4.get('active', 0)}｜备用 "
+                                  f"{d4.get('reserve', 0)}｜待补 {d4.get('deficit_reserve', 0)}"
+                                  f" ∥ v6 可用 {d6.get('active', 0)}｜备用 "
+                                  f"{d6.get('reserve', 0)}｜待补 {d6.get('deficit_reserve', 0)}")
+                        logstate["stock"] = dsig
+                        logstate["stock_at"] = time.time()
                 except Exception as e:
-                    log_event(f"库清理失败: {e}")
+                    log_event(f"清理库存失败 · {e}")
                     try:
                         conn.rollback()
                     except Exception:
                         pass
                 if t == "cycle_end":
+                    total = get_state().get("total", 0)
                     rnd = get_state()["round"] + 1
-                    try:
-                        ver = conn.execute("SELECT COUNT(*) FROM ips WHERE verified_at IS NOT NULL").fetchone()[0]
-                        bw = conn.execute("SELECT COUNT(*) FROM ips WHERE bandwidth_mbps>0").fetchone()[0]
-                    except Exception:
-                        ver = bw = 0
-                    log_event(f"第{rnd}轮完成: 达标 {rec.get('ok', 0)} | "
-                              f"已验证地区 {ver} | 有带宽 {bw}")
+                    log_event(f"本轮完成 · 抽查 {total} 个，其中可用 {rec.get('ok', 0)} 个")
                     set_state(round=rnd, last_ok=rec.get("ok", 0),
                               last_cycle=time.time(), stage="idle",
                               total=0, probed=0, ok_now=0)
@@ -646,9 +655,9 @@ def start_scan(params, db):
     set_state(running=True, stop=threading.Event(), round=0, last_ok=0,
               started_at=time.time(), last_cycle=None, msg="启动中...",
               stage="start", total=0, probed=0, ok_now=0, label=label)
-    log_event(f"开始扫描: {label} | v4抽样{args.count}"
-              + (f" v6抽样{args.count_v6}" if args.ipv6 else "")
-              + f" 并发{args.concurrency} | 端口{','.join(map(str, args.ports))} | TLS {args.tls_check}")
+    log_event(f"开始扫描 · {label}｜v4抽样 {args.count}"
+              + (f" v6抽样 {args.count_v6}" if args.ipv6 else "")
+              + f"｜并发 {args.concurrency}｜端口 {','.join(map(str, args.ports))}")
     threading.Thread(target=scanner_worker, args=(args,), daemon=True).start()
     return {"ok": True}
 
@@ -1588,6 +1597,7 @@ tr.just-tested{outline:2.5px solid var(--acc2);outline-offset:-2px;
 .logline{white-space:pre-wrap;word-break:break-all;animation:logIn .3s ease}
 @keyframes logIn{from{opacity:0;transform:translateX(-8px)}}
 .logline .t{color:#4d5a72;margin-right:9px}
+.logline.warn .m{color:var(--warn)}
 .logline.err .m{color:var(--err)}
 .logline.ok .m{color:var(--acc2)}
 
@@ -2502,7 +2512,10 @@ function renderLog(entries){
   entries.forEach(e=>{
     const msg=String(e[1]||""), dt=new Date(e[0]*1000);
     const pad=("0"+dt.getHours()).slice(-2)+":"+("0"+dt.getMinutes()).slice(-2)+":"+("0"+dt.getSeconds()).slice(-2);
-    const cls=msg.startsWith("开始")?"ok":(msg.includes("错误")||msg.includes("异常")?"err":"");
+    let cls="";
+    if(msg.startsWith("错误")||msg.includes("失败")||msg.includes("异常"))cls="err";
+    else if(msg.startsWith("开始")||msg.startsWith("模式")||msg.startsWith("库存")||msg.startsWith("本轮完成"))cls="ok";
+    else if(msg.startsWith("清理")||msg.startsWith("补位"))cls="warn";
     const d=document.createElement("div"); d.className="logline "+(cls||"m");
     d.innerHTML='<span class="t">'+pad+'</span><span class="m">'+esc(msg)+'</span>';
     box.appendChild(d);

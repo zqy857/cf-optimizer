@@ -50,7 +50,7 @@ MODES = ("discovery", "maintenance", "recovery")
 MODE_NAMES = {"discovery": "发现扩张", "maintenance": "健康维护", "recovery": "质量恢复"}
 PROTOS = ("v4", "v6")
 
-_STATE = {p: {"mode": "discovery", "streak": 0} for p in PROTOS}
+_STATE = {p: {"mode": "discovery", "streak": 0, "inited": False} for p in PROTOS}
 _LOCK = threading.Lock()
 
 
@@ -72,9 +72,11 @@ def set_mode(mode):
         for p in PROTOS:
             if mode == "auto":
                 _STATE[p]["streak"] = 0
+                _STATE[p]["inited"] = False   # 下一个评估立即重新定模式
             elif mode in MODES:
                 _STATE[p]["mode"] = mode
                 _STATE[p]["streak"] = 0
+                _STATE[p]["inited"] = True
 
 
 def _decide(is_v6, conn, now, target_active, target_prefixes, force):
@@ -105,16 +107,25 @@ def _decide(is_v6, conn, now, target_active, target_prefixes, force):
         return out
 
     active, fresh = out["active"], out["fresh"]
+    degraded = active > 0 and fresh < active * DEGRADE_RATIO
     need_more = active < target_active or out["prefixes"] < target_prefixes
-    overfilled = active >= target_active * OVERFILL_MULT   # 已远超目标: 不必再扩张
     if need_more:
-        want, why = "discovery", "库未饱和"
-    elif not overfilled and out["yield"] >= YIELD_MIN:
-        want, why = "discovery", "边际收益仍高"
-    elif active and fresh < active * DEGRADE_RATIO:
-        want, why = "recovery", "存量大量陈旧"
+        want, why = "discovery", "未达目标"
+    elif target_active > 0:
+        # 有明确目标: 达标即转维护(不再因"发现率"一直挖), 备胎由维护期低频补
+        if degraded:
+            want, why = "recovery", "存量陈旧"
+        else:
+            want, why = "maintenance", "已达目标"
     else:
-        want, why = "maintenance", "库已达动态平衡"
+        # 无目标(不限): 沿用"边际收益"判断
+        overfilled = active >= int(target_active) * OVERFILL_MULT
+        if not overfilled and out["yield"] >= YIELD_MIN:
+            want, why = "discovery", "边际收益仍高"
+        elif degraded:
+            want, why = "recovery", "存量大量陈旧"
+        else:
+            want, why = "maintenance", "库已达动态平衡"
 
     key = "v6" if is_v6 else "v4"
     if force in MODES:
@@ -124,7 +135,13 @@ def _decide(is_v6, conn, now, target_active, target_prefixes, force):
         with _LOCK:
             st = _STATE[key]
             prev = st["mode"]
-            if want == prev:
+            if not st.get("inited"):
+                # 首次评估直接采用目标模式, 避免"开局先跑几轮完整发现"才切换
+                st["mode"] = want
+                st["inited"] = True
+                st["streak"] = 0
+                mode = want
+            elif want == prev:
                 st["streak"] = 0
                 mode = prev
             else:

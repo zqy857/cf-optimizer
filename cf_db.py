@@ -1614,19 +1614,18 @@ def main():
                     _mi = modes.get(_p) or {}
                     parts.append(f"{_p} {cf_policy.MODE_NAMES.get(_mi.get('mode'), '?')}"
                                  f"(用{_mi.get('active', 0)}/前{_mi.get('prefixes', 0)})")
-                print(f"  策略: {' · '.join(parts)} | 本轮 抽样 v4:{bud.get('count')} "
-                      f"v6:{bud.get('count_v6')} 复测:{bud.get('recheck')} "
-                      f"({rec.get('reason', '')})", flush=True)
+                print(f"【模式】{'，'.join(parts)}｜本轮抽样 v4 {bud.get('count')} "
+                      f"v6 {bud.get('count_v6')}｜复测 {bud.get('recheck')}", flush=True)
             elif rec["type"] == "monitor":
-                print(f"[{time.strftime('%H:%M:%S')}] 值守监控: 到期 {rec.get('due', 0)}, "
-                      f"本批检查 {rec.get('checking', 0)}", flush=True)
+                print(f"【值守】本批检查 {rec.get('checking', 0)} 个"
+                      f"（还有 {rec.get('due', 0)} 个到期）", flush=True)
             elif rec["type"] == "monitor_end":
                 pass
             elif rec["type"] in ("cycle_end", "lifecycle"):
                 conn.commit()
                 pend = 0
                 if rec["type"] == "cycle_end":
-                    print(banner(), f"| 本轮达标 {rec['ok']}", flush=True)
+                    print(banner(), f"｜本轮可用 {rec['ok']}", flush=True)
                 try:
                     stats, deficits = cf_lifecycle.lifecycle_pass(
                         conn, args.max_ips_v4, args.max_ips_v6,
@@ -1637,13 +1636,13 @@ def main():
                     conn.commit()
                     ev = sum(stats.values())
                     if ev:
-                        print(f"生命周期剔除: 失效{stats['dead']} 去重{stats['dedup']} "
-                              f"均衡{stats['balanced']} 超容{stats['capped']}", flush=True)
+                        print(f"【清理】失效 {stats['dead']}｜重复 {stats['dedup']}｜"
+                              f"地区均衡 {stats['balanced']}｜超容量 {stats['capped']}", flush=True)
                     d4 = deficits.get("v4", {})
                     d6 = deficits.get("v6", {})
-                    print(f"  状态: v4 可用{d4.get('active',0)} 备用{d4.get('reserve',0)} "
-                          f"缺口{d4.get('deficit',0)} | v6 可用{d6.get('active',0)} "
-                          f"备用{d6.get('reserve',0)} 缺口{d6.get('deficit',0)}", flush=True)
+                    print(f"【库存】v4 可用 {d4.get('active',0)}｜备用 {d4.get('reserve',0)}｜"
+                          f"待补 {d4.get('deficit_reserve',0)} ∥ v6 可用 {d6.get('active',0)}｜"
+                          f"备用 {d6.get('reserve',0)}｜待补 {d6.get('deficit_reserve',0)}", flush=True)
                 except Exception as e:
                     print(f"库清理失败: {e}", flush=True)
             elif rec["type"] == "done":

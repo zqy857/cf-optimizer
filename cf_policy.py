@@ -40,10 +40,12 @@ RECOVERY_COUNT_FRACTION = 0.5
 
 # ---- 监控节奏(库满/平衡后, 事件驱动而非一轮轮空转) ----
 IDLE_CAP = 15 * 60                  # 无到期 IP 时最长休眠(秒)
-EXPLORE_INTERVAL = 15 * 60          # 维护模式下发现探索的最小间隔(秒)
+EXPLORE_INTERVAL = 30 * 60          # 值守期低频探索间隔(秒): 定期找有没有更好的IP
+EXPLORE_FRACTION = 0.1              # 值守探索抽样 = 基础抽样数 * 该比例(温和, 不空烧)
 MONITOR_TICK = 60                   # 维护监控的最小节拍: 每 tick 处理一批到期 IP(秒)
 MONITOR_BATCH = 200                 # 每个 tick 最多处理的到期 IP 数(限速)
 LIFE_INTERVAL = 300                 # 纯监控期做一次生命周期维护(剔除/补充判定)的间隔(秒)
+FILL_FRACTION = 0.3                 # "填充库容"阶段: 每轮抽样 = 基础抽样数 * 该比例(温和但持续, 直到达上限)
 DEFAULT_DEFICIT_ACTIVE = 200        # 未指定时的 active 目标(缺员即触发补充)
 
 MODES = ("discovery", "maintenance", "recovery")
@@ -186,16 +188,11 @@ def shared_budget(mode, base_verify, base_bench, base_recheck, active=0):
     base_verify = max(0, int(base_verify))
     base_bench = max(0, int(base_bench))
     base_recheck = max(0, int(base_recheck))
+    # 深度处理(识别/送测)不再单独限流: 0 表示不限, 数量由 复测批量/地区补全/抽样数 自然决定
+    verify = base_verify if base_verify > 0 else 10 ** 9
     if mode == "maintenance":
-        # 维护期仍保留测带宽预算: 补齐缺失的带宽数据本身就是"健康"的一部分,
-        # 不能因为已饱和就停止测量, 否则"有带宽数据"会长期停滞。
-        return {
-            "verify": max(MAINT_VERIFY_MIN, base_verify // 4),
-            "bench": base_bench,
-            "recheck": base_recheck,
-        }
+        return {"verify": verify, "bench": base_bench, "recheck": base_recheck}
     if mode == "recovery":
-        return {"verify": base_verify, "bench": base_bench,
+        return {"verify": verify, "bench": base_bench,
                 "recheck": int(base_recheck * 1.5)}
-    return {"verify": base_verify, "bench": base_bench,
-            "recheck": base_recheck}
+    return {"verify": verify, "bench": base_bench, "recheck": base_recheck}

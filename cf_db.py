@@ -1122,7 +1122,7 @@ async def run_session(nets, known, q, args, stop, nets6=None):
         active_mode = True
         explore = True
         v6_count = getattr(args, "count_v6", args.count)
-        bud = {"count": 0, "count_v6": 0, "verify": args.verify,
+        bud = {"count": 0, "count_v6": 0, "verify": args.verify or 10 ** 9,
                "bench": args.bench, "recheck": args.recheck}
         try:
             conn_v = sqlite3.connect(args.db)
@@ -1137,13 +1137,24 @@ async def run_session(nets, known, q, args, stop, nets6=None):
             deficits = cf_lifecycle.replenish_need(conn_v, target_active,
                                                    args.max_ips_v4, args.max_ips_v6)
             now = time.time()
-            reserve_tick = (now - last_explore["t"]) >= cf_policy.EXPLORE_INTERVAL
             reserve_need = any(d["deficit_reserve"] > 0 for d in deficits.values())
             active_need = any(d["deficit"] > 0 for d in deficits.values())
-            # 发现条件: 发现/恢复期, 或热缺口, 或(维护期且到点)补库容(备胎)
-            explore = active_mode or active_need or (reserve_need and reserve_tick)
-            # 纯值守: 无需发现 -> 不再有"轮"的概念
+            explore_full = active_mode or active_need or reserve_need
+            explore_interval = getattr(args, "explore_interval", cf_policy.EXPLORE_INTERVAL)
+            explore_fraction = getattr(args, "explore_fraction", cf_policy.EXPLORE_FRACTION)
+            # 值守期"低频探索": 库已满也每隔设定时间抽一小批找更好的IP(默认30分/10%)
+            explore_light = (not explore_full) and (
+                now - last_explore["t"] >= explore_interval)
+            explore = explore_full or explore_light
             pure_monitor = (not active_mode) and (not explore)
+            if active_mode or active_need:
+                phase = "discover"
+            elif reserve_need:
+                phase = "fill"
+            elif explore_light:
+                phase = "explore"
+            else:
+                phase = "monitor"
             sb4 = cf_policy.shared_budget(mi4["mode"], args.verify, args.bench,
                                           args.recheck, mi4["active"])
             sb6 = cf_policy.shared_budget(mi6["mode"], args.verify, args.bench,
@@ -1155,9 +1166,11 @@ async def run_session(nets, known, q, args, stop, nets6=None):
                 if mi["mode"] != "maintenance":
                     return cf_policy.scan_count(mi["mode"], base)     # 发现/恢复: 正常量
                 d = deficits.get(key, {})
-                if reserve_tick and d.get("deficit_reserve", 0) > 0:
-                    return max(30, int(base * 0.1))                    # 维护: 低频补备胎
-                return 0                                               # 维护且库容已满: 不发现
+                if d.get("deficit_reserve", 0) > 0:
+                    return max(50, int(base * cf_policy.FILL_FRACTION))  # 填充库容: 温和但持续
+                if explore_light:
+                    return max(20, int(base * explore_fraction))           # 值守: 低频探索找更优
+                return 0                                               # 完全静默
             bud = {
                 "count": proto_count("v4", mi4, args.count, bool(nets)),
                 "count_v6": proto_count("v6", mi6, v6_count, bool(nets6)),
@@ -1169,7 +1182,7 @@ async def run_session(nets, known, q, args, stop, nets6=None):
             due_count = conn_v.execute(
                 "SELECT COUNT(*) FROM ips WHERE next_check_at<=?", (now,)).fetchone()[0]
             q.put({"type": "mode", "modes": modes, "budgets": bud, "explore": explore,
-                   "deficits": deficits,
+                   "phase": phase, "deficits": deficits,
                    "active": mi4["active"] + mi6["active"],
                    "fresh": mi4["fresh"] + mi6["fresh"],
                    "prefixes": mi4["prefixes"] + mi6["prefixes"],
@@ -1473,7 +1486,7 @@ def main():
     ap.add_argument("--count", type=int, default=5000, help="IPv4 每轮发现抽样数(默认 5000)")
     ap.add_argument("--count-v6", dest="count_v6", type=int, default=None,
                     help="IPv6 每轮发现抽样数(默认与 --count 相同)")
-    ap.add_argument("--verify", type=int, default=30, help="每轮验证地区预算(默认30)")
+    ap.add_argument("--verify", type=int, default=0, help="每批深度处理(识别/送测)上限, 0=不限(默认, 由复测/补全/抽样自然决定)")
     ap.add_argument("--bench", type=int, default=40, help="每轮带宽测试预算(默认40)")
     ap.add_argument("--concurrency", type=int, default=400, help="并发拨号数")
     ap.add_argument("--ping-timeout", type=float, default=1.2)
@@ -1504,6 +1517,10 @@ def main():
     ap.add_argument("--country-pct", type=int, default=30, dest="country_pct",
                     help="单国家活跃占比上限%% (0=关闭均衡). 超过上限的新IP不吸收, 超限时该国低分IP先裁剪")
     ap.add_argument("--gap", type=float, default=5, help="轮间间隔秒(默认5)")
+    ap.add_argument("--explore-interval", type=float, default=30, dest="explore_interval",
+                    help="值守期低频探索间隔(分钟, 默认30): 库满后每隔这么久抽一小批找更优IP")
+    ap.add_argument("--explore-fraction", type=float, default=10, dest="explore_fraction",
+                    help="值守期低频探索比例(%%命中于抽样数, 默认10); 0=库满后完全不探索")
     ap.add_argument("--scan-mode", dest="scan_mode", choices=["auto", "discovery", "maintenance", "recovery"],
                     default="auto", help="扫描策略: auto=达动态平衡后自动转健康维护(默认)")
     ap.add_argument("--target-active", type=int, default=60, dest="target_active",
@@ -1535,6 +1552,8 @@ def main():
     args.ports = tuple(base_ports)
     if args.count_v6 is None:
         args.count_v6 = args.count
+    args.explore_interval = max(1.0, float(getattr(args, "explore_interval", 30))) * 60
+    args.explore_fraction = min(1.0, max(0.0, float(getattr(args, "explore_fraction", 10)) / 100.0))
 
     if args.stats:
         print(stats_report(args))

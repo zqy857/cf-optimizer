@@ -48,6 +48,7 @@ import types
 import urllib.parse
 
 import cf_health
+import cf_lifecycle
 import cf_policy
 
 OFFICIAL_V4_URL = "https://www.cloudflare.com/ips-v4"
@@ -107,7 +108,11 @@ CREATE TABLE IF NOT EXISTS ips(
   lat_ewma_ms REAL,
   bw_ewma_mbps REAL,
   score REAL DEFAULT 0,
-  next_check_at REAL DEFAULT 0
+  next_check_at REAL DEFAULT 0,
+  state TEXT,
+  interval REAL,
+  tag TEXT,
+  pin INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_ips_score ON ips(latency_ms, verified_at, bandwidth_mbps);
 CREATE INDEX IF NOT EXISTS idx_ips_tested ON ips(tested_at);
@@ -137,8 +142,14 @@ MIGRATIONS = [
     "ALTER TABLE ips ADD COLUMN bw_ewma_mbps REAL",
     "ALTER TABLE ips ADD COLUMN score REAL DEFAULT 0",
     "ALTER TABLE ips ADD COLUMN next_check_at REAL DEFAULT 0",
+    # 生命周期: 状态标签 / 监控周期 / 用户标签 / 置顶保护
+    "ALTER TABLE ips ADD COLUMN state TEXT",
+    "ALTER TABLE ips ADD COLUMN interval REAL",
+    "ALTER TABLE ips ADD COLUMN tag TEXT",
+    "ALTER TABLE ips ADD COLUMN pin INTEGER DEFAULT 0",
     "CREATE INDEX IF NOT EXISTS idx_ips_next ON ips(next_check_at)",
     "CREATE INDEX IF NOT EXISTS idx_ips_quality ON ips(score)",
+    "CREATE INDEX IF NOT EXISTS idx_ips_state ON ips(state)",
 ]
 
 N24_SQL = ("substr(ip,1,"
@@ -385,19 +396,22 @@ def upsert(conn, rec, country_pct=0):
 
     lat_v = lat_ewma if lat_ewma is not None else latency_ms
     bw_v = bw_ewma if bw_ewma is not None else best_bw
-    sc = cf_health.score(ok_count, fail_count, lat_v, bw_v, bool(colo), last_ok_at, now)
-    nxt = cf_health.next_check_at(sc, ok_count, fail_streak, last_ok_at, last_fail_at,
-                                  now, bool(colo), now)
+    verified = bool(colo)
+    sc = cf_health.score(ok_count, fail_count, lat_v, bw_v, verified, last_ok_at, now)
+    st = cf_health.classify(ok_count, fail_streak, sc, last_ok_at, now, verified)
+    iv = cf_health.state_interval(st, sc, fail_streak, verified)
+    nxt = cf_health.next_check_for(ip, st, sc, fail_streak, last_ok_at, last_fail_at,
+                                   now, verified, now)
 
     values = (port, colo, loc, latency_ms, best_bw, bw_last, bw_last_at, now,
               verified_at, ok_count, fail_count, last_ok_at, last_fail_at,
-              fail_streak, lat_ewma, bw_ewma, sc, nxt)
+              fail_streak, lat_ewma, bw_ewma, sc, nxt, iv, st)
     if is_new:
         conn.execute(
             "INSERT INTO ips(ip,port,colo,loc,latency_ms,bandwidth_mbps,bw_last_mbps,"
             "bw_last_at,tested_at,verified_at,ok_count,fail_count,last_ok_at,last_fail_at,"
-            "fail_streak,lat_ewma_ms,bw_ewma_mbps,score,next_check_at,first_seen) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "fail_streak,lat_ewma_ms,bw_ewma_mbps,score,next_check_at,interval,state,first_seen) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (ip,) + values + (first_seen,))
         try:
             conn.execute(
@@ -410,7 +424,7 @@ def upsert(conn, rec, country_pct=0):
             "UPDATE ips SET port=?,colo=?,loc=?,latency_ms=?,bandwidth_mbps=?,"
             "bw_last_mbps=?,bw_last_at=?,tested_at=?,verified_at=?,ok_count=?,fail_count=?,"
             "last_ok_at=?,last_fail_at=?,fail_streak=?,lat_ewma_ms=?,bw_ewma_mbps=?,"
-            "score=?,next_check_at=? WHERE ip=?",
+            "score=?,next_check_at=?,interval=?,state=? WHERE ip=?",
             values + (ip,))
     return "ok"
 
@@ -482,108 +496,11 @@ def _grave_ts(now):
     return now + GRAVE_DAYS * 86400 - 3600
 
 
-def prune_ips(conn, max_v4, max_v6, country_pct=0):
-    """IPv4/IPv6 分别按上限剪枝, 返回总剔除数. limit<=0 不限该协议.
-
-    country_pct>0 时先做国家均衡裁剪: 单个国家(通过的colo映射聚合)活跃数超过
-    占比上限的超额部分按分数剪掉, 使库整体覆盖更多地区, 再执行原有全库剪枝.
-    """
-    if (not max_v4 or int(max_v4) <= 0) and (not max_v6 or int(max_v6) <= 0) \
-            and (not country_pct or int(country_pct) <= 0):
-        return 0
-    now = time.time()
-    try:
-        conn.execute("DELETE FROM graveyard WHERE buried_at < ?",
-                     (now - GRAVE_EXPIRE_DAYS * 86400,))
-        conn.execute("DELETE FROM graveyard WHERE rowid NOT IN "
-                     "(SELECT rowid FROM graveyard "
-                     "ORDER BY buried_at DESC LIMIT ?)", (GRAVE_MAX_ROWS,))
-    except Exception:
-        pass
-
-    def _purge_dead():
-        # 1) 从未存活且持续失败: 直接清退
-        # 2) 曾经存活但已 >HARD_TTL 无成功且连续失败: 判定失效降级, 入墓碑后由扫描重发现
-        cond = ("((ok_count = 0 AND fail_count >= 3 AND tested_at < :cut) OR "
-                "(ok_count > 0 AND fail_streak >= :fs AND COALESCE(last_ok_at,0) < :hard)) "
-                "LIMIT 50000")
-        params = {"ts": _grave_ts(now), "cut": now - 7 * 86400,
-                  "fs": cf_health.FLAP_FAIL_STREAK, "hard": now - cf_health.HARD_TTL}
-        conn.execute("INSERT OR REPLACE INTO graveyard(ip, buried_at) "
-                     f"SELECT ip, :ts FROM ips WHERE {cond}", params)
-        conn.execute(f"DELETE FROM ips WHERE ip IN (SELECT ip FROM ips WHERE {cond})",
-                     params)
-
-    _purge_dead()
-    pruned = 0
-    for is_v6, limit in [(False, max_v4), (True, max_v6)]:
-        proto = "ip LIKE '%:%'" if is_v6 else "ip NOT LIKE '%:%'"
-        alive_cond = f"{proto} AND ok_count > 0"
-        alive = conn.execute(f"SELECT COUNT(*) FROM ips WHERE {alive_cond}").fetchone()[0]
-        dead = conn.execute(f"SELECT COUNT(*) FROM ips WHERE {proto} AND ok_count = 0").fetchone()[0]
-
-        # 第一优先: 清理所有死IP(ok_count=0), 不占存活名额
-        if dead > 0:
-            conn.execute(f"DELETE FROM ips WHERE {proto} AND ok_count = 0")
-            pruned += dead
-
-        # 阶段0: 国家均衡裁剪 —— 单个国家超过占比上限(country_pct)的部分, 低分先删。
-        # 不依赖库容上限(max_v4/max_v6), 只要开了均衡就每轮强制生效。
-        # cap 一次按"本轮裁剪前总量"快照计算, 逐轮扫描会向 30% 收敛, 避免过量删除。
-        if country_pct and int(country_pct) > 0:
-            alive = conn.execute(
-                f"SELECT COUNT(*) FROM ips WHERE {alive_cond}").fetchone()[0]
-            cap = max(1, int(alive * int(country_pct) / 100))
-            rows = conn.execute(f"SELECT colo, COUNT(*) FROM ips "
-                                f"WHERE {alive_cond} GROUP BY colo").fetchall()
-            agg = {}
-            for colo, cnt in rows:
-                if not colo:
-                    continue
-                c = _country(colo)
-                if c:
-                    agg[c] = agg.get(c, 0) + cnt
-            overs = [(c, cnt - cap) for c, cnt in agg.items() if cnt > cap]
-            has_gap = any((cnt if colo else 0) < cap for colo, cnt in rows) or \
-                any(not colo for colo, _ in rows)
-            # 只有当仍有"闲余"空间(未超限国家或未归类IP)时才裁剪, 否则所有国家都满,
-            # 已是最优分布(总量=各国之和, 无法继续降占比), 停了避免慢性删光.
-            if overs and has_gap:
-                for ctry, n_del in overs:
-                    colos = [colo for colo, _ in rows
-                             if colo and _country(colo) == ctry]
-                    ph = ",".join(":c%d" % i for i in range(len(colos)))
-                    params = {"n": n_del}
-                    params.update({"c%d" % i: co for i, co in enumerate(colos)})
-                    conn.execute(
-                        f"DELETE FROM ips WHERE {alive_cond} AND colo IN ({ph}) AND ip IN "
-                        f"(SELECT ip FROM (SELECT ip FROM ips "
-                        f"WHERE {alive_cond} AND colo IN ({ph}) "
-                        f"ORDER BY score ASC, latency_ms ASC LIMIT :n))",
-                        params)
-                    pruned += n_del
-
-        # 第二: 存活数超限时按分数剪枝(只有超库容上限才需要)
-        if int(limit) > 0:
-            alive = conn.execute(f"SELECT COUNT(*) FROM ips WHERE {alive_cond}").fetchone()[0]
-            excess = alive - int(limit)
-            if excess > 0:
-                conn.execute("CREATE TEMP TABLE IF NOT EXISTS victims"
-                             "(ip TEXT PRIMARY KEY)")
-                conn.execute("DELETE FROM victims")
-                conn.execute(f"INSERT INTO victims(ip) SELECT ip FROM ips "
-                             f"WHERE {alive_cond} "
-                             f"ORDER BY score ASC, latency_ms ASC LIMIT :n",
-                             {"n": int(excess)})
-                conn.execute("DELETE FROM ips WHERE ip IN (SELECT ip FROM victims)")
-                pruned += excess
-
-    remaining = conn.execute("SELECT COUNT(*) FROM ips").fetchone()[0]
-    try:
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    except Exception:
-        pass
-    return pruned
+def prune_ips(conn, max_v4, max_v6, country_pct=0, target_active=0):
+    """兼容入口: 转交 cf_lifecycle.lifecycle_pass(剔除闭环). 返回剔除总数."""
+    stats, _def = cf_lifecycle.lifecycle_pass(
+        conn, max_v4, max_v6, country_pct, target_active)
+    return sum(stats.values())
 
 
 def fetch_networks(operator, port):
@@ -715,20 +632,23 @@ def net24(ip):
     return ".".join(ip.split(".")[:3])
 
 
-def fetch_hot24(path, limit=200, raw=False):
+def fetch_hot24(path, limit=200, raw=False, cap=cf_lifecycle.PER24_MAX):
+    """优质 v4 /24 邻域(按历史净成功加权). cap: 已达该前缀配额的 /24 不再返回,
+    避免"发现->超额->剔除"的空转(与生命周期去重联动)。"""
     try:
         conn = sqlite3.connect(path)
         q = (f"SELECT {N24_SQL} AS n, SUM(ok_count) g, SUM(fail_count) f, COUNT(*) c "
              f"FROM ips WHERE instr(ip, ':')=0 GROUP BY n "
-             f"ORDER BY (SUM(ok_count)-SUM(fail_count)) DESC, g DESC LIMIT ?")
-        rows = conn.execute(q, (limit,)).fetchall()
+             f"ORDER BY (SUM(ok_count)-SUM(fail_count)) DESC, g DESC")
+        rows = conn.execute(q).fetchall()
         conn.close()
     except Exception:
         return []
     hot = [(n, (g or 0), (f or 0), c) for n, g, f, c in rows]
     if raw:
         return hot
-    return [(n, max(1, g)) for n, g, f, c in hot if g and g >= 1]
+    hot = [(n, max(1, g)) for n, g, f, c in hot if g and g >= 1 and c < cap]
+    return hot[:limit]
 
 
 def fetch_due(path, limit, now=None):
@@ -749,14 +669,17 @@ def fetch_due(path, limit, now=None):
         return []
 
 
-def _maybe_refresh_health(conn, ttl=900):
-    """限频地把全库 score/next_check_at 按当前时间重算(新鲜度会随时间衰减)."""
+def _maybe_refresh_health(conn, target_active=0, ttl=120):
+    """限频地把全库 score/state/interval/next_check_at 重算.
+
+    新版会按分数排名: 每协议前 target_active 名 -> active(高频), 其余 -> reserve(低频)。
+    """
     now = time.time()
     row = conn.execute("SELECT value FROM meta WHERE key='score_refreshed_at'").fetchone()
     if row and now - row[0] < ttl:
         return
     try:
-        cf_health.health_refresh(conn, now)
+        cf_health.health_refresh(conn, now, target_active)
         conn.execute("INSERT INTO meta(key,value) VALUES('score_refreshed_at',?) "
                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (int(now),))
         conn.commit()
@@ -853,8 +776,9 @@ def v6_prefix(ip, hextets=3):
     return ":".join(parts[:hextets])
 
 
-def fetch_hot_v6(path, limit=400):
-    """从库内已存活 v6 聚合出优质 /48 邻域(按成功次数加权), 供发现时优先利用."""
+def fetch_hot_v6(path, limit=400, cap=cf_lifecycle.PER48_MAX):
+    """从库内已存活 v6 聚合出优质 /48 邻域(按成功次数加权), 供发现时优先利用.
+    cap: 已达该 /48 配额的邻域不再返回(与去重联动, 防止同 /48 反复超容/回填 churn)."""
     try:
         conn = sqlite3.connect(path)
         rows = conn.execute("SELECT ip, ok_count FROM ips WHERE instr(ip,':')>0 "
@@ -863,11 +787,14 @@ def fetch_hot_v6(path, limit=400):
     except Exception:
         return []
     agg = {}
+    cnt = {}
     for ip, ok in rows:
         p = v6_prefix(ip)
         agg[p] = agg.get(p, 0) + (ok or 0)
-    hot = sorted(agg.items(), key=lambda x: -x[1])[:limit]
-    return [(p, max(1, w)) for p, w in hot]
+        cnt[p] = cnt.get(p, 0) + 1
+    hot = [(p, w) for p, w in agg.items() if cnt.get(p, 0) < cap]
+    hot.sort(key=lambda x: -x[1])
+    return [(p, max(1, w)) for p, w in hot[:limit]]
 
 
 def discover_v6(nets6, count, ports, known, cooldown, hot48=None, exploit_frac=0.7):
@@ -1182,42 +1109,73 @@ async def run_session(nets, known, q, args, stop, nets6=None):
         await run_tasks([v(ip, p, lat, do_id, i)
                          for i, (ip, p, lat, do_id) in enumerate(pend)])
 
+    last_explore = {"t": 0.0}
+
     async def discovery_cycle():
         nonlocal verified
         verified = set()
         have_bw = None
         have_colo = set()
+        deficits = {}
+        next_due = None
+        due_count = 0
+        active_mode = True
+        explore = True
         v6_count = getattr(args, "count_v6", args.count)
-        bud = {"count": args.count if nets else 0, "count_v6": v6_count if nets6 else 0,
-               "verify": args.verify, "bench": args.bench, "recheck": args.recheck}
+        bud = {"count": 0, "count_v6": 0, "verify": args.verify,
+               "bench": args.bench, "recheck": args.recheck}
         try:
             conn_v = sqlite3.connect(args.db)
-            _maybe_refresh_health(conn_v)
-            # 动态平衡控制: IPv4/IPv6 各自评估, 饱和的转维护、未饱和的继续发现
+            _maybe_refresh_health(conn_v, getattr(args, "target_active", 0))
             target_active = getattr(args, "target_active", cf_policy.TARGET_ACTIVE)
             target_prefixes = getattr(args, "target_prefixes", cf_policy.TARGET_PREFIXES)
             force = getattr(args, "scan_mode", "auto") or "auto"
             modes = cf_policy.evaluate_all(conn_v, target_active=target_active,
                                            target_prefixes=target_prefixes, force=force)
             mi4, mi6 = modes["v4"], modes["v6"]
+            active_mode = any(m["mode"] != "maintenance" for m in (mi4, mi6))
+            deficits = cf_lifecycle.replenish_need(conn_v, target_active,
+                                                   args.max_ips_v4, args.max_ips_v6)
+            now = time.time()
+            reserve_tick = (now - last_explore["t"]) >= cf_policy.EXPLORE_INTERVAL
+            reserve_need = any(d["deficit_reserve"] > 0 for d in deficits.values())
+            active_need = any(d["deficit"] > 0 for d in deficits.values())
+            # 发现条件: 发现/恢复期, 或热缺口, 或(维护期且到点)补库容(备胎)
+            explore = active_mode or active_need or (reserve_need and reserve_tick)
+            # 纯值守: 无需发现 -> 不再有"轮"的概念
+            pure_monitor = (not active_mode) and (not explore)
             sb4 = cf_policy.shared_budget(mi4["mode"], args.verify, args.bench,
                                           args.recheck, mi4["active"])
             sb6 = cf_policy.shared_budget(mi6["mode"], args.verify, args.bench,
                                           args.recheck, mi6["active"])
+
+            def proto_count(key, mi, base, enabled):
+                if not enabled:
+                    return 0
+                if mi["mode"] != "maintenance":
+                    return cf_policy.scan_count(mi["mode"], base)     # 发现/恢复: 正常量
+                d = deficits.get(key, {})
+                if reserve_tick and d.get("deficit_reserve", 0) > 0:
+                    return max(30, int(base * 0.1))                    # 维护: 低频补备胎
+                return 0                                               # 维护且库容已满: 不发现
             bud = {
-                "count": cf_policy.scan_count(mi4["mode"], args.count) if nets else 0,
-                "count_v6": cf_policy.scan_count(mi6["mode"], v6_count) if nets6 else 0,
+                "count": proto_count("v4", mi4, args.count, bool(nets)),
+                "count_v6": proto_count("v6", mi6, v6_count, bool(nets6)),
                 "verify": max(sb4["verify"], sb6["verify"]),
                 "bench": max(sb4["bench"], sb6["bench"]) if (nets or nets6) else 0,
                 "recheck": max(sb4["recheck"], sb6["recheck"]),
             }
-            q.put({"type": "mode", "modes": modes, "budgets": bud,
+            next_due = conn_v.execute("SELECT MIN(next_check_at) FROM ips").fetchone()[0]
+            due_count = conn_v.execute(
+                "SELECT COUNT(*) FROM ips WHERE next_check_at<=?", (now,)).fetchone()[0]
+            q.put({"type": "mode", "modes": modes, "budgets": bud, "explore": explore,
+                   "deficits": deficits,
                    "active": mi4["active"] + mi6["active"],
                    "fresh": mi4["fresh"] + mi6["fresh"],
                    "prefixes": mi4["prefixes"] + mi6["prefixes"],
                    "yield": max(mi4["yield"], mi6["yield"]),
                    "mode": mi4["mode"] if mi4["mode"] != "maintenance" else mi6["mode"],
-                   "reason": f"v4 {mi4['mode']} / v6 {mi6['mode']}"})
+                   "reason": f"v4 {mi4['mode']} / v6 {mi6['mode']}" + (" +探索" if explore else "")})
             have_bw = set() if bud["bench"] > 0 else None
             for ip, okc, bw, colo, loc in conn_v.execute(
                     "SELECT ip, ok_count, bandwidth_mbps, colo, loc FROM ips"):
@@ -1230,33 +1188,72 @@ async def run_session(nets, known, q, args, stop, nets6=None):
             conn_v.close()
         except Exception:
             verified = set()
-        hot24 = fetch_hot24(args.db) if (nets and args.exploit > 0) else []
-        cands = discover(nets, hot24, bud["count"], ports, known, args.cooldown, args.exploit)
-        if nets6:
-            hot48 = fetch_hot_v6(args.db) if args.exploit > 0 else []
-            cands.extend(discover_v6(nets6, bud["count_v6"], ports, known,
-                                     args.cooldown, hot48, args.exploit))
-        backfill_ips = set()
-        if bud["recheck"] and not args.once:
-            for ip, p in fetch_due(args.db, bud["recheck"]):
+            explore = True
+
+        cands = []
+        seen = set()
+
+        def add_cand(ip, ports_seq):
+            if not ip or ip in seen:
+                return
+            seen.add(ip)
+            cands.append((ip, tuple(ports_seq)))
+
+        def seq_for(p):
+            return [p] + [x for x in ports if x != p]
+
+        # 1) 监控: 到期复测(每轮始终执行, 限速)
+        due_limit = min(cf_policy.MONITOR_BATCH,
+                        bud["recheck"] or cf_policy.MONITOR_BATCH)
+        if not args.once:
+            for ip, p in fetch_due(args.db, due_limit):
                 if ip in known:
                     known[ip] = time.time()
-                seq = [p] + [x for x in ports if x != p]
-                cands.append((ip, tuple(seq)))
+                add_cand(ip, seq_for(p))
+
+        # 2) 补充: 有缺口时优先提升 reserve(快速确认)
+        for key, is_v6 in (("v4", False), ("v6", True)):
+            d = (deficits.get(key) or {}).get("deficit", 0)
+            if d > 0:
+                for ip, p in cf_lifecycle.fetch_promote(args.db, is_v6, d, args.cooldown):
+                    if ip in known:
+                        known[ip] = time.time()
+                    add_cand(ip, seq_for(p))
+
+        # 3) 发现: 仅在探索期进行(避免库满后空扫); 邻域名单已排除超额前缀
+        if nets and bud["count"] > 0:
+            hot24 = fetch_hot24(args.db) if args.exploit > 0 else []
+            for ip, ps in discover(nets, hot24, bud["count"], ports, known,
+                                   args.cooldown, args.exploit):
+                add_cand(ip, ps)
+        if nets6 and bud["count_v6"] > 0:
+            hot48 = fetch_hot_v6(args.db) if args.exploit > 0 else []
+            for ip, ps in discover_v6(nets6, bud["count_v6"], ports, known,
+                                      args.cooldown, hot48, args.exploit):
+                add_cand(ip, ps)
+
+        # 4) 地区补全
+        backfill_ips = set()
         if getattr(args, "backfill", 0) and not args.once:
             for ip, p, _, _ in fetch_backfill(args.db, args.backfill, args.cooldown):
                 if ip in known:
                     known[ip] = time.time()
                 backfill_ips.add(ip)
-                seq = [p] + [x for x in ports if x != p]
-                cands.append((ip, tuple(seq)))
+                add_cand(ip, seq_for(p))
+
+        status = {"active_mode": active_mode, "explored": explore,
+                  "pure_monitor": pure_monitor, "next_due": next_due,
+                  "due": due_count, "deficits": deficits}
         if not cands:
-            return 0, [], bud
-        q.put({"type": "cycle_start", "total": len(cands)})
+            return 0, [], bud, status
+        if pure_monitor:
+            q.put({"type": "monitor", "checking": len(cands), "due": due_count,
+                   "next_due": next_due})
+        else:
+            q.put({"type": "cycle_start", "total": len(cands)})
         results = []
 
         async def probe_emit(ip, ps):
-            # 结果逐个回传(而不是整轮结束后一次性回传), 让进度条/统计实时推进
             r = await probe(ip, ps)
             if r and r[0]:
                 _, p, lat, alive = r
@@ -1273,22 +1270,23 @@ async def run_session(nets, known, q, args, stop, nets6=None):
             if alive and lat is not None and lat <= max_lat:
                 ok += 1
                 alive_list.append((ip, p, lat, ip in backfill_ips, ip not in have_colo))
-        # backfill(缺地区)优先; 已识别过地区的 IP 跳过 trace 识别(只做延迟/带宽), 大幅加速
         alive_list.sort(key=lambda r: (0 if r[3] else 1, r[2]))
         pend = [(ip, p, lat, need_id)
                 for ip, p, lat, _bf, need_id in alive_list[: bud["verify"]]]
         if bud["bench"] > 0 and have_bw is not None:
             pend = ([x for x in pend if x[0] not in have_bw]
                     + [x for x in pend if x[0] in have_bw])
-        return ok, pend, bud
+        return ok, pend, bud, status
+
+    async def sleep_interruptible(seconds):
+        slept = 0.0
+        while slept < seconds and not stop.is_set():
+            step = min(0.5, seconds - slept)
+            await asyncio.sleep(step)
+            slept += step
 
     async def gap_sleep():
-        waited = 0.0
-        while waited < args.gap:
-            if stop.is_set():
-                return
-            await asyncio.sleep(0.5)
-            waited += 0.5
+        await sleep_interruptible(args.gap)
 
     if args.reverify:
         conn_rev = open_db(args.db)
@@ -1306,22 +1304,45 @@ async def run_session(nets, known, q, args, stop, nets6=None):
         return
 
     if args.once:
-        ok, pend, bud = await discovery_cycle()
+        ok, pend, bud, _st = await discovery_cycle()
         if pend:
             await verify_batch(pend, bud["bench"])
         q.put({"type": "cycle_end", "ok": ok})
         return
 
     cycles = 0
+    last_life = 0.0
     while not stop.is_set():
         if args.cycles and cycles >= args.cycles:
             break
-        ok, pend, bud = await discovery_cycle()
+        ok, pend, bud, st = await discovery_cycle()
         if pend:
             await verify_batch(pend, bud["bench"])
-        q.put({"type": "cycle_end", "ok": ok})
-        cycles += 1
-        await gap_sleep()
+        if st["pure_monitor"]:
+            # 值守监控: 不计"轮", 不发 cycle_end; 定期做一次生命周期维护(剔除/补充判定)
+            if time.time() - last_life >= cf_policy.LIFE_INTERVAL:
+                q.put({"type": "lifecycle"})
+                last_life = time.time()
+            q.put({"type": "monitor_end", "checked": ok})
+        else:
+            q.put({"type": "cycle_end", "ok": ok})
+            cycles += 1
+        if st["explored"]:
+            last_explore["t"] = time.time()
+        # 节奏: 发现/恢复/探索期短歇; 纯监控期按 tick / 睡到下一个到期, 不空转
+        if st["active_mode"] or st["explored"]:
+            await sleep_interruptible(args.gap)
+        else:
+            nx = st["next_due"]
+            if st.get("due", 0) > 0:
+                wait = cf_policy.MONITOR_TICK
+            elif not nx:
+                wait = cf_policy.IDLE_CAP
+            else:
+                wait = max(cf_policy.MONITOR_TICK, min(nx - time.time(), cf_policy.IDLE_CAP))
+            wait = min(wait, max(2.0, cf_policy.EXPLORE_INTERVAL
+                                 - (time.time() - last_explore["t"])))
+            await sleep_interruptible(wait)
 
 
 def export_report(args):
@@ -1489,6 +1510,10 @@ def main():
                     help="动态平衡目标: 期望保有的可用IP数(默认60)")
     ap.add_argument("--target-prefixes", type=int, default=8, dest="target_prefixes",
                     help="动态平衡目标: 期望覆盖的独立前缀数(默认8)")
+    ap.add_argument("--per24-max", type=int, default=50, dest="per24_max",
+                    help="每个 v4 /24 最多保留(越小越多样; 默认50; 0=不限)")
+    ap.add_argument("--per48-max", type=int, default=100, dest="per48_max",
+                    help="每个 v6 /48 最多保留(默认100; 0=不限)")
     ap.add_argument("--once", action="store_true", help="只扫描一轮(发现+验证预算)后退出")
     ap.add_argument("--reverify", type=int, metavar="N", default=0,
                     help="复核模式: 重新探测库内现有最优的 N 个IP")
@@ -1592,21 +1617,35 @@ def main():
                 print(f"  策略: {' · '.join(parts)} | 本轮 抽样 v4:{bud.get('count')} "
                       f"v6:{bud.get('count_v6')} 复测:{bud.get('recheck')} "
                       f"({rec.get('reason', '')})", flush=True)
-            elif rec["type"] == "cycle_end":
+            elif rec["type"] == "monitor":
+                print(f"[{time.strftime('%H:%M:%S')}] 值守监控: 到期 {rec.get('due', 0)}, "
+                      f"本批检查 {rec.get('checking', 0)}", flush=True)
+            elif rec["type"] == "monitor_end":
+                pass
+            elif rec["type"] in ("cycle_end", "lifecycle"):
                 conn.commit()
                 pend = 0
-                print(banner(), f"| 本轮达标 {rec['ok']}", flush=True)
-                if (getattr(args, "max_ips_v4", 0) or getattr(args, "max_ips_v6", 0)
-                        or getattr(args, "country_pct", 0)):
-                    try:
-                        npruned = prune_ips(conn, args.max_ips_v4, args.max_ips_v6,
-                                            getattr(args, "country_pct", 0))
-                        conn.commit()
-                        if npruned:
-                            print(f"库内超限清理(国家均衡): 剔除 {npruned} 个低质量IP",
-                                  flush=True)
-                    except Exception as e:
-                        print(f"库清理失败: {e}", flush=True)
+                if rec["type"] == "cycle_end":
+                    print(banner(), f"| 本轮达标 {rec['ok']}", flush=True)
+                try:
+                    stats, deficits = cf_lifecycle.lifecycle_pass(
+                        conn, args.max_ips_v4, args.max_ips_v6,
+                        getattr(args, "country_pct", 0),
+                        getattr(args, "target_active", 0),
+                        getattr(args, "per24_max", None),
+                        getattr(args, "per48_max", None))
+                    conn.commit()
+                    ev = sum(stats.values())
+                    if ev:
+                        print(f"生命周期剔除: 失效{stats['dead']} 去重{stats['dedup']} "
+                              f"均衡{stats['balanced']} 超容{stats['capped']}", flush=True)
+                    d4 = deficits.get("v4", {})
+                    d6 = deficits.get("v6", {})
+                    print(f"  状态: v4 可用{d4.get('active',0)} 备用{d4.get('reserve',0)} "
+                          f"缺口{d4.get('deficit',0)} | v6 可用{d6.get('active',0)} "
+                          f"备用{d6.get('reserve',0)} 缺口{d6.get('deficit',0)}", flush=True)
+                except Exception as e:
+                    print(f"库清理失败: {e}", flush=True)
             elif rec["type"] == "done":
                 conn.commit()
                 print(banner(), flush=True)

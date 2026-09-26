@@ -19,11 +19,13 @@ import ipaddress
 import threading
 import time
 
-# ---- 判定阈值 ----
-ACTIVE_SCORE = 40.0                 # 质量分达到该值算"可用"
+import cf_health
+
+# ---- 判定阈值(与 cf_health 共用同一口径, 避免各算各的) ----
+ACTIVE_SCORE = cf_health.ACTIVE_SCORE       # 质量分达到该值算"可用"
+HEALTHY_WINDOW = cf_health.HEALTHY_ACTIVE_WINDOW
 TARGET_ACTIVE = 60                  # 期望保有的可用 IP 数(动态平衡目标, 按协议各算)
 TARGET_PREFIXES = 8                 # 期望覆盖的独立前缀数(抗单点/单路由故障)
-HEALTHY_WINDOW = 6 * 3600           # 可用 IP 在该时长内确认过才算"新鲜"
 YIELD_WINDOW = 1800                 # 统计边际发现收益的滑动窗口(秒)
 YIELD_MIN = 0.02                    # 每测 1 个 IP 新增有用 IP 比例低于此 -> 不值得继续大范围扫
 OVERFILL_MULT = 3                   # 可用数超过目标该倍数即视为"过量", 不再因发现率而继续扩张
@@ -35,6 +37,14 @@ MAINT_COUNT_FRACTION = 0.15         # 维护模式抽样数 = 基础抽样数 * 
 MAINT_VERIFY_MIN = 8
 MAINT_BENCH_MIN = 4
 RECOVERY_COUNT_FRACTION = 0.5
+
+# ---- 监控节奏(库满/平衡后, 事件驱动而非一轮轮空转) ----
+IDLE_CAP = 15 * 60                  # 无到期 IP 时最长休眠(秒)
+EXPLORE_INTERVAL = 15 * 60          # 维护模式下发现探索的最小间隔(秒)
+MONITOR_TICK = 60                   # 维护监控的最小节拍: 每 tick 处理一批到期 IP(秒)
+MONITOR_BATCH = 200                 # 每个 tick 最多处理的到期 IP 数(限速)
+LIFE_INTERVAL = 300                 # 纯监控期做一次生命周期维护(剔除/补充判定)的间隔(秒)
+DEFAULT_DEFICIT_ACTIVE = 200        # 未指定时的 active 目标(缺员即触发补充)
 
 MODES = ("discovery", "maintenance", "recovery")
 MODE_NAMES = {"discovery": "发现扩张", "maintenance": "健康维护", "recovery": "质量恢复"}
@@ -72,10 +82,10 @@ def _decide(is_v6, conn, now, target_active, target_prefixes, force):
     out = {"mode": "discovery", "active": 0, "fresh": 0, "prefixes": 0,
            "yield": 0.0, "overdue": 0, "reason": ""}
     try:
+        # 与生命周期/补充统一口径: active = state='active'(分数达标且近期确认过)
         rows = conn.execute(
-            f"SELECT ip, last_ok_at FROM ips "
-            f"WHERE ok_count>0 AND COALESCE(score,0)>=? AND {proto}",
-            (ACTIVE_SCORE,)).fetchall()
+            f"SELECT ip, last_ok_at FROM ips WHERE state=? AND {proto}",
+            (cf_health.STATE_ACTIVE,)).fetchall()
         active = len(rows)
         fresh = sum(1 for _, lok in rows if lok and now - lok < HEALTHY_WINDOW)
         prefixes = len({prefix_of(ip) for ip, _ in rows})
@@ -86,9 +96,8 @@ def _decide(is_v6, conn, now, target_active, target_prefixes, force):
             f"SELECT COUNT(*) FROM ips WHERE tested_at>? AND {proto}",
             (now - YIELD_WINDOW,)).fetchone()[0]
         new_active = conn.execute(
-            f"SELECT COUNT(*) FROM ips WHERE first_seen>? AND ok_count>0 "
-            f"AND COALESCE(score,0)>=? AND {proto}",
-            (now - YIELD_WINDOW, ACTIVE_SCORE)).fetchone()[0]
+            f"SELECT COUNT(*) FROM ips WHERE first_seen>? AND state=? AND {proto}",
+            (now - YIELD_WINDOW, cf_health.STATE_ACTIVE)).fetchone()[0]
         out.update(active=active, fresh=fresh, prefixes=prefixes, overdue=overdue)
         out["yield"] = round(new_active / max(1, probes), 4)
     except Exception as e:

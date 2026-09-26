@@ -53,10 +53,11 @@ from urllib.parse import parse_qs, urlparse
 
 import cf_db
 import cf_health
+import cf_lifecycle
 import cf_policy
 
 COV_TOTAL = sum(1 << (32 - int(r.split("/")[1])) for r in cf_db.FALLBACK_RANGES)
-VERSION = "2.8.2"
+VERSION = "2.9.4"
 
 COLO_COUNTRY = cf_db.COLO_COUNTRY
 
@@ -65,7 +66,7 @@ SETTINGS_KEYS = ["operator", "ports", "count", "concurrency", "verify", "bench",
                  "bench_parallel", "backfill", "recheck", "exploit", "max_latency", "tls_check",
                  "bench_host", "v4", "ipv6", "operator_v6", "count_v6", "v6_official",
                  "max_ips_v4", "max_ips_v6", "country_max_pct",
-                 "scan_mode", "target_active", "target_prefixes"]
+                 "scan_mode", "target_active", "target_prefixes", "per24_max", "per48_max"]
 
 
 def load_settings():
@@ -117,6 +118,8 @@ STATE = {
     "mode_yield": 0.0,
     "mode_reason": "",
     "budgets": {},
+    "lifecycle": {},
+    "monitor_due": 0,
     "log": [],
 }
 
@@ -491,6 +494,8 @@ def scan_args(params, db):
         scan_mode=str(flat.get("scan_mode", "auto") or "auto"),
         target_active=max(1, int(num("target_active", 60, int))),
         target_prefixes=max(1, int(num("target_prefixes", 8, int))),
+        per24_max=max(0, int(num("per24_max", 50, int))),
+        per48_max=max(0, int(num("per48_max", 100, int))),
         cycles=0, gap=max(1, num("gap", 5)), once=False, reverify=0,
     )
 
@@ -553,30 +558,47 @@ def scanner_worker(args):
                           f"v4:{bud.get('count')} v6:{bud.get('count_v6')} 复测:{bud.get('recheck')}")
             elif t == "cycle_start":
                 set_state(stage="probe", total=rec.get("total", 0), probed=0, ok_now=0)
-            elif t == "cycle_end":
+            elif t == "monitor":
+                # 值守监控: 一批到期 IP; 不计"轮"
+                set_state(stage="monitor", total=rec.get("checking", 0), probed=0,
+                          ok_now=0, monitor_due=rec.get("due", 0))
+            elif t == "monitor_end":
+                set_state(stage="monitor", probed=0, ok_now=0)
+            elif t in ("cycle_end", "lifecycle"):
                 flush()
                 try:
-                    _n = cf_db.prune_ips(conn, args.max_ips_v4, args.max_ips_v6,
-                                  getattr(args, "country_max_pct", 0))
-                    if _n:
-                        conn.commit()
-                        log_event(f"库内超限清理: 已剔除 {_n} 个低质量IP")
+                    stats, deficits = cf_lifecycle.lifecycle_pass(
+                        conn, args.max_ips_v4, args.max_ips_v6,
+                        getattr(args, "country_max_pct", 0),
+                        getattr(args, "target_active", 0),
+                        getattr(args, "per24_max", None),
+                        getattr(args, "per48_max", None))
+                    conn.commit()
+                    ev = sum(stats.values())
+                    if ev:
+                        log_event(f"生命周期剔除: 失效{stats['dead']} 去重{stats['dedup']} "
+                                  f"均衡{stats['balanced']} 超容{stats['capped']}")
+                    d4 = deficits.get("v4", {})
+                    d6 = deficits.get("v6", {})
+                    set_state(lifecycle={"v4": d4, "v6": d6})
                 except Exception as e:
                     log_event(f"库清理失败: {e}")
                     try:
                         conn.rollback()
                     except Exception:
                         pass
-                rnd = get_state()["round"] + 1
-                try:
-                    ver = conn.execute("SELECT COUNT(*) FROM ips WHERE verified_at IS NOT NULL").fetchone()[0]
-                    bw = conn.execute("SELECT COUNT(*) FROM ips WHERE bandwidth_mbps>0").fetchone()[0]
-                except Exception:
-                    ver = bw = 0
-                log_event(f"第{rnd}轮完成: 达标 {rec.get('ok', 0)} | "
-                          f"已验证地区 {ver} | 有带宽 {bw}")
-                set_state(round=rnd, last_ok=rec.get("ok", 0),
-                          last_cycle=time.time(), stage="idle", total=0, probed=0, ok_now=0)
+                if t == "cycle_end":
+                    rnd = get_state()["round"] + 1
+                    try:
+                        ver = conn.execute("SELECT COUNT(*) FROM ips WHERE verified_at IS NOT NULL").fetchone()[0]
+                        bw = conn.execute("SELECT COUNT(*) FROM ips WHERE bandwidth_mbps>0").fetchone()[0]
+                    except Exception:
+                        ver = bw = 0
+                    log_event(f"第{rnd}轮完成: 达标 {rec.get('ok', 0)} | "
+                              f"已验证地区 {ver} | 有带宽 {bw}")
+                    set_state(round=rnd, last_ok=rec.get("ok", 0),
+                              last_cycle=time.time(), stage="idle",
+                              total=0, probed=0, ok_now=0)
             elif t == "error":
                 flush()
                 log_event(f"错误: {rec.get('msg')}")
@@ -1806,6 +1828,8 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
           <div class="f"><label>优质C段比例<span class="tip">?<span class="pop">抽样时0-1比例的IP从历史优质C段(邻居表现好)里选. 0.6=6成优质邻域+4成随机</span></span></label><input id="exploit" type="number" step="0.1" value="0.6"></div>
           <div class="f"><label>IPv4库上限<span class="tip">?<span class="pop">IPv4超限后按健康分低者先剔除; 0=不限</span></span></label><input id="max_ips_v4" type="number" value="0"></div>
           <div class="f"><label>IPv6库上限<span class="tip">?<span class="pop">IPv6超限后按健康分低者先剔除; 0=不限</span></span></label><input id="max_ips_v6" type="number" value="0"></div>
+          <div class="f"><label>每/24保留数<span class="tip">?<span class="pop">每个 v4 /24 最多保留的 IP 数(多样性去重). 越小越分散、库越小; 0=不限</span></span></label><input id="per24_max" type="number" value="50"></div>
+          <div class="f"><label>每/48保留数<span class="tip">?<span class="pop">每个 v6 /48 最多保留的 IP 数(多样性去重). 越小越分散、库越小; 0=不限</span></span></label><input id="per48_max" type="number" value="100"></div>
           <div class="f"><label>单国家占比上限%<span class="tip">?<span class="pop">同一个国家(按CF机房归属映射)活跃IP最多占库的百分比, 让结果覆盖更多地区. 0=关闭; 超限后该国新IP不再新增, 并按质量先裁剪该国</span></span></label><input id="country_max_pct" type="number" value="30"></div>
           <div class="f"><label>扫描策略<span class="tip">?<span class="pop">auto=库达到动态平衡(可用数/前缀数达标且边际发现率低)后自动从"发现"转向"健康维护", 只做小比例探索+到期复测, 不空烧家宽; 也可手动固定为发现/维护/恢复</span></span></label>
             <select id="scan_mode"><option value="auto">自动(平衡后转维护)</option><option value="discovery">强制发现</option><option value="maintenance">强制维护</option><option value="recovery">强制恢复</option></select></div>
@@ -2414,6 +2438,7 @@ function saveSet(){
     bench_host:$("bench_host").value,
     max_ips_v4:$("max_ips_v4").value,max_ips_v6:$("max_ips_v6").value,
     country_max_pct:$("country_max_pct").value,
+    per24_max:$("per24_max").value,per48_max:$("per48_max").value,
     scan_mode:$("scan_mode").value,target_active:$("target_active").value,
     target_prefixes:$("target_prefixes").value,
     v4:$("v4_on").checked?"1":"0",
@@ -2431,7 +2456,7 @@ function loadSet(){
     if(!d||!Object.keys(d).length)return;
     if(d.operator!==undefined)$("operator").value=d.operator||"";
     ["ports","count","concurrency","verify","bench","bench_parallel","bench_host",
-     "backfill","recheck","exploit","max_latency","max_ips_v4","max_ips_v6","country_max_pct",
+     "backfill","recheck","exploit","max_latency","max_ips_v4","max_ips_v6","country_max_pct","per24_max","per48_max",
      "scan_mode","target_active","target_prefixes","operator_v6","count_v6"].forEach(k=>{
        const v=d[k];
        if(v!==undefined&&v!==null&&v!=="")$(k).value=v;
@@ -2492,19 +2517,25 @@ async function poll(){
     $("dbpath").textContent=st.db||""; $("ver").textContent=st.version||"?";
     const pill=$("pill");
     const mname=st.mode_name?" · "+st.mode_name:"";
-    if(st.running){pill.className="pill run";pill.textContent="扫描中"+mname+" · 第"+st.round+"轮 · 本轮达标 "+st.last_ok;
+    const mon=st.running&&st.stage==="monitor";
+    if(st.running){pill.className="pill run";
+      pill.textContent=(mon?"值守监控":"扫描中")+mname+(mon?(" · 到期 "+st.monitor_due):(" · 第"+st.round+"轮 · 本轮达标 "+st.last_ok));
       $("startBtn").disabled=true;$("stopBtn").disabled=false;}
     else{pill.className=st.msg.startsWith("错误")?"pill stop":"pill idle";
       pill.textContent=st.msg;$("startBtn").disabled=false;$("stopBtn").disabled=true;}
     const pf=$("progFill"), pl=$("progLabel");
-    const mstat=st.running?" · 可用"+st.active+"/新鲜"+st.fresh+"/前缀"+st.prefixes+" · 发现率"+(100*(st.mode_yield||0)).toFixed(1)+"%":"";
-    if(st.running&&st.total>0){
+    const mstat=" · 可用"+st.active+"/新鲜"+st.fresh+"/前缀"+st.prefixes;
+    if(mon){
+      pf.style.width="100%";pf.style.opacity=".5";
+      pl.textContent="值守监控中 · 每个IP按各自周期定时检查 · 当前到期 "+st.monitor_due+" 个"+mstat;
+    }else if(st.running&&st.total>0){
+      pf.style.opacity="";
       const pct=Math.min(100,Math.round(st.probed/st.total*100));
       pf.style.width=(pct||0.6)+"%";
       pl.textContent=(pct||0)+"% · 第"+(st.round+1)+"轮 已探测 "+st.probed+" / "+st.total+
         " · 本轮达标 "+st.ok_now+mstat;
-    }else if(st.running){pf.style.width="3%";pl.textContent="第"+(st.round+1)+"轮 准备中(发现IP/构造地址池)..."+mstat;}
-    else{pf.style.width="0";pl.textContent="当前未在扫描";}
+    }else if(st.running){pf.style.opacity="";pf.style.width="3%";pl.textContent="第"+(st.round+1)+"轮 准备中(发现IP/构造地址池)..."+mstat;}
+    else{pf.style.opacity="";pf.style.width="0";pl.textContent="当前未在扫描";}
     renderLog(st.log||[]);
     const s=await (await fetch("/api/stats")).json();
     STATS=s;

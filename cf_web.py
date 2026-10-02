@@ -57,7 +57,7 @@ import cf_lifecycle
 import cf_policy
 
 COV_TOTAL = sum(1 << (32 - int(r.split("/")[1])) for r in cf_db.FALLBACK_RANGES)
-VERSION = "2.12.2"
+VERSION = "2.13.2"
 
 COLO_COUNTRY = cf_db.COLO_COUNTRY
 

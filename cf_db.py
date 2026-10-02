@@ -403,6 +403,11 @@ def upsert(conn, rec, country_pct=0):
     verified = bool(colo)
     sc = cf_health.score(ok_count, fail_count, lat_v, bw_v, verified, last_ok_at, now)
     st = cf_health.classify(ok_count, fail_streak, sc, last_ok_at, now, verified)
+    if st == cf_health.STATE_ACTIVE:
+        # 热榜名次只能由 health_refresh 的排名决定(它带真实 target_active)。
+        # 单条 upsert 若自行提拔, 热榜会膨胀成"所有分数达标的IP"
+        # (实测 1371 条, 而目标是 500x2=1000), 且排序会被随机先后顺序带偏。
+        st = cf_health.STATE_RESERVE
     iv = cf_health.state_interval(st, sc, fail_streak, verified)
     nxt = cf_health.next_check_for(ip, st, sc, fail_streak, last_ok_at, last_fail_at,
                                    now, verified, now)
@@ -972,6 +977,21 @@ async def identify(ip, port, args, latency=None):
 # 10 万上限 -> 九成请求打空、新 IP 拿不到带宽 -> 榜单被旧数据钉死。
 # 这里用"每日尝试次数硬上限 + 连续失败暂停"把请求量锁在预算内。
 BENCH_FAIL_LIMIT = 8               # 连续多少轮颗粒无收才暂停测速
+# 当日计数以内存为权威(meta 只负责跨重启持久化): 扫描器的 commit 有延迟,
+# 每轮去读库会读到上一轮的旧值, 导致上限被突破一整轮(实测 100 -> 120)。
+_BENCH_MEM = {"day": "", "n": 0, "fails": 0, "pause": 0.0}
+
+
+def _load_bench_mem(db_path, now):
+    try:
+        conn = open_db(db_path)
+        m = _bench_meta(conn, now)
+        conn.close()
+    except Exception:
+        m = {}
+    _BENCH_MEM.update(day=m.get("bench_day", ""), n=int(m.get("bench_n") or 0),
+                      fails=int(m.get("bench_fails") or 0),
+                      pause=float(m.get("bench_pause") or 0))
 
 
 def _bench_meta(conn, now):
@@ -989,17 +1009,12 @@ def bench_quota(db_path, daily_limit, now=None):
     now = now or time.time()
     if not daily_limit or int(daily_limit) <= 0:
         return 10 ** 9
-    try:
-        conn = open_db(db_path)
-        m = _bench_meta(conn, now)
-        used = int(m.get("bench_n") or 0)
-        pause = float(m.get("bench_pause") or 0)
-        conn.close()
-    except Exception:
-        return int(daily_limit)
-    if now < pause:
+    today = time.strftime("%Y-%m-%d", time.localtime(now))
+    if _BENCH_MEM["day"] != today:
+        _load_bench_mem(db_path, now)
+    if now < _BENCH_MEM["pause"]:
         return 0
-    return max(0, int(daily_limit) - used)
+    return max(0, int(daily_limit) - _BENCH_MEM["n"])
 
 
 def bench_flush(conn, ok, fail, pause_secs, now=None, commit=False):
@@ -1030,6 +1045,7 @@ def bench_flush(conn, ok, fail, pause_secs, now=None, commit=False):
             conn.execute("INSERT INTO meta(key,value) VALUES(?,?) "
                          "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                          (k, v))
+        _BENCH_MEM.update(day=m["bench_day"], n=n, fails=fails, pause=pause)
         if commit:
             conn.commit()
     except Exception:

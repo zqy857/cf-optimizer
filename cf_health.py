@@ -39,12 +39,15 @@ PROBATION_STREAK = 2                # 连续失败达到该值 -> 进入观察
 STAGGER_JITTER = 0.15               # 到期时间抖动 ±15%, 让同周期 IP 错峰
 
 # ---- 质量分参考值 ----
-HEALTH_VERSION = 3                  # 评分/调度模型版本; 变更后启动时自动重算存量库
+HEALTH_VERSION = 4                  # 评分/调度模型版本; 变更后启动时自动重算存量库
 MAX_LAT = 1000.0                    # 延迟参考上限(ms): 0ms=>满分, >=1000ms=>0分
-TARGET_BW = 100.0                   # 带宽参考(Mbps): 达到即带宽项满分(开方衰减)
-W_AVAIL = 0.25                      # 可用率权重
-W_LAT = 0.35                        # 延迟权重
-W_BW = 0.40                         # 带宽权重(权重最高: 带宽未测不该算高分)
+TARGET_BW = 120.0                   # 带宽参考(Mbps): 达到即带宽项满分(幂衰减)
+# "带宽至上": 带宽是决定体感的首要指标, 故给到 0.60 绝对权重; 延迟/可用率退居
+# 次要(仍保留, 用来挡掉"带宽高但时通时断/延迟爆炸"的伪优 IP)。
+W_AVAIL = 0.15                      # 可用率权重
+W_LAT = 0.25                        # 延迟权重
+W_BW = 0.60                         # 带宽权重(最高, 主导排名)
+BW_EXP = 0.65                       # 带宽幂次(<1 拉开低带宽段的差距, >参考值即满分)
 VERIFIED_BONUS = 0.05               # 已识别地区加分
 COMPLETENESS_FLOOR = 0.55           # 数据完整度折扣下限
 COMPLETENESS_SPAN = 0.45            # 完整度对折扣的影响幅度
@@ -89,7 +92,7 @@ def base_score(ok_count, fail_count, latency, bandwidth, verified):
     av = availability(ok_count, fail_count)
     lat = 0.0 if latency is None else _clamp(1.0 - latency / MAX_LAT)
     if bandwidth:
-        bw = _clamp((bandwidth / TARGET_BW) ** 0.5)   # 开方: 高带宽边际收益递减
+        bw = _clamp((bandwidth / TARGET_BW) ** BW_EXP)   # 幂衰减: 低带宽段差距拉得更开
     else:
         bw = 0.0
     s = W_AVAIL * av + W_LAT * lat + W_BW * bw
@@ -227,11 +230,14 @@ def health_refresh(conn, now=None, target_active=0):
         idx = [i for i, r in enumerate(parsed) if ((":" in r[0]) == is6)]
         elig = sorted((i for i in idx if _eligible(parsed[i])),
                       key=lambda i: -parsed[i][3])
-        cap = target_active if target_active > 0 else len(elig)
-        active_set = set(elig[:cap])
+        # target_active<=0(例如评分版本升级后的全库重算)时不擅自提拔:
+        # 否则会把所有达标 IP 全标成 active, 热榜瞬间膨胀到上万条。
+        # 交给随后带真实 target 的 _maybe_refresh_health 去排名。
+        cap = target_active if target_active > 0 else 0
+        active_set = set(elig[:cap]) if cap else set()
         for i in idx:
             if parsed[i][8] is None:
-                parsed[i][8] = STATE_ACTIVE if i in active_set else STATE_RESERVE
+                parsed[i][8] = STATE_ACTIVE if (cap and i in active_set) else STATE_RESERVE
 
     updates = []
     for r in parsed:

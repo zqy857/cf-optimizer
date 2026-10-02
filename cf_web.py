@@ -57,7 +57,7 @@ import cf_lifecycle
 import cf_policy
 
 COV_TOTAL = sum(1 << (32 - int(r.split("/")[1])) for r in cf_db.FALLBACK_RANGES)
-VERSION = "2.12.1"
+VERSION = "2.12.2"
 
 COLO_COUNTRY = cf_db.COLO_COUNTRY
 
@@ -509,6 +509,17 @@ def scan_args(params, db):
     )
 
 
+def _bk(conn, args, rec):
+    """把本轮测速成功/失败数写回每日预算账本(必须复用扫描器的连接)。"""
+    ok, fail = rec.get("bench_ok"), rec.get("bench_fail")
+    if not (ok or fail):
+        return
+    try:
+        cf_db.bench_flush(conn, ok, fail, getattr(args, "bench_pause", 0))
+    except Exception:
+        pass
+
+
 def scanner_worker(args):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -583,6 +594,7 @@ def scanner_worker(args):
                     logstate["mon_at"] = time.time()
             elif t == "monitor_end":
                 set_state(stage="monitor", probed=0, ok_now=0)
+                _bk(conn, args, rec)
             elif t in ("cycle_end", "lifecycle"):
                 flush()
                 try:
@@ -616,6 +628,7 @@ def scanner_worker(args):
                     except Exception:
                         pass
                 if t == "cycle_end":
+                    _bk(conn, args, rec)
                     total = get_state().get("total", 0)
                     rnd = get_state()["round"] + 1
                     log_event(f"本轮完成 · 抽查 {total} 个，其中可用 {rec.get('ok', 0)} 个")

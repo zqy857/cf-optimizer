@@ -1002,15 +1002,18 @@ def bench_quota(db_path, daily_limit, now=None):
     return max(0, int(daily_limit) - used)
 
 
-def bench_flush(db_path, ok, fail, pause_secs, now=None):
-    """把本轮测速结果写回预算: 累计尝试次数; 连续颗粒无收则暂停一段时间。"""
+def bench_flush(conn, ok, fail, pause_secs, now=None, commit=False):
+    """把本轮测速结果写回预算: 累计尝试次数; 连续颗粒无收则暂停一段时间。
+
+    必须复用调用方的连接: 扫描器在整轮扫描期间持有写事务, 另开连接写 meta 会
+    直接 "database is locked"(WAL 也救不了写锁), 那样每日上限等于没生效。
+    """
     now = now or time.time()
     attempts = int(ok or 0) + int(fail or 0)
-    if attempts <= 0:
+    if attempts <= 0 or conn is None:
         return
     ok, fail = int(ok or 0), int(fail or 0)
     try:
-        conn = open_db(db_path)
         m = _bench_meta(conn, now)
         n = int(m.get("bench_n") or 0) + attempts
         fails = int(m.get("bench_fails") or 0)
@@ -1027,8 +1030,8 @@ def bench_flush(db_path, ok, fail, pause_secs, now=None):
             conn.execute("INSERT INTO meta(key,value) VALUES(?,?) "
                          "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                          (k, v))
-        conn.commit()
-        conn.close()
+        if commit:
+            conn.commit()
     except Exception:
         pass
 
@@ -1185,12 +1188,15 @@ async def run_session(nets, known, q, args, stop, nets6=None):
 
         await run_tasks([v(ip, p, lat, do_id, i)
                          for i, (ip, p, lat, do_id) in enumerate(pend)])
-        if bench_stat["ok"] or bench_stat["fail"]:
-            bench_flush(args.db, bench_stat["ok"], bench_stat["fail"],
-                        getattr(args, "bench_pause", 0))
-            bench_stat["ok"] = bench_stat["fail"] = 0
+
 
     last_explore = {"t": 0.0}
+
+    def _take_bench_stat():
+        """取出并清零本轮测速计数(交给上层用同一条连接写回 meta)."""
+        ok, fail = bench_stat["ok"], bench_stat["fail"]
+        bench_stat["ok"] = bench_stat["fail"] = 0
+        return ok, fail
 
     async def discovery_cycle():
         nonlocal verified
@@ -1445,7 +1451,9 @@ async def run_session(nets, known, q, args, stop, nets6=None):
         ok, pend, bud, _st = await discovery_cycle()
         if pend:
             await verify_batch(pend, bud["bench"])
-        q.put({"type": "cycle_end", "ok": ok})
+        _bok, _bfail = _take_bench_stat()
+        q.put({"type": "cycle_end", "ok": ok,
+               "bench_ok": _bok, "bench_fail": _bfail})
         return
 
     cycles = 0
@@ -1461,9 +1469,13 @@ async def run_session(nets, known, q, args, stop, nets6=None):
             if time.time() - last_life >= cf_policy.LIFE_INTERVAL:
                 q.put({"type": "lifecycle"})
                 last_life = time.time()
-            q.put({"type": "monitor_end", "checked": ok})
+            _bok, _bfail = _take_bench_stat()
+            q.put({"type": "monitor_end", "checked": ok,
+                   "bench_ok": _bok, "bench_fail": _bfail})
         else:
-            q.put({"type": "cycle_end", "ok": ok})
+            _bok, _bfail = _take_bench_stat()
+            q.put({"type": "cycle_end", "ok": ok,
+                   "bench_ok": _bok, "bench_fail": _bfail})
             cycles += 1
         if st["explored"]:
             last_explore["t"] = time.time()

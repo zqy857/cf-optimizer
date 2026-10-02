@@ -32,6 +32,10 @@ DEAD_SILENCE = 7 * 86400        # 失效 IP 静默
 # 想要严格多样(每 /24 仅留 3、每 /48 仅留 8)可在设置里调小。
 PER24_MAX = 50                  # 每个 v4 /24 最多保留
 PER48_MAX = 100                 # 每个 v6 /48 最多保留
+# 换血节流: 观测到每轮"地区均衡"能裁掉 170+ 个、整轮换血 300+, 而一轮只测 20 个带宽,
+# 库 5 天就整体换一遍 -> IP 站不住、榜单一直翻新。给裁剪加每轮上限与库容滞回。
+BALANCE_TRIM_PCT = 0.3          # 地区均衡每轮最多裁掉存活数的千分之三(0.3%)
+CAP_SLACK = 1.05                # 库容滞回: 超过 上限*1.05 才裁, 避免顶格时"插一个删一个"
 GRAVE_EXPIRE_DAYS = 30
 GRAVE_MAX_ROWS = 200000
 
@@ -74,10 +78,13 @@ def _select_victims(conn, cond, limit, extra_order=""):
 
 
 def lifecycle_pass(conn, max_v4, max_v6, country_pct, target_active=0,
-                   per24=None, per48=None, now=None):
+                   per24=None, per48=None, now=None,
+                   balance_trim_pct=None, cap_slack=None):
     """一轮生命周期维护(剔除 + 计算补充缺口). 返回 (stats, deficits)."""
     per24 = int(per24) if per24 else PER24_MAX
     per48 = int(per48) if per48 else PER48_MAX
+    trim_pct = float(balance_trim_pct) if balance_trim_pct is not None else BALANCE_TRIM_PCT
+    slack = float(cap_slack) if cap_slack else CAP_SLACK
     now = now or time.time()
     stats = {"dead": 0, "dedup": 0, "balanced": 0, "capped": 0}
     _purge_graveyard(conn, now)
@@ -140,6 +147,10 @@ def lifecycle_pass(conn, max_v4, max_v6, country_pct, target_active=0,
                     or any(not colo for colo, _ in rows)
                 if not overs or not has_gap:
                     continue
+                # 每轮裁剪上限: 一次最多裁掉存活数的 trim_pct%, 其余留到后面的轮次,
+                # 避免"一轮砍掉 170+ 个"造成剧烈换血
+                budget = max(1, int(alive * trim_pct / 100.0))
+                overs = [(c, min(n, budget)) for c, n in overs]
                 for ctry, n_del in overs:
                     colos = [colo for colo, _ in rows
                              if colo and country(colo) == ctry]
@@ -166,7 +177,10 @@ def lifecycle_pass(conn, max_v4, max_v6, country_pct, target_active=0,
             continue
         alive = conn.execute(
             f"SELECT COUNT(*) FROM ips WHERE {proto}").fetchone()[0] or 0
-        excess = alive - int(limit)
+        # 滞回: 顶格时每插一个就裁一个, 等于每轮强制换血。留出slack 带,
+        # 只在明显超限时才裁(用户也可以直接把上限调大)。
+        soft = int(int(limit) * slack)
+        excess = alive - max(int(limit), soft)
         if excess <= 0:
             continue
         victims = _select_victims(conn, proto, excess)

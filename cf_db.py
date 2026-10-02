@@ -82,6 +82,10 @@ OPERATOR_URLS = {
     "cmcc": "https://raw.githubusercontent.com/cmliu/cmliu/main/CF-CIDR/cmcc.txt",
 }
 OPERATOR_NAMES = {"cf": "CF官方优选", "ct": "电信优选", "cu": "联通优选", "cmcc": "移动优选"}
+# 单轮抽样里每个前缀最多贡献几个候选: 不加限制时, "优质邻域利用"会把整轮候选
+# 都堆到少数几个前缀上(实测 v6 有 233 个 /48 在反复出票), 库看起来高度雷同。
+PER24_PER_ROUND = 3                # 每个 v4 /24 单轮最多 3 个
+PER48_PER_ROUND = 4                # 每个 v6 /48 单轮最多 4 个
 TRACE_HOST = "cloudflare.com"
 SPEED_HOST = "speed.cloudflare.com"
 PORTS_DEFAULT = [443, 2053, 2083, 8443]
@@ -632,7 +636,7 @@ def net24(ip):
     return ".".join(ip.split(".")[:3])
 
 
-def fetch_hot24(path, limit=200, raw=False, cap=cf_lifecycle.PER24_MAX):
+def fetch_hot24(path, limit=80, raw=False, cap=cf_lifecycle.PER24_MAX):
     """优质 v4 /24 邻域(按历史净成功加权). cap: 已达该前缀配额的 /24 不再返回,
     避免"发现->超额->剔除"的空转(与生命周期去重联动)。"""
     try:
@@ -737,16 +741,18 @@ def discover(nets, hot24, count, ports, known, cooldown, exploit_frac):
     hot_w = [w for _, w in hot24]
     hot_total = sum(hot_w)
 
+    from_pre = {}
     for _ in range(n_exploit):
         if hot_total <= 0:
             break
         pre = random.choices(hot_pre, weights=hot_w)[0]
-        if pre in exhausted:
+        if pre in exhausted or from_pre.get(pre, 0) >= PER24_PER_ROUND:
             continue
         ip = take_ip(pre, count, skip_known=False)
         if ip is None:
             exhausted.add(pre)
             continue
+        from_pre[pre] = from_pre.get(pre, 0) + 1
         known[ip] = now
         cands.append((ip, tuple(ports)))
 
@@ -776,7 +782,7 @@ def v6_prefix(ip, hextets=3):
     return ":".join(parts[:hextets])
 
 
-def fetch_hot_v6(path, limit=400, cap=cf_lifecycle.PER48_MAX):
+def fetch_hot_v6(path, limit=60, cap=cf_lifecycle.PER48_MAX):
     """从库内已存活 v6 聚合出优质 /48 邻域(按成功次数加权), 供发现时优先利用.
     cap: 已达该 /48 配额的邻域不再返回(与去重联动, 防止同 /48 反复超容/回填 churn)."""
     try:
@@ -836,14 +842,18 @@ def discover_v6(nets6, count, ports, known, cooldown, hot48=None, exploit_frac=0
         pre = [p for p, _ in hot48]
         w = [x for _, x in hot48]
         added = tries = 0
-        while added < n_exploit and len(cands) < count and tries < n_exploit * 4:
+        from_p48 = {}
+        while added < n_exploit and len(cands) < count and tries < n_exploit * 6:
             tries += 1
             p = random.choices(pre, weights=w)[0]
+            if from_p48.get(p, 0) >= PER48_PER_ROUND:
+                continue
             try:
                 net = ipaddress.ip_network(p + "::/48")
             except ValueError:
                 continue
             if add(str(random_ip_in_net(net))):
+                from_p48[p] = from_p48.get(p, 0) + 1
                 added += 1
 
     big = [n for n in nets6 if n.prefixlen < 64]
@@ -956,9 +966,76 @@ async def identify(ip, port, args, latency=None):
             "bandwidth": None, "colo": colo or "UNK", "loc": loc or "UNK"}
 
 
+# ---- 测速请求预算 ----------------------------------------------------
+# 每测 1 个 IP 要打 bench_parallel 次 Worker 请求; 失败(降档/超时/无数据)同样计费。
+# 观测: bench=20/轮 x ~850 轮/天 x 6 流 ~= 10.2 万请求/天, 正好撞 Worker 每日
+# 10 万上限 -> 九成请求打空、新 IP 拿不到带宽 -> 榜单被旧数据钉死。
+# 这里用"每日尝试次数硬上限 + 连续失败暂停"把请求量锁在预算内。
+BENCH_FAIL_LIMIT = 8               # 连续多少轮颗粒无收才暂停测速
+
+
+def _bench_meta(conn, now):
+    """读取测速预算状态; 跨天自动清零当日计数。"""
+    m = {k: v for k, v in conn.execute(
+        "SELECT key,value FROM meta WHERE key LIKE 'bench%'")}
+    today = time.strftime("%Y-%m-%d", time.localtime(now))
+    if m.get("bench_day") != today:
+        m["bench_day"], m["bench_n"] = today, 0
+    return m
+
+
+def bench_quota(db_path, daily_limit, now=None):
+    """本轮还允许测几个 IP(按当日累计"尝试"次数算, 失败也消耗请求额度)。"""
+    now = now or time.time()
+    if not daily_limit or int(daily_limit) <= 0:
+        return 10 ** 9
+    try:
+        conn = open_db(db_path)
+        m = _bench_meta(conn, now)
+        used = int(m.get("bench_n") or 0)
+        pause = float(m.get("bench_pause") or 0)
+        conn.close()
+    except Exception:
+        return int(daily_limit)
+    if now < pause:
+        return 0
+    return max(0, int(daily_limit) - used)
+
+
+def bench_flush(db_path, ok, fail, pause_secs, now=None):
+    """把本轮测速结果写回预算: 累计尝试次数; 连续颗粒无收则暂停一段时间。"""
+    now = now or time.time()
+    attempts = int(ok or 0) + int(fail or 0)
+    if attempts <= 0:
+        return
+    ok, fail = int(ok or 0), int(fail or 0)
+    try:
+        conn = open_db(db_path)
+        m = _bench_meta(conn, now)
+        n = int(m.get("bench_n") or 0) + attempts
+        fails = int(m.get("bench_fails") or 0)
+        pause = float(m.get("bench_pause") or 0)
+        if fail == 0 and ok > 0:
+            fails = 0                      # 本轮全部成功 -> 清零失败计数
+        elif ok == 0 and fail > 0:
+            fails += 1                     # 本轮颗粒无收 -> 累加
+        if fails >= BENCH_FAIL_LIMIT and pause_secs:
+            pause = now + float(pause_secs)
+            fails = 0
+        for k, v in (("bench_day", m["bench_day"]), ("bench_n", n),
+                     ("bench_fails", fails), ("bench_pause", pause)):
+            conn.execute("INSERT INTO meta(key,value) VALUES(?,?) "
+                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                         (k, v))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
 async def bench_bandwidth(ip, port, args, parallel=4):
     parallel = max(1, getattr(args, "bench_parallel", parallel) or parallel)
-    size = max(1_000_000, min(args.bench_size, 80_000_000))
+    size = max(1_000_000, min(args.bench_size, 300_000_000))
     host = getattr(args, "bench_host", SPEED_HOST) or SPEED_HOST
     timeout = args.bench_timeout
     begin = time.perf_counter()
@@ -1015,15 +1092,9 @@ async def bench_bandwidth(ip, port, args, parallel=4):
     items = [b for b in bodies if isinstance(b, tuple) and b[0] and b[1] is not None]
     total = sum(b[0] for b in items)
     if total < 100_000:
-        # 大档位+高并发可能被测速端限流(实测 6×30MB 常失败, 8MB 稳定);
-        # 失败时自动降档重试一次(更小体积 + 更少并发), 显著提升带宽测量命中率。
-        if size > 3_000_000:
-            ns2 = types.SimpleNamespace(
-                bench_size=max(2_000_000, size // 4),
-                bench_timeout=timeout,
-                bench_parallel=max(2, parallel // 2),
-                bench_host=host)
-            return await bench_bandwidth(ip, port, ns2)
+        # 不再降档重试: 降档后的可测上限只有原来的 1/8, 写进同一个带宽字段会污染数据;
+        # 且重试会多花一倍 Worker 请求。失败就当没测到(返回 None),
+        # 由 bench_quota 统一算请求预算 + bench_fail_streak 统一做失败退避。
         return None
     w0 = min(b[1] for b in items)
     w1 = max(b[2] for b in items)
@@ -1068,6 +1139,8 @@ async def run_session(nets, known, q, args, stop, nets6=None):
                         out[idx] = None
         return out
 
+    bench_stat = {"ok": 0, "fail": 0}
+
     async def verify_one(ip, p, lat, do_bench, do_id=True):
         args_ns = types.SimpleNamespace(bench_size=args.bench_size,
                                         bench_timeout=args.bench_timeout,
@@ -1088,6 +1161,10 @@ async def run_session(nets, known, q, args, stop, nets6=None):
                 bw = await bench_bandwidth(ip, p, args_ns)
             except Exception:
                 bw = None
+            if isinstance(bw, (int, float)) and bw > 0:
+                bench_stat["ok"] += 1
+            else:
+                bench_stat["fail"] += 1
         rec = {"type": "result", "ip": ip, "port": p, "ok": True,
                "latency": lat, "colo": colo, "loc": loc, "bandwidth": bw,
                "tested_at": time.time()}
@@ -1108,14 +1185,19 @@ async def run_session(nets, known, q, args, stop, nets6=None):
 
         await run_tasks([v(ip, p, lat, do_id, i)
                          for i, (ip, p, lat, do_id) in enumerate(pend)])
+        if bench_stat["ok"] or bench_stat["fail"]:
+            bench_flush(args.db, bench_stat["ok"], bench_stat["fail"],
+                        getattr(args, "bench_pause", 0))
+            bench_stat["ok"] = bench_stat["fail"] = 0
 
     last_explore = {"t": 0.0}
 
     async def discovery_cycle():
         nonlocal verified
         verified = set()
-        have_bw = None
         have_colo = set()
+        bw_info = {}
+        active_set = set()
         deficits = {}
         next_due = None
         due_count = 0
@@ -1130,8 +1212,11 @@ async def run_session(nets, known, q, args, stop, nets6=None):
             target_active = getattr(args, "target_active", cf_policy.TARGET_ACTIVE)
             target_prefixes = getattr(args, "target_prefixes", cf_policy.TARGET_PREFIXES)
             force = getattr(args, "scan_mode", "auto") or "auto"
-            modes = cf_policy.evaluate_all(conn_v, target_active=target_active,
-                                           target_prefixes=target_prefixes, force=force)
+            modes = cf_policy.evaluate_all(
+                conn_v, target_active=target_active,
+                target_prefixes=target_prefixes, force=force,
+                max_v4=int(getattr(args, "max_ips_v4", 0) or 0),
+                max_v6=int(getattr(args, "max_ips_v6", 0) or 0))
             mi4, mi6 = modes["v4"], modes["v6"]
             active_mode = any(m["mode"] != "maintenance" for m in (mi4, mi6))
             deficits = cf_lifecycle.replenish_need(conn_v, target_active,
@@ -1189,18 +1274,29 @@ async def run_session(nets, known, q, args, stop, nets6=None):
                    "yield": max(mi4["yield"], mi6["yield"]),
                    "mode": mi4["mode"] if mi4["mode"] != "maintenance" else mi6["mode"],
                    "reason": f"v4 {mi4['mode']} / v6 {mi6['mode']}" + (" +探索" if explore else "")})
-            have_bw = set() if bud["bench"] > 0 else None
-            for ip, okc, bw, colo, loc in conn_v.execute(
-                    "SELECT ip, ok_count, bandwidth_mbps, colo, loc FROM ips"):
+            # 请求预算: 当日测速次数用完/处于失败暂停期 -> 本轮不测带宽(只探测)
+            _daily = int(getattr(args, "bench_daily", 0) or 0)
+            if _daily > 0 and bud["bench"] > 0:
+                _left = bench_quota(args.db, _daily)
+                if _left < bud["bench"]:
+                    bud["bench"] = _left
+            bw_info = {}
+            active_set = set()
+            for ip, okc, bw, bwa, colo, loc, st in conn_v.execute(
+                    "SELECT ip, ok_count, bandwidth_mbps, bw_last_at, colo, loc, "
+                    "COALESCE(state,'') FROM ips"):
                 if okc and okc > 0:
                     verified.add(ip)
-                if have_bw is not None and bw is not None:
-                    have_bw.add(ip)
+                bw_info[ip] = (bw, bwa)
+                if st == cf_health.STATE_ACTIVE:
+                    active_set.add(ip)
                 if colo and loc:
                     have_colo.add(ip)
             conn_v.close()
         except Exception:
             verified = set()
+            bw_info = {}
+            active_set = set()
             explore = True
 
         cands = []
@@ -1286,9 +1382,38 @@ async def run_session(nets, known, q, args, stop, nets6=None):
         alive_list.sort(key=lambda r: (0 if r[3] else 1, r[2]))
         pend = [(ip, p, lat, need_id)
                 for ip, p, lat, _bf, need_id in alive_list[: bud["verify"]]]
-        if bud["bench"] > 0 and have_bw is not None:
-            pend = ([x for x in pend if x[0] not in have_bw]
-                    + [x for x in pend if x[0] in have_bw])
+        if bud["bench"] > 0:
+            # 测速优先级(小=先测):
+            #   0 从没测过带宽 / 1 active 且数据已过期 / 2 其他过期 / 3 数据还新鲜
+            # 原来是"没测过的优先、测过的一律排最后", 导致老数据的旧量程值
+            # 永远得不到刷新, 带宽项对所有人失去区分度。
+            _stale = float(getattr(args, "bw_stale_hours", 24) or 0) * 3600
+            _nowb = time.time()
+
+            def bench_prio(x, _bi=bw_info, _as=active_set, _st=_stale, _nw=_nowb):
+                b = _bi.get(x[0])
+                if not b or not b[0]:
+                    return 0
+                if _st <= 0 or (_nw - (b[1] or 0)) < _st:
+                    return 3
+                return 1 if x[0] in _as else 2
+
+            # 分档后按 2:1 交错(新测 2 个 / 刷新过期 1 个):
+            # 纯排序会让"从没测过的"(全库有 7500 个)把名额全占光,
+            # active 的过期数据永远排不上 -> 榜单又被旧量程值钉死。
+            p0, p12, p3 = [], [], []
+            for x in pend:
+                    g = bench_prio(x)
+                    (p0 if g == 0 else p12 if g in (1, 2) else p3).append(x)
+            mixed = []
+            i = j = 0
+            while i < len(p0) or j < len(p12):
+                for _ in range(2):
+                    if i < len(p0):
+                        mixed.append(p0[i]); i += 1
+                if j < len(p12):
+                    mixed.append(p12[j]); j += 1
+            pend = mixed + p3
         return ok, pend, bud, status
 
     async def sleep_interruptible(seconds):
@@ -1506,9 +1631,18 @@ def main():
                     help="每轮到期复测数量(按健康度分层调度: 优质IP勤测, 失败退避; 默认30; 0=关闭)")
     ap.add_argument("--backfill", type=int, default=0,
                     help="每轮为'存活但缺地区(colo/loc)'的旧IP补全地区识别数量(默认0; GUI默认开启)")
-    ap.add_argument("--bench-size", type=int, default=12_000_000)
-    ap.add_argument("--bench-timeout", type=float, default=12)
-    ap.add_argument("--bench-parallel", type=int, default=4)
+    ap.add_argument("--bench-size", type=int, default=64_000_000,
+                    help="每流下载量(字节)。可测上限=size*parallel*8/timeout")
+    ap.add_argument("--bench-timeout", type=float, default=15)
+    ap.add_argument("--bench-parallel", type=int, default=8,
+                    help="并行流数。单流约 39Mbps, 8流可达 188Mbps; "
+                         "注意: 每流=一个 Worker 请求, 并行越高请求越多")
+    ap.add_argument("--bench-daily", type=int, default=100,
+                    help="每日测速 IP 数硬上限(请求预算; 失败也算额度; 0=不限)")
+    ap.add_argument("--bench-pause", type=int, default=1800,
+                    help="测速连续失败达阈值后暂停测速的秒数(防空打 Worker)")
+    ap.add_argument("--bw-stale-hours", type=float, default=24,
+                    help="带宽数据超过这个小时就当没测过, 优先重测(避免旧量程数据永久霸榜)")
     ap.add_argument("--cycles", type=int, default=0, help="扫描轮数限制, 0=无限")
     ap.add_argument("--max-ips-v4", type=int, default=0, dest="max_ips_v4",
                     help="IPv4 库上限(0=不限)")

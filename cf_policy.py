@@ -46,6 +46,9 @@ MONITOR_TICK = 60                   # 维护监控的最小节拍: 每 tick 处�
 MONITOR_BATCH = 200                 # 每个 tick 最多处理的到期 IP 数(限速)
 LIFE_INTERVAL = 300                 # 纯监控期做一次生命周期维护(剔除/补充判定)的间隔(秒)
 FILL_FRACTION = 0.3                 # "填充库容"阶段: 每轮抽样 = 基础抽样数 * 该比例(温和但持续, 直到达上限)
+FILL_WATERMARK = 0.9                # 库容低于 上限*该比例 时回到填充阶段(温和补库, 不做无谓的整轮扩张)
+                                  # 注意: 模式判定只看"可用数/前缀数", 库容只决定"补多少",
+                                  # 二者解耦后就不会出现"删一批->掉出上限->切发现->再删"的抖动
 DEFAULT_DEFICIT_ACTIVE = 200        # 未指定时的 active 目标(缺员即触发补充)
 
 MODES = ("discovery", "maintenance", "recovery")
@@ -81,10 +84,10 @@ def set_mode(mode):
                 _STATE[p]["inited"] = True
 
 
-def _decide(is_v6, conn, now, target_active, target_prefixes, force):
+def _decide(is_v6, conn, now, target_active, target_prefixes, force, total_limit=0):
     proto = "ip LIKE '%:%'" if is_v6 else "ip NOT LIKE '%:%'"
     out = {"mode": "discovery", "active": 0, "fresh": 0, "prefixes": 0,
-           "yield": 0.0, "overdue": 0, "reason": ""}
+           "yield": 0.0, "overdue": 0, "total": 0, "reason": ""}
     try:
         # 与生命周期/补充统一口径: active = state='active'(分数达标且近期确认过)
         rows = conn.execute(
@@ -102,7 +105,10 @@ def _decide(is_v6, conn, now, target_active, target_prefixes, force):
         new_active = conn.execute(
             f"SELECT COUNT(*) FROM ips WHERE first_seen>? AND state=? AND {proto}",
             (now - YIELD_WINDOW, cf_health.STATE_ACTIVE)).fetchone()[0]
-        out.update(active=active, fresh=fresh, prefixes=prefixes, overdue=overdue)
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM ips WHERE {proto}").fetchone()[0] or 0
+        out.update(active=active, fresh=fresh, prefixes=prefixes, overdue=overdue,
+                   total=total)
         out["yield"] = round(new_active / max(1, probes), 4)
     except Exception as e:
         out["reason"] = f"evaluate failed: {e}"
@@ -111,8 +117,12 @@ def _decide(is_v6, conn, now, target_active, target_prefixes, force):
     active, fresh = out["active"], out["fresh"]
     degraded = active > 0 and fresh < active * DEGRADE_RATIO
     need_more = active < target_active or out["prefixes"] < target_prefixes
+    need_fill = bool(total_limit and int(total_limit) > 0
+                     and out["total"] < int(total_limit) * FILL_WATERMARK)
     if need_more:
         want, why = "discovery", "未达目标"
+    elif need_fill:
+        want, why = "discovery", f"库容 {out['total']}<{int(total_limit * FILL_WATERMARK)}(温和补库)"
     elif target_active > 0:
         # 有明确目标: 达标即转维护(不再因"发现率"一直挖), 备胎由维护期低频补
         if degraded:
@@ -160,10 +170,12 @@ def _decide(is_v6, conn, now, target_active, target_prefixes, force):
 
 
 def evaluate_all(conn, now=None, target_active=TARGET_ACTIVE,
-                 target_prefixes=TARGET_PREFIXES, force="auto"):
+                 target_prefixes=TARGET_PREFIXES, force="auto",
+                 max_v4=0, max_v6=0):
     """分别评估 IPv4 / IPv6 的库健康与应处模式(各带迟滞). 返回 {'v4':info,'v6':info}."""
     now = now or time.time()
-    return {p: _decide(p == "v6", conn, now, target_active, target_prefixes, force)
+    return {p: _decide(p == "v6", conn, now, target_active, target_prefixes, force,
+                       total_limit=(max_v6 if p == "v6" else max_v4))
             for p in PROTOS}
 
 

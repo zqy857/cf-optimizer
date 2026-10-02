@@ -1218,6 +1218,7 @@ async def run_session(nets, known, q, args, stop, nets6=None):
         nonlocal verified
         verified = set()
         have_colo = set()
+        stale_colo = set()
         bw_info = {}
         active_set = set()
         deficits = {}
@@ -1304,19 +1305,30 @@ async def run_session(nets, known, q, args, stop, nets6=None):
                     bud["bench"] = _left
             bw_info = {}
             active_set = set()
-            for ip, okc, bw, bwa, colo, loc, st in conn_v.execute(
+            # colo 是"当时接入路径"的快照, 会随路由变化漂移(实测 SIN→HKG、
+            # DFW/SYD→LAX、AMS→CDG、TPE→HKG)。已识别过的 IP 若永不重认, 地区
+            # 数据会越来越陈旧, 而地区均衡还在拿它分组 -> 每轮都在按过期信息
+            # 删IP。识别走 cloudflare.com 的 trace(不占 Worker 配额), 代价极低,
+            # 所以按 colo_stale_days 做保鲜重认。
+            _id_stale = float(getattr(args, "colo_stale_days", 7) or 0) * 86400
+            _now_id = time.time()
+            for ip, okc, bw, bwa, colo, loc, st, vat in conn_v.execute(
                     "SELECT ip, ok_count, bandwidth_mbps, bw_last_at, colo, loc, "
-                    "COALESCE(state,'') FROM ips"):
+                    "COALESCE(state,''), COALESCE(verified_at,0) FROM ips"):
                 if okc and okc > 0:
                     verified.add(ip)
                 bw_info[ip] = (bw, bwa)
                 if st == cf_health.STATE_ACTIVE:
                     active_set.add(ip)
                 if colo and loc:
-                    have_colo.add(ip)
+                    if _id_stale and (not vat or _now_id - vat > _id_stale):
+                        stale_colo.add(ip)      # 数据过期 -> 本轮复测时顺便重认
+                    else:
+                        have_colo.add(ip)
             conn_v.close()
         except Exception:
             verified = set()
+            stale_colo = set()
             bw_info = {}
             active_set = set()
             explore = True
@@ -1400,7 +1412,9 @@ async def run_session(nets, known, q, args, stop, nets6=None):
         for ip, p, lat, alive in results:
             if alive and lat is not None and lat <= max_lat:
                 ok += 1
-                alive_list.append((ip, p, lat, ip in backfill_ips, ip not in have_colo))
+                # 需要识别: 从没识别过 / colo 数据已过期 / 本来就在补全名单里
+                _need_id = ip in stale_colo or ip not in have_colo
+                alive_list.append((ip, p, lat, ip in backfill_ips, _need_id))
         alive_list.sort(key=lambda r: (0 if r[3] else 1, r[2]))
         pend = [(ip, p, lat, need_id)
                 for ip, p, lat, _bf, need_id in alive_list[: bud["verify"]]]
@@ -1669,6 +1683,9 @@ def main():
                     help="每日测速 IP 数硬上限(请求预算; 失败也算额度; 0=不限)")
     ap.add_argument("--bench-pause", type=int, default=1800,
                     help="测速连续失败达阈值后暂停测速的秒数(防空打 Worker)")
+    ap.add_argument("--colo-stale-days", type=float, default=7,
+                    help="机房/地区识别结果的保鲜天数; 超期复测时顺便重认一次"
+                         "(实测 colo 会随路径漂移: SIN→HKG、DFW/SYD→LAX、AMS→CDG)")
     ap.add_argument("--bw-stale-hours", type=float, default=24,
                     help="带宽数据超过这个小时就当没测过, 优先重测(避免旧量程数据永久霸榜)")
     ap.add_argument("--cycles", type=int, default=0, help="扫描轮数限制, 0=无限")

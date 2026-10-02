@@ -57,7 +57,7 @@ import cf_lifecycle
 import cf_policy
 
 COV_TOTAL = sum(1 << (32 - int(r.split("/")[1])) for r in cf_db.FALLBACK_RANGES)
-VERSION = "2.13.7"
+VERSION = "2.13.8"
 
 COLO_COUNTRY = cf_db.COLO_COUNTRY
 
@@ -1880,7 +1880,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
               <div class="fc-params">
                 <div class="fc-text">每轮随机抽 <span class="pn">抽样数/轮</span> 个新 IP（v4 / v6 各算）去探测；其中由 <span class="pn">优质C段比例</span>（默认 60%）决定多少从历史优质 /24 邻域里选，命中率更高。</div>
                 <div class="fc-text">同时做通用组的活：按 <span class="pn">复测批量</span> 处理到期 IP、按 <span class="pn">地区补全/批</span> 补缺地区、按 <span class="pn">测带宽/批</span> 补带宽。</div>
-                <div class="fc-text">判定"可用"：TCP 能连 + TLS 握手通过 + 延迟 ≤ <span class="pn">最大延迟</span>。</div>
+                <div class="fc-text">判定"可用"：TCP 能连 + TLS 握手通过 + 延迟 ≤ <span class="pn">最大延迟</span>。本阶段抽样量还会被<span class="pn">当日剩余测速额度</span>收敛。</div>
               </div>
             </div>
             <div class="fc-conn"><span>✔ 热IP 达到 <span class="pn">目标可用IP数</span> 且覆盖 <span class="pn">目标前缀数</span></span></div>
@@ -1896,7 +1896,8 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
               <div class="fc-head">③ 值守期<span class="fc-cond">热够 + 库满</span></div>
               <div class="fc-params">
                 <div class="fc-text"><b>到期复测</b>：每个 IP 有自己的检查周期（active 30~60min / reserve 6~24h）+ 随机抖动错峰，<b>到点才测</b>。有到期就约每分钟处理一批（每批 ≤ <span class="pn">复测批量</span>）；没到期就睡到下一个到期（最长 15 分钟）。<b>不再整轮扫固定数量。</b></div>
-                <div class="fc-text"><b>低频探索</b>：每 <span class="pn">探索间隔</span>（默认 30 分）扫 <span class="pn">抽样数 × 探索比例%</span> 个新 IP 去找更优的；命中就按健康分排名顶掉较差的。</div>
+                <div class="fc-text"><b>低频探索</b>：每 <span class="pn">探索间隔</span>（默认 30 分）扫 <span class="pn">抽样数 × 探索比例%</span> 个新 IP 去找更优的；<b>只有实测带宽够高才可能顶掉老 IP</b>。</div>
+                <div class="fc-text"><b>带宽至上</b>：实测带宽是入榜硬门槛 —— 只测了延迟、没测带宽的 IP 分数上限只有 ~31 分，低于 active 门槛 40，<b>永远进不了热榜</b>。所以"发现"和"测速"必须配对：<span class="pn">每日测速上限</span>既是请求预算也是发现配额，<b>额度用完就不再扫新 IP</b>（测不起等于白扫）。</div>
                 <div class="fc-text">通用组的 <span class="pn">地区补全/批</span>、<span class="pn">测带宽/批</span> 继续跑，把地区、带宽覆盖率逐步补满。</div>
               </div>
             </div>
@@ -1911,7 +1912,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
       </div>
 
       <div class="card">
-        <div class="h">🌐 扫描范围 &amp; 值守探索<span class="sub">上面几项只在「发现 / 填充库容」生效；最下方「值守期低频探索」在库满后的<b>值守期</b>生效</span></div>
+        <div class="h">🌐 扫描范围 &amp; 值守探索<span class="sub">抽样数在<b>发现期</b>用满、<b>填充期</b>降为 30%、<b>值守期</b>=抽样数×探索比例；三个阶段实际还会被<b>当日剩余测速额度</b>收敛</span></div>
         <div class="scan-grid">
           <div class="proto" id="protoV4">
             <label class="switch"><input type="checkbox" id="v4_on" checked><span class="track"><span class="knob"></span></span><b>IPv4 扫描</b></label>
@@ -1921,7 +1922,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
                 <option value="">官方全网</option><option value="cf">CF官方优选</option>
                 <option value="ct">电信优选</option><option value="cu">联通优选</option>
                 <option value="cmcc">移动优选</option></select></div>
-              <div class="f"><label>抽样数/轮<span class="tip">?<span class="pop">【发现期】每轮随机抽样探测的 IPv4 数量；【填充期】自动降为 30%。越大覆盖越广、每轮越久</span></span></label><input id="count" type="number" value="5000"></div>
+              <div class="f"><label>抽样数/轮<span class="tip">?<span class="pop">本轮探测多少个<b>新</b> IPv4。【发现期】用满该值；【填充期】自动降为 30%；【值守期】= 抽样数 × <b>探索比例%</b>。<br>其中 <b>优质C段比例</b> 那部分来自历史优质 /24 邻域(单轮每个 /24 最多 3 个，防雷同)，其余来自官方大段随机。<br><b>还会被当日测速额度收敛</b>：测不起的候选等于白扫，所以额度不足时自动少扫甚至不扫。</span></span></label><input id="count" type="number" value="5000"></div>
             </div>
           </div>
           <div class="proto" id="protoV6">
@@ -1930,7 +1931,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
               <div class="f"><label>优选列表<span class="tip">?<span class="pop">公开优选 v6 列表(命中率高)；公共列表始终纳入，可选移动优选</span></span></label>
                 <select id="operator_v6">
                 <option value="">公共优选</option><option value="cmcc">移动优选</option></select></div>
-              <div class="f"><label>抽样数/轮<span class="tip">?<span class="pop">【发现期】每轮随机抽样探测的 IPv6 数量，独立于 IPv4</span></span></label><input id="count_v6" type="number" value="5000"></div>
+              <div class="f"><label>抽样数/轮<span class="tip">?<span class="pop">本轮探测多少个<b>新</b> IPv6，规则与 IPv4 相同但<b>独立计算</b>。<br>v6 特殊之处：约七成来自已知优质 /48 邻域内的随机地址(单轮每个 /48 最多 4 个)，命中率极高但会让地址高度相似；想更多样就调低「优质C段比例」。</span></span></label><input id="count_v6" type="number" value="5000"></div>
             </div>
             <div class="chk"><input type="checkbox" id="v6_official" checked><label for="v6_official">叠加 CF 官方 v6 大段<span class="tip">?<span class="pop">从 CF 官方 v6 大段随机发现新地址；命中率低于优选列表但覆盖更广</span></span></label></div>
             <div class="proto-note">需本机具备 IPv6 网络</div>
@@ -1939,10 +1940,10 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
         <div class="row" style="margin-top:8px">
           <div class="f"><label>目标可用IP数<span class="tip">?<span class="pop">每协议各算：把健康分最高的前 N 名设为 active(高频巡检)。达到即停止大范围发现；N 越小越省资源</span></span></label><input id="target_active" type="number" value="60"></div>
           <div class="f"><label>目标前缀数<span class="tip">?<span class="pop">希望覆盖多少个不同前缀(/24、/48)，用于抗单机房/单路由故障</span></span></label><input id="target_prefixes" type="number" value="8"></div>
-          <div class="f"><label>优质C段比例<span class="tip">?<span class="pop">发现时 0~1 比例的 IP 从历史优质C段(邻居表现好)里选；0.6 = 6成优质邻域 + 4成随机</span></span></label><input id="exploit" type="number" step="0.1" value="0.6"></div>
+          <div class="f"><label>优质C段比例<span class="tip">?<span class="pop">发现时 0~1 比例的 IP 从历史优质C段(/24、/48 邻域)里选；0.6 = 6成优质邻域 + 4成官方大段随机。<br>邻域命中率高但会让地址<b>高度雷同</b>(实测 v6 曾集中在仅 233 个 /48 上反复出票)，所以加了"单轮每前缀配额"兜底：每 /24 最多 3 个、每 /48 最多 4 个。<br>调低它=更多样但命中率下降。</span></span></label><input id="exploit" type="number" step="0.1" value="0.6"></div>
         </div>
         <div class="row" style="margin-top:8px;align-items:flex-end">
-          <div class="chk" style="flex:1 1 100%"><label class="sub" style="font-size:12.5px">值守期低频探索 —— 库满后每隔一段时间抽一小批继续找更优IP(命中照样顶掉较差的)；不看就填 0</label></div>
+          <div class="chk" style="flex:1 1 100%"><label class="sub" style="font-size:12.5px">值守期低频探索 —— 库满后每隔一段时间抽一小批继续找更优IP；<b>但只有实测带宽超过现有榜单的 IP 才顶得掉</b>(没测带宽的进不了热榜)，且探索量同样受当日测速额度限制；不看就填 0</label></div>
           <div class="f"><label>探索间隔(分钟)<span class="tip">?<span class="pop">库满进入值守后，每隔这么久做一次低频探索。默认30分钟。设很大=几乎不探索</span></span></label><input id="explore_interval" type="number" value="30"></div>
           <div class="f"><label>探索比例%<span class="tip">?<span class="pop">每次探索抽样量 = 上面的「抽样数/轮」× 该比例。默认10%。0=库满后完全不探索(纯复测)</span></span></label><input id="explore_fraction" type="number" value="10"></div>
         </div>
@@ -1958,11 +1959,12 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
         </div>
         <div class="row">
           <div class="f"><label>复测批量<span class="tip">?<span class="pop">每批最多处理多少个"到期"IP。每个IP到期时间由其周期(active 30~60min / reserve 6~24h)加抖动错峰决定；发现/填充/值守都用它</span></span></label><input id="recheck" type="number" value="200"></div>
-          <div class="f"><label>地区补全/批<span class="tip">?<span class="pop">每批额外把"存活但缺地区"的IP拉来补识别(不等它自然到期)；所有阶段都生效</span></span></label><input id="backfill" type="number" value="300"></div>
-          <div class="f"><label>测带宽/批<span class="tip">?<span class="pop">每批最多实测多少个IP的带宽。会按"从没测过 &gt; active数据过期 &gt; 其他过期"排优先级；还要受"每日测速上限"约束；0=不测</span></span></label><input id="bench" type="number" value="20"></div>
+          <div class="f"><label>地区补全/批<span class="tip">?<span class="pop">每批额外把这些 IP 拉来补识别(不等它自然到期)：<b>存活但缺 colo/loc</b> 的, 以及 <b>机房数据已过期</b>(见「机房数据保鲜」)的。<br>识别走 cloudflare.com 的 trace, <b>不消耗测速 Worker 配额</b>；所有阶段都生效。</span></span></label><input id="backfill" type="number" value="300"></div>
+          <div class="f"><label>测带宽/批<span class="tip">?<span class="pop"><b>带宽至上</b>：实测带宽是入榜硬门槛(只测了延迟、没测带宽的IP 分数上限只有 ~31 分, 低于 active 门槛 40, 所以永远进不了热榜)。<br>本项决定每轮最多实测几个。按 <b>2:1 交错</b>取：新测 2 个 + 刷新过期 1 个(其中 active 过期优先), 避免"没测过的"把名额全占光、老数据永远刷不到。<br><b>测速是串行的</b>(一次只测一个IP), 否则多个IP的并发流会互相压低读数。还要受「每日测速上限」约束；0=完全不测(热榜将不再更新)</span></span></label><input id="bench" type="number" value="20"></div>
           <div class="f"><label>测速并连数<span class="tip">?<span class="pop">测速同时开的下载连接数。<b>每条流=1个 Worker 请求</b>。单流只有约39Mbps，要测满本机线路得开8条(实测能到188Mbps)；条数翻倍=请求翻倍</span></span></label><input id="bench_parallel" type="number" value="8"></div>
-          <div class="f"><label>每流下载量<span class="tip">?<span class="pop">单条流最多下多少字节(默认64MB)。<b>可测上限 = 每流下载量 × 并连数 × 8 ÷ 超时秒</b>。实测 8 条流在 <b>2 秒</b>就能读准(2s与15s读数一致 96~102Mbps, 但流量差7倍), 所以超时默认只给 <b>5 秒</b>——流量从 190MB 降到 59MB。下载量只花流量不花请求，宁可调大它、少加流</span></span></label><input id="bench_size" type="number" value="64000000" step="1000000"></div>
-          <div class="f"><label>每日测速上限<span class="tip">?<span class="pop"><b>请求预算，同时是"发现配额"</b>：一天最多实测多少个IP的带宽(失败也计数)。<br>每测1个 = 并连数个 Worker 请求(默认8)，每个约下350MB。<br><b>发现量会自动收敛到这个额度</b>——额度用完就不再扫新IP(测不起=白扫)。所以调大它=更快找到更好的IP，代价是流量。<br>参考：400 → 3200请求/天(Worker配额3.2%)、约140GB/天；1000 → 8000请求/天、约350GB/天。填0=不限(会天天爆配额)</span></span></label><input id="bench_daily" type="number" value="400"></div>
+          <div class="f"><label>每流下载量<span class="tip">?<span class="pop">单条流最多下多少字节(默认64MB)。<b>它决定"每条流能拉多少", 总上限 = 该值 × 并连数</b>；实测中它几乎从不生效(是「测速超时」先到), 所以它只影响流量上限、不影响读数。<b>下载量只花流量不花请求</b>——想抬高位数上限就调大它、少加流</span></span></label><input id="bench_size" type="number" value="64000000" step="1000000"></div>
+          <div class="f"><label>测速超时秒<span class="tip">?<span class="pop"><b>真正决定流量与读数的一项</b>：每次测速最多跑这么久, 流量 ≈ 实测速率 × 该值。<br>实测 8 条流在 <b>2 秒</b>就能读准(2s 与 15s 读数一致 96~102Mbps, 流量差 7 倍), 所以默认只给 <b>5 秒</b>——190MB 降到 59MB。<br>调小更省流量; 调大对很慢的IP更稳(能在窗口内多拉些字节)。<b>注意: 测速是串行的</b>, 一次只测一个IP, 不会互相压低</span></span></label><input id="bench_timeout" type="number" value="5"></div>
+          <div class="f"><label>每日测速上限<span class="tip">?<span class="pop"><b>请求预算，同时是"发现配额"</b>：一天最多实测多少个IP的带宽(失败也算额度)。<br>① 每小时最多只能用 <b>每日额度 ÷ 24</b>(令牌桶)，避免一小时内烧光然后全天停摆。<br>② <b>发现量自动收敛到这个额度</b>：额度用完就不再扫新IP——因为带宽是入榜硬门槛，测不起就是白扫。<br>③ 流量 ≈ 每次(实测速率 × 测速超时)，按超时5秒算约 <b>60MB/次</b>。<br>参考：400 → 3200请求/天(Worker配额3.2%)、约24GB/天；1000 → 8000请求/天、约60GB/天。填0=不限(会天天爆配额)</span></span></label><input id="bench_daily" type="number" value="400"></div>
           <div class="f"><label>测速失败暂停<span class="tip">?<span class="pop">连续多轮测速颗粒无收时，暂停测速多少秒(默认1800)，避免继续空打被限流的 Worker</span></span></label><input id="bench_pause" type="number" value="1800"></div>
           <div class="f"><label>机房数据保鲜<span class="tip">?<span class="pop">机房/地区识别结果的保鲜天数(默认7天)。colo 是<b>当时接入路径</b>的快照、会漂移(实测 SIN→HKG、DFW/SYD→LAX、AMS→CDG、TPE→HKG), 超期复测时顺便重认一次。识别走 cloudflare.com 的 trace, <b>不占测速 Worker 配额</b></span></span></label><input id="colo_stale_days" type="number" value="7"></div>
           <div class="f"><label>带宽数据保鲜<span class="tip">?<span class="pop">带宽数据超过多少小时就算"过期"，优先重新实测(默认24h)。防止老数据在旧量程下永久霸榜；active 的IP优先级最高</span></span></label><input id="bw_stale_hours" type="number" value="24"></div>
@@ -1974,11 +1976,11 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
       <div class="card">
         <div class="h">📦 库规模与去重<span class="sub">所有阶段通用；超限时触发剔除</span></div>
         <div class="row">
-          <div class="f"><label>IPv4库上限<span class="tip">?<span class="pop">IPv4 总库容(热+备)，也是"填充库容"阶段的目标；超限按健康分低者先剔除；0=不限</span></span></label><input id="max_ips_v4" type="number" value="0"></div>
+          <div class="f"><label>IPv4库上限<span class="tip">?<span class="pop">IPv4 总库容(热+备)，也是"填充库容"阶段的目标；0=不限。<br><b>滞回</b>：实际超过 <b>上限 × 1.05</b> 才开始剔除(按健康分低者先剔)，避免顶格时"插一个就删一个"造成剧烈换血。<br>库容低于 <b>上限 × 0.9</b> 时才回到"温和补库"阶段。</span></span></label><input id="max_ips_v4" type="number" value="0"></div>
           <div class="f"><label>IPv6库上限<span class="tip">?<span class="pop">IPv6 总库容，规则同上；0=不限</span></span></label><input id="max_ips_v6" type="number" value="0"></div>
           <div class="f"><label>每/24保留数<span class="tip">?<span class="pop">每个 v4 /24 最多保留几个IP(多样性去重)。越小越分散、库越小；0=不限</span></span></label><input id="per24_max" type="number" value="50"></div>
           <div class="f"><label>每/48保留数<span class="tip">?<span class="pop">每个 v6 /48 最多保留几个IP。越小越分散、库越小；0=不限</span></span></label><input id="per48_max" type="number" value="100"></div>
-          <div class="f"><label>单国家占比上限%<span class="tip">?<span class="pop">同一国家(按CF机房归属映射)活跃IP最多占库的百分比，让结果覆盖更多地区；0=关闭</span></span></label><input id="country_max_pct" type="number" value="30"></div>
+          <div class="f"><label>单国家占比上限%<span class="tip">?<span class="pop">同一国家(按 CF 机房归属映射)存活 IP 最多占库的百分比，让结果覆盖更多地区；0=关闭。<br>为避免一次砍太多，<b>每轮最多裁掉存活数的 0.3%</b>(实测原本一轮能砍 170+ 个，导致整库 5 天换一遍、IP 站不住)。<br>注意 colo 会随路径漂移，所以本项会持续"纠正"地区构成，属正常。</span></span></label><input id="country_max_pct" type="number" value="30"></div>
         </div>
         <div class="proto-note">备胎池目标 = <b>库上限 − 目标可用数</b>（自动）；把库上限设成 ≈ 目标可用数 就是不养备胎、填满即值守。</div>
       </div>
@@ -1986,7 +1988,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
       <div class="card">
         <div class="h">⚙️ 扫描策略</div>
         <div class="row">
-          <div class="f"><label>策略<span class="tip">?<span class="pop">auto=自动(未达目标发现 → 未满填充 → 满后值守)；也可强制固定为 发现/维护(值守)/恢复</span></span></label>
+          <div class="f"><label>策略<span class="tip">?<span class="pop">auto=自动，按<b>每协议独立</b>判定：<br>可用数 &lt; 目标 或 前缀数不足 → <b>发现</b>；可用数够但库容 &lt; 上限×0.9 → <b>温和补库</b>；都达标 → <b>值守</b>；可用数达标但多数已陈旧 → <b>恢复</b>。<br>切换有 3 轮迟滞防抖。注意模式只看"可用数/前缀数"，<b>库容只决定补多少</b>，二者解耦后不会来回抖。也可强制固定。</span></span></label>
             <select id="scan_mode"><option value="auto">自动(推荐)</option><option value="discovery">强制发现</option><option value="maintenance">强制值守</option><option value="recovery">强制恢复</option></select></div>
         </div>
       </div>
@@ -2371,7 +2373,7 @@ function control(act){
       bench_parallel:$("bench_parallel").value,
       bench_size:$("bench_size").value,bench_timeout:$("bench_timeout") ? $("bench_timeout").value : "",
       bench_daily:$("bench_daily").value,bench_pause:$("bench_pause").value,
-      bw_stale_hours:$("bw_stale_hours").value,colo_stale_days:$("colo_stale_days").value,colo_stale_days:$("colo_stale_days").value,
+      bw_stale_hours:$("bw_stale_hours").value,colo_stale_days:$("colo_stale_days").value,
       bench_host:$("bench_host").value,
       scan_mode:$("scan_mode").value,target_active:$("target_active").value,
       target_prefixes:$("target_prefixes").value,
@@ -2597,7 +2599,6 @@ function saveSet(){
     bench_pause:$("bench_pause") ? $("bench_pause").value : "",
     bw_stale_hours:$("bw_stale_hours") ? $("bw_stale_hours").value : "",
     colo_stale_days:$("colo_stale_days") ? $("colo_stale_days").value : "",
-    colo_stale_days:$("colo_stale_days") ? $("colo_stale_days").value : "",
     bench_host:$("bench_host").value,
     max_ips_v4:$("max_ips_v4").value,max_ips_v6:$("max_ips_v6").value,
     country_max_pct:$("country_max_pct").value,
@@ -2620,6 +2621,7 @@ function loadSet(){
     if(!d||!Object.keys(d).length)return;
     if(d.operator!==undefined)$("operator").value=d.operator||"";
     ["ports","count","concurrency","bench","bench_parallel","bench_host",
+     "bench_size","bench_timeout","bench_daily","bench_pause","bw_stale_hours","colo_stale_days",
      "backfill","recheck","exploit","max_latency","max_ips_v4","max_ips_v6","country_max_pct","per24_max","per48_max",
      "scan_mode","target_active","target_prefixes","explore_interval","explore_fraction","operator_v6","count_v6"].forEach(k=>{
        const v=d[k];

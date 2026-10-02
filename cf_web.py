@@ -57,13 +57,15 @@ import cf_lifecycle
 import cf_policy
 
 COV_TOTAL = sum(1 << (32 - int(r.split("/")[1])) for r in cf_db.FALLBACK_RANGES)
-VERSION = "2.11.4"
+VERSION = "2.12.1"
 
 COLO_COUNTRY = cf_db.COLO_COUNTRY
 
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cf_settings.json")
 SETTINGS_KEYS = ["operator", "ports", "count", "concurrency", "bench",
-                 "bench_parallel", "backfill", "recheck", "exploit", "max_latency", "tls_check",
+                 "bench_parallel", "bench_size", "bench_timeout", "bench_daily",
+                 "bench_pause", "bw_stale_hours", "backfill", "recheck", "exploit",
+                 "max_latency", "tls_check",
                  "bench_host", "v4", "ipv6", "operator_v6", "count_v6", "v6_official",
                  "max_ips_v4", "max_ips_v6", "country_max_pct",
                  "scan_mode", "target_active", "target_prefixes", "per24_max", "per48_max",
@@ -486,9 +488,12 @@ def scan_args(params, db):
         max_ips_v4=max(0, int(num("max_ips_v4", 0, int))),
         max_ips_v6=max(0, int(num("max_ips_v6", 0, int))),
         country_max_pct=max(0, int(num("country_max_pct", 30, int))),
-        bench_size=int(max(1_000_000, min(num("bench_size", 12_000_000, int), 80_000_000))),
-        bench_timeout=max(1, num("bench_timeout", 10)),
-        bench_parallel=max(1, int(num("bench_parallel", 6, int))),
+        bench_size=int(max(1_000_000, min(num("bench_size", 64_000_000, int), 300_000_000))),
+        bench_timeout=max(1, num("bench_timeout", 15)),
+        bench_parallel=max(1, int(num("bench_parallel", 8, int))),
+        bench_daily=max(0, int(num("bench_daily", 100, int))),
+        bench_pause=max(0, int(num("bench_pause", 1800, int))),
+        bw_stale_hours=max(0.0, num("bw_stale_hours", 24, float)),
         bench_host=str(flat.get("bench_host", "")).strip() or cf_db.SPEED_HOST,
         v4=str(flat.get("v4", "1")) not in ("0", "false", ""),
         ipv6=str(flat.get("ipv6", "0")) not in ("0", "false", ""),
@@ -809,8 +814,8 @@ def test_ip(db, params):
             _bh = (params.get("bench_host")
                    or load_settings().get("bench_host")
                    or cf_db.SPEED_HOST)
-            ns = types.SimpleNamespace(bench_size=50_000_000, bench_timeout=15,
-                                       bench_parallel=6,
+            ns = types.SimpleNamespace(bench_size=64_000_000, bench_timeout=15,
+                                       bench_parallel=8,
                                        bench_host=str(_bh).strip() or cf_db.SPEED_HOST)
             bw = _run_on_test_loop(cf_db.bench_bandwidth(ip, port, ns), timeout=22)
             if bw is None:
@@ -1939,8 +1944,12 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
         <div class="row">
           <div class="f"><label>复测批量<span class="tip">?<span class="pop">每批最多处理多少个"到期"IP。每个IP到期时间由其周期(active 30~60min / reserve 6~24h)加抖动错峰决定；发现/填充/值守都用它</span></span></label><input id="recheck" type="number" value="200"></div>
           <div class="f"><label>地区补全/批<span class="tip">?<span class="pop">每批额外把"存活但缺地区"的IP拉来补识别(不等它自然到期)；所有阶段都生效</span></span></label><input id="backfill" type="number" value="300"></div>
-          <div class="f"><label>测带宽/批<span class="tip">?<span class="pop">每批最多实测多少个IP的带宽，优先"没测过"的；0=不测。很耗带宽/CPU，所有阶段都生效</span></span></label><input id="bench" type="number" value="20"></div>
-          <div class="f"><label>测速并连数<span class="tip">?<span class="pop">测速时同时开的下载连接数，6条基本能测满本机线路</span></span></label><input id="bench_parallel" type="number" value="6"></div>
+          <div class="f"><label>测带宽/批<span class="tip">?<span class="pop">每批最多实测多少个IP的带宽。会按"从没测过 &gt; active数据过期 &gt; 其他过期"排优先级；还要受"每日测速上限"约束；0=不测</span></span></label><input id="bench" type="number" value="20"></div>
+          <div class="f"><label>测速并连数<span class="tip">?<span class="pop">测速同时开的下载连接数。<b>每条流=1个 Worker 请求</b>。单流只有约39Mbps，要测满本机线路得开8条(实测能到188Mbps)；条数翻倍=请求翻倍</span></span></label><input id="bench_parallel" type="number" value="8"></div>
+          <div class="f"><label>每流下载量<span class="tip">?<span class="pop">单条流最多下多少字节(默认64MB)。<b>可测上限 = 每流下载量 × 并连数 × 8 ÷ 超时秒</b>：64MB×8÷15≈273Mbps。下载量只花流量不花请求，所以宁可调大它、少加流</span></span></label><input id="bench_size" type="number" value="64000000" step="1000000"></div>
+          <div class="f"><label>每日测速上限<span class="tip">?<span class="pop"><b>请求预算</b>：一天最多实测多少个IP的带宽(失败也计数)。默认100 → 100×8=800 请求/天，远低于 Worker 的10万/天上限。填0=不限(会天天爆配额)</span></span></label><input id="bench_daily" type="number" value="100"></div>
+          <div class="f"><label>测速失败暂停<span class="tip">?<span class="pop">连续多轮测速颗粒无收时，暂停测速多少秒(默认1800)，避免继续空打被限流的 Worker</span></span></label><input id="bench_pause" type="number" value="1800"></div>
+          <div class="f"><label>带宽数据保鲜<span class="tip">?<span class="pop">带宽数据超过多少小时就算"过期"，优先重新实测(默认24h)。防止老数据在旧量程下永久霸榜；active 的IP优先级最高</span></span></label><input id="bw_stale_hours" type="number" value="24"></div>
           <div class="f"><label>测速域名<span class="tip">?<span class="pop">带宽实测用的域名。默认 speed.cloudflare.com(会被限流)；建议填自己的CF Worker域名，不受公共限流</span></span></label><input id="bench_host" value="speed.cloudflare.com" style="min-width:220px"></div>
         </div>
         <div class="proto-note">每批流程：<b>复测批量</b>(处理到期IP) + <b>地区补全</b>(额外拉缺地区IP) (+发现/填充期的新抽样) 一起探测 → 存活者自动补地区 → 其中最多 <b>测带宽/批</b> 个实测带宽。</div>
@@ -2344,6 +2353,9 @@ function control(act){
       bench:$("bench").value,backfill:$("backfill").value,recheck:$("recheck").value,
       exploit:$("exploit").value,max_latency:$("max_latency").value,
       bench_parallel:$("bench_parallel").value,
+      bench_size:$("bench_size").value,bench_timeout:$("bench_timeout") ? $("bench_timeout").value : "",
+      bench_daily:$("bench_daily").value,bench_pause:$("bench_pause").value,
+      bw_stale_hours:$("bw_stale_hours").value,
       bench_host:$("bench_host").value,
       scan_mode:$("scan_mode").value,target_active:$("target_active").value,
       target_prefixes:$("target_prefixes").value,
@@ -2564,6 +2576,10 @@ function saveSet(){
     concurrency:$("concurrency").value,bench:$("bench").value,
     backfill:$("backfill").value,recheck:$("recheck").value,exploit:$("exploit").value,
     max_latency:$("max_latency").value,bench_parallel:$("bench_parallel").value,
+    bench_size:$("bench_size") ? $("bench_size").value : "",
+    bench_daily:$("bench_daily") ? $("bench_daily").value : "",
+    bench_pause:$("bench_pause") ? $("bench_pause").value : "",
+    bw_stale_hours:$("bw_stale_hours") ? $("bw_stale_hours").value : "",
     bench_host:$("bench_host").value,
     max_ips_v4:$("max_ips_v4").value,max_ips_v6:$("max_ips_v6").value,
     country_max_pct:$("country_max_pct").value,

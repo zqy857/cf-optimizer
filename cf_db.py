@@ -979,7 +979,30 @@ async def identify(ip, port, args, latency=None):
 BENCH_FAIL_LIMIT = 8               # 连续多少轮颗粒无收才暂停测速
 # 当日计数以内存为权威(meta 只负责跨重启持久化): 扫描器的 commit 有延迟,
 # 每轮去读库会读到上一轮的旧值, 导致上限被突破一整轮(实测 100 -> 120)。
-_BENCH_MEM = {"day": "", "n": 0, "fails": 0, "pause": 0.0}
+#
+# 只靠"每日上限"还不够: 每轮 bench=20 无节流, 400 的额度会在头半小时烧光,
+# 之后 23 小时彻底停摆(既测不了新IP, 也不再刷新老数据)。所以再加一层
+# "每小时桶": 每小时最多花 每日额度/24, 把额度均匀摊到一整天。
+BENCH_HOURS = 24                   # 额度摊平的小时数(桶容量 = 每日额度/该值)
+_BENCH_MEM = {"day": "", "hour": "", "n": 0, "h": 0, "fails": 0, "pause": 0.0}
+
+
+def _bench_keys(now):
+    lt = time.localtime(now)
+    return time.strftime("%Y-%m-%d", lt), time.strftime("%Y-%m-%dT%H", lt)
+
+
+def _bench_meta(conn, now):
+    """读取测速预算状态; 跨天清零当日计数, 跨小时清零本小时计数。"""
+    m = {k: v for k, v in conn.execute(
+        "SELECT key,value FROM meta WHERE key LIKE 'bench%'")}
+    day, hour = _bench_keys(now)
+    if m.get("bench_day") != day:
+        m["bench_day"], m["bench_n"] = day, 0
+        m["bench_hour"], m["bench_h"] = hour, 0
+    elif m.get("bench_hour") != hour:
+        m["bench_hour"], m["bench_h"] = hour, 0
+    return m
 
 
 def _load_bench_mem(db_path, now):
@@ -989,36 +1012,29 @@ def _load_bench_mem(db_path, now):
         conn.close()
     except Exception:
         m = {}
-    _BENCH_MEM.update(day=m.get("bench_day", ""), n=int(m.get("bench_n") or 0),
+    day, hour = _bench_keys(now)
+    _BENCH_MEM.update(day=m.get("bench_day", day), hour=m.get("bench_hour", hour),
+                      n=int(m.get("bench_n") or 0), h=int(m.get("bench_h") or 0),
                       fails=int(m.get("bench_fails") or 0),
                       pause=float(m.get("bench_pause") or 0))
 
 
-def _bench_meta(conn, now):
-    """读取测速预算状态; 跨天自动清零当日计数。"""
-    m = {k: v for k, v in conn.execute(
-        "SELECT key,value FROM meta WHERE key LIKE 'bench%'")}
-    today = time.strftime("%Y-%m-%d", time.localtime(now))
-    if m.get("bench_day") != today:
-        m["bench_day"], m["bench_n"] = today, 0
-    return m
-
-
 def bench_quota(db_path, daily_limit, now=None):
-    """本轮还允许测几个 IP(按当日累计"尝试"次数算, 失败也消耗请求额度)。"""
+    """本轮还允许测几个 IP: min(今日剩余, 本小时剩余)。失败也消耗额度。"""
     now = now or time.time()
     if not daily_limit or int(daily_limit) <= 0:
         return 10 ** 9
-    today = time.strftime("%Y-%m-%d", time.localtime(now))
-    if _BENCH_MEM["day"] != today:
+    day, hour = _bench_keys(now)
+    if _BENCH_MEM["day"] != day or _BENCH_MEM["hour"] != hour:
         _load_bench_mem(db_path, now)
     if now < _BENCH_MEM["pause"]:
         return 0
-    return max(0, int(daily_limit) - _BENCH_MEM["n"])
+    burst = max(1, int(daily_limit) // BENCH_HOURS)
+    return max(0, min(int(daily_limit) - _BENCH_MEM["n"], burst - _BENCH_MEM["h"]))
 
 
 def bench_flush(conn, ok, fail, pause_secs, now=None, commit=False):
-    """把本轮测速结果写回预算: 累计尝试次数; 连续颗粒无收则暂停一段时间。
+    """把本轮测速结果写回预算: 累计次数; 连续颗粒无收则暂停一段时间。
 
     必须复用调用方的连接: 扫描器在整轮扫描期间持有写事务, 另开连接写 meta 会
     直接 "database is locked"(WAL 也救不了写锁), 那样每日上限等于没生效。
@@ -1031,6 +1047,7 @@ def bench_flush(conn, ok, fail, pause_secs, now=None, commit=False):
     try:
         m = _bench_meta(conn, now)
         n = int(m.get("bench_n") or 0) + attempts
+        h = int(m.get("bench_h") or 0) + attempts
         fails = int(m.get("bench_fails") or 0)
         pause = float(m.get("bench_pause") or 0)
         if fail == 0 and ok > 0:
@@ -1041,11 +1058,13 @@ def bench_flush(conn, ok, fail, pause_secs, now=None, commit=False):
             pause = now + float(pause_secs)
             fails = 0
         for k, v in (("bench_day", m["bench_day"]), ("bench_n", n),
+                     ("bench_hour", m["bench_hour"]), ("bench_h", h),
                      ("bench_fails", fails), ("bench_pause", pause)):
             conn.execute("INSERT INTO meta(key,value) VALUES(?,?) "
                          "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                          (k, v))
-        _BENCH_MEM.update(day=m["bench_day"], n=n, fails=fails, pause=pause)
+        _BENCH_MEM.update(day=m["bench_day"], hour=m["bench_hour"], n=n, h=h,
+                          fails=fails, pause=pause)
         if commit:
             conn.commit()
     except Exception:
@@ -1268,20 +1287,38 @@ async def run_session(nets, known, q, args, stop, nets6=None):
             sb6 = cf_policy.shared_budget(mi6["mode"], args.verify, args.bench,
                                           args.recheck, mi6["active"])
 
-            def proto_count(key, mi, base, enabled):
+            # ---- 发现量必须与"今日还测得起多少个"挂钩 ----
+            # 带宽是入榜硬门槛(没测带宽上限 31 分 < 门槛 40), 额度用完后再发现新 IP
+            # 纯属白扫(探测+TLS 全做、永远进不了热榜)。原来两者脱钩: 每 30 分钟
+            # 发现 150 个 vs 每天只测得起 100 个 -> 命中率 1:72。
+            _daily = int(getattr(args, "bench_daily", 0) or 0)
+            _left = bench_quota(args.db, _daily) if _daily > 0 else None
+
+            def proto_count(key, mi, base, enabled, left=None):
+                """返回 (本轮抽样数, 剩余可用额度); left=None 表示不设额度上限。"""
+                def spend(n):
+                    return (n, left - n) if left is not None else (n, None)
                 if not enabled:
-                    return 0
+                    return spend(0)
+                if left is not None and left <= 0:
+                    return spend(0)              # 今日额度用尽 -> 不再发现
                 if mi["mode"] != "maintenance":
-                    return cf_policy.scan_count(mi["mode"], base)     # 发现/恢复: 正常量
+                    return spend(cf_policy.scan_count(mi["mode"], base))
                 d = deficits.get(key, {})
                 if d.get("deficit_reserve", 0) > 0:
-                    return max(50, int(base * cf_policy.FILL_FRACTION))  # 填充库容: 温和但持续
-                if explore_light:
-                    return max(20, int(base * explore_fraction))           # 值守: 低频探索找更优
-                return 0                                               # 完全静默
+                    n = max(50, int(base * cf_policy.FILL_FRACTION))  # 填充库容: 温和但持续
+                elif explore_light:
+                    n = max(20, int(base * explore_fraction))          # 值守: 低频探索找更优
+                else:
+                    n = 0                                            # 完全静默
+                if left is not None:
+                    n = min(n, left)               # 别超过今天测得起的量
+                return spend(n)
+            _c4, _left2 = proto_count("v4", mi4, args.count, bool(nets), _left)
+            _c6, _left3 = proto_count("v6", mi6, v6_count, bool(nets6), _left2)
             bud = {
-                "count": proto_count("v4", mi4, args.count, bool(nets)),
-                "count_v6": proto_count("v6", mi6, v6_count, bool(nets6)),
+                "count": _c4,
+                "count_v6": _c6,
                 "verify": max(sb4["verify"], sb6["verify"]),
                 "bench": max(sb4["bench"], sb6["bench"]) if (nets or nets6) else 0,
                 "recheck": max(sb4["recheck"], sb6["recheck"]),
@@ -1298,11 +1335,10 @@ async def run_session(nets, known, q, args, stop, nets6=None):
                    "mode": mi4["mode"] if mi4["mode"] != "maintenance" else mi6["mode"],
                    "reason": f"v4 {mi4['mode']} / v6 {mi6['mode']}" + (" +探索" if explore else "")})
             # 请求预算: 当日测速次数用完/处于失败暂停期 -> 本轮不测带宽(只探测)
-            _daily = int(getattr(args, "bench_daily", 0) or 0)
             if _daily > 0 and bud["bench"] > 0:
-                _left = bench_quota(args.db, _daily)
-                if _left < bud["bench"]:
-                    bud["bench"] = _left
+                _l2 = bench_quota(args.db, _daily)
+                if _l2 < bud["bench"]:
+                    bud["bench"] = _l2
             bw_info = {}
             active_set = set()
             # colo 是"当时接入路径"的快照, 会随路由变化漂移(实测 SIN→HKG、
@@ -1679,7 +1715,7 @@ def main():
     ap.add_argument("--bench-parallel", type=int, default=8,
                     help="并行流数。单流约 39Mbps, 8流可达 188Mbps; "
                          "注意: 每流=一个 Worker 请求, 并行越高请求越多")
-    ap.add_argument("--bench-daily", type=int, default=100,
+    ap.add_argument("--bench-daily", type=int, default=400,
                     help="每日测速 IP 数硬上限(请求预算; 失败也算额度; 0=不限)")
     ap.add_argument("--bench-pause", type=int, default=1800,
                     help="测速连续失败达阈值后暂停测速的秒数(防空打 Worker)")

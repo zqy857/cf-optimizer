@@ -57,7 +57,7 @@ import cf_lifecycle
 import cf_policy
 
 COV_TOTAL = sum(1 << (32 - int(r.split("/")[1])) for r in cf_db.FALLBACK_RANGES)
-VERSION = "2.13.5"
+VERSION = "2.13.7"
 
 COLO_COUNTRY = cf_db.COLO_COUNTRY
 
@@ -490,7 +490,7 @@ def scan_args(params, db):
         max_ips_v6=max(0, int(num("max_ips_v6", 0, int))),
         country_max_pct=max(0, int(num("country_max_pct", 30, int))),
         bench_size=int(max(1_000_000, min(num("bench_size", 64_000_000, int), 300_000_000))),
-        bench_timeout=max(1, num("bench_timeout", 15)),
+        bench_timeout=max(1, num("bench_timeout", 5)),
         bench_parallel=max(1, int(num("bench_parallel", 8, int))),
         bench_daily=max(0, int(num("bench_daily", 400, int))),
         bench_pause=max(0, int(num("bench_pause", 1800, int))),
@@ -829,7 +829,7 @@ def test_ip(db, params):
             _bh = (params.get("bench_host")
                    or load_settings().get("bench_host")
                    or cf_db.SPEED_HOST)
-            ns = types.SimpleNamespace(bench_size=64_000_000, bench_timeout=15,
+            ns = types.SimpleNamespace(bench_size=64_000_000, bench_timeout=5,
                                        bench_parallel=8,
                                        bench_host=str(_bh).strip() or cf_db.SPEED_HOST)
             bw = _run_on_test_loop(cf_db.bench_bandwidth(ip, port, ns), timeout=22)
@@ -1961,7 +1961,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
           <div class="f"><label>地区补全/批<span class="tip">?<span class="pop">每批额外把"存活但缺地区"的IP拉来补识别(不等它自然到期)；所有阶段都生效</span></span></label><input id="backfill" type="number" value="300"></div>
           <div class="f"><label>测带宽/批<span class="tip">?<span class="pop">每批最多实测多少个IP的带宽。会按"从没测过 &gt; active数据过期 &gt; 其他过期"排优先级；还要受"每日测速上限"约束；0=不测</span></span></label><input id="bench" type="number" value="20"></div>
           <div class="f"><label>测速并连数<span class="tip">?<span class="pop">测速同时开的下载连接数。<b>每条流=1个 Worker 请求</b>。单流只有约39Mbps，要测满本机线路得开8条(实测能到188Mbps)；条数翻倍=请求翻倍</span></span></label><input id="bench_parallel" type="number" value="8"></div>
-          <div class="f"><label>每流下载量<span class="tip">?<span class="pop">单条流最多下多少字节(默认64MB)。<b>可测上限 = 每流下载量 × 并连数 × 8 ÷ 超时秒</b>：64MB×8÷15≈273Mbps。下载量只花流量不花请求，所以宁可调大它、少加流</span></span></label><input id="bench_size" type="number" value="64000000" step="1000000"></div>
+          <div class="f"><label>每流下载量<span class="tip">?<span class="pop">单条流最多下多少字节(默认64MB)。<b>可测上限 = 每流下载量 × 并连数 × 8 ÷ 超时秒</b>。实测 8 条流在 <b>2 秒</b>就能读准(2s与15s读数一致 96~102Mbps, 但流量差7倍), 所以超时默认只给 <b>5 秒</b>——流量从 190MB 降到 59MB。下载量只花流量不花请求，宁可调大它、少加流</span></span></label><input id="bench_size" type="number" value="64000000" step="1000000"></div>
           <div class="f"><label>每日测速上限<span class="tip">?<span class="pop"><b>请求预算，同时是"发现配额"</b>：一天最多实测多少个IP的带宽(失败也计数)。<br>每测1个 = 并连数个 Worker 请求(默认8)，每个约下350MB。<br><b>发现量会自动收敛到这个额度</b>——额度用完就不再扫新IP(测不起=白扫)。所以调大它=更快找到更好的IP，代价是流量。<br>参考：400 → 3200请求/天(Worker配额3.2%)、约140GB/天；1000 → 8000请求/天、约350GB/天。填0=不限(会天天爆配额)</span></span></label><input id="bench_daily" type="number" value="400"></div>
           <div class="f"><label>测速失败暂停<span class="tip">?<span class="pop">连续多轮测速颗粒无收时，暂停测速多少秒(默认1800)，避免继续空打被限流的 Worker</span></span></label><input id="bench_pause" type="number" value="1800"></div>
           <div class="f"><label>机房数据保鲜<span class="tip">?<span class="pop">机房/地区识别结果的保鲜天数(默认7天)。colo 是<b>当时接入路径</b>的快照、会漂移(实测 SIN→HKG、DFW/SYD→LAX、AMS→CDG、TPE→HKG), 超期复测时顺便重认一次。识别走 cloudflare.com 的 trace, <b>不占测速 Worker 配额</b></span></span></label><input id="colo_stale_days" type="number" value="7"></div>

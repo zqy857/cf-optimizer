@@ -1129,7 +1129,7 @@ async def bench_bandwidth(ip, port, args, parallel=4):
     bodies = await asyncio.gather(*(one() for _ in range(parallel)), return_exceptions=True)
     items = [b for b in bodies if isinstance(b, tuple) and b[0] and b[1] is not None]
     total = sum(b[0] for b in items)
-    if total < 100_000:
+    if total < 20_000:      # 20KB/5s ≈ 32kbps, 低于此视作没测到
         # 不再降档重试: 降档后的可测上限只有原来的 1/8, 写进同一个带宽字段会污染数据;
         # 且重试会多花一倍 Worker 请求。失败就当没测到(返回 None),
         # 由 bench_quota 统一算请求预算 + bench_fail_streak 统一做失败退避。
@@ -1178,6 +1178,10 @@ async def run_session(nets, known, q, args, stop, nets6=None):
         return out
 
     bench_stat = {"ok": 0, "fail": 0}
+    # 测速必须串行: 所有测速共用同一条宽带, 并发测会互相压低读数。
+    # 原来 vsem=8(最多8个IP同时测) x bench_parallel=8(每个8条流) = 64 条流抢带宽,
+    # 记录下来的值最大只有真实值的 1/8, 榜单因此全是偏低的随机数。
+    bench_sem = asyncio.Semaphore(1)
 
     async def verify_one(ip, p, lat, do_bench, do_id=True):
         args_ns = types.SimpleNamespace(bench_size=args.bench_size,
@@ -1195,10 +1199,11 @@ async def run_session(nets, known, q, args, stop, nets6=None):
                 colo, loc = info["colo"], info["loc"]
                 verified_at = time.time()
         if do_bench:
-            try:
-                bw = await bench_bandwidth(ip, p, args_ns)
-            except Exception:
-                bw = None
+            async with bench_sem:      # 独占测速通道, 避免并发互相压低
+                try:
+                    bw = await bench_bandwidth(ip, p, args_ns)
+                except Exception:
+                    bw = None
             if isinstance(bw, (int, float)) and bw > 0:
                 bench_stat["ok"] += 1
             else:
@@ -1711,7 +1716,7 @@ def main():
                     help="每轮为'存活但缺地区(colo/loc)'的旧IP补全地区识别数量(默认0; GUI默认开启)")
     ap.add_argument("--bench-size", type=int, default=64_000_000,
                     help="每流下载量(字节)。可测上限=size*parallel*8/timeout")
-    ap.add_argument("--bench-timeout", type=float, default=15)
+    ap.add_argument("--bench-timeout", type=float, default=5)
     ap.add_argument("--bench-parallel", type=int, default=8,
                     help="并行流数。单流约 39Mbps, 8流可达 188Mbps; "
                          "注意: 每流=一个 Worker 请求, 并行越高请求越多")

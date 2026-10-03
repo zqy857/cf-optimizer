@@ -57,14 +57,14 @@ import cf_lifecycle
 import cf_policy
 
 COV_TOTAL = sum(1 << (32 - int(r.split("/")[1])) for r in cf_db.FALLBACK_RANGES)
-VERSION = "2.13.8"
+VERSION = "2.13.12"
 
 COLO_COUNTRY = cf_db.COLO_COUNTRY
 
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cf_settings.json")
 SETTINGS_KEYS = ["operator", "ports", "count", "concurrency", "bench",
                  "bench_parallel", "bench_size", "bench_timeout", "bench_daily",
-                 "bench_pause", "bw_stale_hours", "colo_stale_days",
+                 "bench_pause", "bench_funnel", "bw_stale_hours", "colo_stale_days",
                  "backfill", "recheck", "exploit",
                  "max_latency", "tls_check",
                  "bench_host", "v4", "ipv6", "operator_v6", "count_v6", "v6_official",
@@ -494,6 +494,7 @@ def scan_args(params, db):
         bench_parallel=max(1, int(num("bench_parallel", 8, int))),
         bench_daily=max(0, int(num("bench_daily", 400, int))),
         bench_pause=max(0, int(num("bench_pause", 1800, int))),
+        bench_funnel=max(1, int(num("bench_funnel", 10, int))),
         bw_stale_hours=max(0.0, num("bw_stale_hours", 24, float)),
         colo_stale_days=max(0.0, num("colo_stale_days", 7, float)),
         bench_host=str(flat.get("bench_host", "")).strip() or cf_db.SPEED_HOST,
@@ -1922,7 +1923,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
                 <option value="">官方全网</option><option value="cf">CF官方优选</option>
                 <option value="ct">电信优选</option><option value="cu">联通优选</option>
                 <option value="cmcc">移动优选</option></select></div>
-              <div class="f"><label>抽样数/轮<span class="tip">?<span class="pop">本轮探测多少个<b>新</b> IPv4。【发现期】用满该值；【填充期】自动降为 30%；【值守期】= 抽样数 × <b>探索比例%</b>。<br>其中 <b>优质C段比例</b> 那部分来自历史优质 /24 邻域(单轮每个 /24 最多 3 个，防雷同)，其余来自官方大段随机。<br><b>还会被当日测速额度收敛</b>：测不起的候选等于白扫，所以额度不足时自动少扫甚至不扫。</span></span></label><input id="count" type="number" value="5000"></div>
+              <div class="f"><label>抽样数/轮<span class="tip">?<span class="pop">本轮探测多少个<b>新</b> IPv4。【发现期】用满该值；【填充期】自动降为 30%；【值守期】= 抽样数 × <b>探索比例%</b>。<br>其中 <b>优质C段比例</b> 那部分来自历史优质 /24 邻域(单轮每个 /24 最多 3 个，防雷同)，其余来自官方大段随机。<br><b>上限是 <span class="pn">发现漏斗倍数</span> × 当日剩余测速额度</b>(按 v4/v6 等比缩减)。探测不花 Worker 配额，所以默认倍数 10，基本不会砍到你的 500。</span></span></label><input id="count" type="number" value="5000"></div>
             </div>
           </div>
           <div class="proto" id="protoV6">
@@ -1965,6 +1966,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
           <div class="f"><label>每流下载量<span class="tip">?<span class="pop">单条流最多下多少字节(默认64MB)。<b>它决定"每条流能拉多少", 总上限 = 该值 × 并连数</b>；实测中它几乎从不生效(是「测速超时」先到), 所以它只影响流量上限、不影响读数。<b>下载量只花流量不花请求</b>——想抬高位数上限就调大它、少加流</span></span></label><input id="bench_size" type="number" value="64000000" step="1000000"></div>
           <div class="f"><label>测速超时秒<span class="tip">?<span class="pop"><b>真正决定流量与读数的一项</b>：每次测速最多跑这么久, 流量 ≈ 实测速率 × 该值。<br>实测 8 条流在 <b>2 秒</b>就能读准(2s 与 15s 读数一致 96~102Mbps, 流量差 7 倍), 所以默认只给 <b>5 秒</b>——190MB 降到 59MB。<br>调小更省流量; 调大对很慢的IP更稳(能在窗口内多拉些字节)。<b>注意: 测速是串行的</b>, 一次只测一个IP, 不会互相压低</span></span></label><input id="bench_timeout" type="number" value="5"></div>
           <div class="f"><label>每日测速上限<span class="tip">?<span class="pop"><b>请求预算，同时是"发现配额"</b>：一天最多实测多少个IP的带宽(失败也算额度)。<br>① 每小时最多只能用 <b>每日额度 ÷ 24</b>(令牌桶)，避免一小时内烧光然后全天停摆。<br>② <b>发现量自动收敛到这个额度</b>：额度用完就不再扫新IP——因为带宽是入榜硬门槛，测不起就是白扫。<br>③ 流量 ≈ 每次(实测速率 × 测速超时)，按超时5秒算约 <b>60MB/次</b>。<br>参考：400 → 3200请求/天(Worker配额3.2%)、约24GB/天；1000 → 8000请求/天、约60GB/天。填0=不限(会天天爆配额)</span></span></label><input id="bench_daily" type="number" value="400"></div>
+          <div class="f"><label>发现漏斗倍数<span class="tip">?<span class="pop"><b>候选池 = 测速额度的几倍</b>。每轮抽样量最多 = <b>当日剩余额度 × 该倍数</b>(按 v4/v6 各自想要的量等比缩减, 互不抢)。<br>为什么要 &gt;1：<b>探测本身不花 Worker 配额</b>, 而且每轮是从这批候选里挑延迟最低的若干个去测速 —— 候选池必须大于测量量, 否则没有筛选空间。<br>调小=更省库容/更快扫完一轮; 调大=候选更多样。按 400 额度 × 10 = 4000, 你的 500+1000 完全用不满这个上限, 不会被砍。<br>0=不按额度收敛(会发现很多但大部分测不了)</span></span></label><input id="bench_funnel" type="number" value="10"></div>
           <div class="f"><label>测速失败暂停<span class="tip">?<span class="pop">连续多轮测速颗粒无收时，暂停测速多少秒(默认1800)，避免继续空打被限流的 Worker</span></span></label><input id="bench_pause" type="number" value="1800"></div>
           <div class="f"><label>机房数据保鲜<span class="tip">?<span class="pop">机房/地区识别结果的保鲜天数(默认7天)。colo 是<b>当时接入路径</b>的快照、会漂移(实测 SIN→HKG、DFW/SYD→LAX、AMS→CDG、TPE→HKG), 超期复测时顺便重认一次。识别走 cloudflare.com 的 trace, <b>不占测速 Worker 配额</b></span></span></label><input id="colo_stale_days" type="number" value="7"></div>
           <div class="f"><label>带宽数据保鲜<span class="tip">?<span class="pop">带宽数据超过多少小时就算"过期"，优先重新实测(默认24h)。防止老数据在旧量程下永久霸榜；active 的IP优先级最高</span></span></label><input id="bw_stale_hours" type="number" value="24"></div>
@@ -2372,7 +2374,7 @@ function control(act){
       exploit:$("exploit").value,max_latency:$("max_latency").value,
       bench_parallel:$("bench_parallel").value,
       bench_size:$("bench_size").value,bench_timeout:$("bench_timeout") ? $("bench_timeout").value : "",
-      bench_daily:$("bench_daily").value,bench_pause:$("bench_pause").value,
+      bench_daily:$("bench_daily").value,bench_pause:$("bench_pause").value,bench_funnel:$("bench_funnel").value,
       bw_stale_hours:$("bw_stale_hours").value,colo_stale_days:$("colo_stale_days").value,
       bench_host:$("bench_host").value,
       scan_mode:$("scan_mode").value,target_active:$("target_active").value,
@@ -2596,6 +2598,7 @@ function saveSet(){
     max_latency:$("max_latency").value,bench_parallel:$("bench_parallel").value,
     bench_size:$("bench_size") ? $("bench_size").value : "",
     bench_daily:$("bench_daily") ? $("bench_daily").value : "",
+    bench_funnel:$("bench_funnel") ? $("bench_funnel").value : "",
     bench_pause:$("bench_pause") ? $("bench_pause").value : "",
     bw_stale_hours:$("bw_stale_hours") ? $("bw_stale_hours").value : "",
     colo_stale_days:$("colo_stale_days") ? $("colo_stale_days").value : "",
@@ -2621,7 +2624,7 @@ function loadSet(){
     if(!d||!Object.keys(d).length)return;
     if(d.operator!==undefined)$("operator").value=d.operator||"";
     ["ports","count","concurrency","bench","bench_parallel","bench_host",
-     "bench_size","bench_timeout","bench_daily","bench_pause","bw_stale_hours","colo_stale_days",
+     "bench_size","bench_timeout","bench_daily","bench_pause","bench_funnel","bw_stale_hours","colo_stale_days",
      "backfill","recheck","exploit","max_latency","max_ips_v4","max_ips_v6","country_max_pct","per24_max","per48_max",
      "scan_mode","target_active","target_prefixes","explore_interval","explore_fraction","operator_v6","count_v6"].forEach(k=>{
        const v=d[k];

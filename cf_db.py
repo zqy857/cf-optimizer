@@ -336,7 +336,7 @@ def _quota_ok(conn, country, pct):
 
 _EXISTING_COLS = ("ok_count,fail_count,fail_streak,last_ok_at,last_fail_at,"
                   "latency_ms,lat_ewma_ms,bandwidth_mbps,bw_last_mbps,bw_last_at,"
-                  "bw_ewma_mbps,colo,loc,verified_at,first_seen,port")
+                  "bw_ewma_mbps,colo,loc,verified_at,first_seen,port,state")
 
 
 def upsert(conn, rec, country_pct=0):
@@ -360,12 +360,12 @@ def upsert(conn, rec, country_pct=0):
             if not _quota_ok(conn, _country(rec["colo"]), country_pct):
                 return "refused"
         (p_ok, p_fail, p_fs, p_lok, p_lfail, p_lat, p_latw, p_bw, p_bwlast,
-         p_bwlastat, p_bww, p_colo, p_loc, p_ver, p_first, p_port) = (
+         p_bwlastat, p_bww, p_colo, p_loc, p_ver, p_first, p_port, p_state) = (
             0, 0, 0, None, None, None, None, None, None, None, None, None, None,
-            None, now, 443)
+            None, now, 443, "")
     else:
         (p_ok, p_fail, p_fs, p_lok, p_lfail, p_lat, p_latw, p_bw, p_bwlast,
-         p_bwlastat, p_bww, p_colo, p_loc, p_ver, p_first, p_port) = row
+         p_bwlastat, p_bww, p_colo, p_loc, p_ver, p_first, p_port, p_state) = row
 
     ok_count = (p_ok or 0) + ok
     fail_count = (p_fail or 0) + fail
@@ -403,10 +403,15 @@ def upsert(conn, rec, country_pct=0):
     verified = bool(colo)
     sc = cf_health.score(ok_count, fail_count, lat_v, bw_v, verified, last_ok_at, now)
     st = cf_health.classify(ok_count, fail_streak, sc, last_ok_at, now, verified)
-    if st == cf_health.STATE_ACTIVE:
-        # 热榜名次只能由 health_refresh 的排名决定(它带真实 target_active)。
-        # 单条 upsert 若自行提拔, 热榜会膨胀成"所有分数达标的IP"
-        # (实测 1371 条, 而目标是 500x2=1000), 且排序会被随机先后顺序带偏。
+    if st == cf_health.STATE_ACTIVE and p_state != cf_health.STATE_ACTIVE:
+        # 热榜"名次"只能由 health_refresh 的排名决定(它带真实 target_active,
+        # 每协议取前 N 名)。所以单条 upsert 不能把没在榜的 IP 提拔进榜, 否则热榜
+        # 会膨胀成"所有分数达标的IP"(实测 1371 条 vs 目标 1000)。
+        #
+        # 但反过来: 已经在榜的 active 被一次成功复测就打成 reserve 是错的 ——
+        # active 的复测间隔本来就短(几十分钟), 一轮下来几乎每个在榜 IP 都会被
+        # 探到并被抹掉, 而 health_refresh 一轮只跑一次, 于是热榜在轮内塌成
+        # 一两百条(实测 1000 -> 220)。所以只在"上一轮不是 active"时才降级。
         st = cf_health.STATE_RESERVE
     iv = cf_health.state_interval(st, sc, fail_streak, verified)
     nxt = cf_health.next_check_for(ip, st, sc, fail_streak, last_ok_at, last_fail_at,
@@ -1019,6 +1024,19 @@ def _load_bench_mem(db_path, now):
                       pause=float(m.get("bench_pause") or 0))
 
 
+def bench_left_day(db_path, daily_limit, now=None):
+    """当日剩余额度(不考虑每小时桶)。用于给"发现量"定收敛上限。"""
+    now = now or time.time()
+    if not daily_limit or int(daily_limit) <= 0:
+        return 10 ** 9
+    day, hour = _bench_keys(now)
+    if _BENCH_MEM["day"] != day:
+        _load_bench_mem(db_path, now)
+    if now < _BENCH_MEM["pause"]:
+        return 0
+    return max(0, int(daily_limit) - _BENCH_MEM["n"])
+
+
 def bench_quota(db_path, daily_limit, now=None):
     """本轮还允许测几个 IP: min(今日剩余, 本小时剩余)。失败也消耗额度。"""
     now = now or time.time()
@@ -1297,30 +1315,46 @@ async def run_session(nets, known, q, args, stop, nets6=None):
             # 纯属白扫(探测+TLS 全做、永远进不了热榜)。原来两者脱钩: 每 30 分钟
             # 发现 150 个 vs 每天只测得起 100 个 -> 命中率 1:72。
             _daily = int(getattr(args, "bench_daily", 0) or 0)
-            _left = bench_quota(args.db, _daily) if _daily > 0 else None
+            _funnel = int(getattr(args, "bench_funnel", 10) or 10)
 
-            def proto_count(key, mi, base, enabled, left=None):
-                """返回 (本轮抽样数, 剩余可用额度); left=None 表示不设额度上限。"""
-                def spend(n):
-                    return (n, left - n) if left is not None else (n, None)
+            def want_count(key, mi, base, enabled, need_active):
+                """本协议本轮想要的抽样量(不考虑测速额度)。
+
+                注意 need_active 分支: active 有缺口时, 即使模式因 3 轮迟滞还停在
+                maintenance, 也按你设定的抽样量(base)全力发现 —— 否则会出现
+                "界面显示 发现期 / count=0" 的空转(迟滞期内抽样量被吞掉)。
+                """
                 if not enabled:
-                    return spend(0)
-                if left is not None and left <= 0:
-                    return spend(0)              # 今日额度用尽 -> 不再发现
-                if mi["mode"] != "maintenance":
-                    return spend(cf_policy.scan_count(mi["mode"], base))
+                    return 0
                 d = deficits.get(key, {})
+                if mi["mode"] != "maintenance":
+                    return cf_policy.scan_count(mi["mode"], base)   # 发现/恢复: 正常量
+                if need_active:
+                    return base        # 有 active 缺口: 按你设定的抽样量全力发现
                 if d.get("deficit_reserve", 0) > 0:
-                    n = max(50, int(base * cf_policy.FILL_FRACTION))  # 填充库容: 温和但持续
-                elif explore_light:
-                    n = max(20, int(base * explore_fraction))          # 值守: 低频探索找更优
+                    return max(50, int(base * cf_policy.FILL_FRACTION))  # 填充库容
+                if explore_light:
+                    return max(20, int(base * explore_fraction))         # 值守: 低频探索
+                return 0                                                # 完全静默
+
+            # 收敛: 发现量不超过"当日剩余额度 × 漏斗倍数"。
+            # 倍数 >1 是有意的 —— 探测不花 Worker 配额, 而且每轮是从这批候选里挑
+            # 延迟最低的若干个去测速; 候选池必须远大于测量量, 否则失去筛选意义。
+            # 额度按各自"想要的量"等比缩减(而不是先到先得), v4/v6 互不抢。
+            _w4 = want_count("v4", mi4, args.count, bool(nets),
+                             (deficits.get("v4") or {}).get("deficit", 0) > 0)
+            _w6 = want_count("v6", mi6, v6_count, bool(nets6),
+                             (deficits.get("v6") or {}).get("deficit", 0) > 0)
+            _tot = _w4 + _w6
+            if _daily > 0 and _tot > 0:
+                _cap = bench_left_day(args.db, _daily) * max(1, int(_funnel))
+                if _tot > _cap:
+                    _k = _cap / float(_tot)
+                    _c4, _c6 = int(_w4 * _k), int(_w6 * _k)
                 else:
-                    n = 0                                            # 完全静默
-                if left is not None:
-                    n = min(n, left)               # 别超过今天测得起的量
-                return spend(n)
-            _c4, _left2 = proto_count("v4", mi4, args.count, bool(nets), _left)
-            _c6, _left3 = proto_count("v6", mi6, v6_count, bool(nets6), _left2)
+                    _c4, _c6 = _w4, _w6
+            else:
+                _c4, _c6 = _w4, _w6
             bud = {
                 "count": _c4,
                 "count_v6": _c6,
@@ -1722,6 +1756,10 @@ def main():
                          "注意: 每流=一个 Worker 请求, 并行越高请求越多")
     ap.add_argument("--bench-daily", type=int, default=400,
                     help="每日测速 IP 数硬上限(请求预算; 失败也算额度; 0=不限)")
+    ap.add_argument("--bench-funnel", type=int, default=10,
+                    help="发现量/测量量 的漏斗倍数: 每轮抽样量最多为当日剩余"
+                         "测速额度的该倍数(默认10)。探测不花配额, 候选池应远大于"
+                         "测量量; 调小=更省库容, 调大=候选更多样")
     ap.add_argument("--bench-pause", type=int, default=1800,
                     help="测速连续失败达阈值后暂停测速的秒数(防空打 Worker)")
     ap.add_argument("--colo-stale-days", type=float, default=7,

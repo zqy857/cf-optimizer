@@ -1824,6 +1824,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <span id="dbpath" class="sub" style="margin:0;font-size:12px"></span>
     <span id="pill" class="pill idle">待命</span>
   </header>
+  <div id="pollErr" style="display:none;background:#7f1d1d;color:#fff;padding:7px 14px;font-size:13px;font-weight:600"></div>
   <div class="content">
     <section class="view on" id="v-overview">
       <div class="card">
@@ -2677,7 +2678,6 @@ function renderLog(entries){
 }
 
 async function poll(){
-  console.log("[DBG] poll tick");
   try{
     const st=await (await fetch("/api/status")).json();
     $("dbpath").textContent=st.db||""; $("ver").textContent=st.version||"?";
@@ -2688,7 +2688,7 @@ async function poll(){
     const lc=st.lifecycle||{};
     const fillLeft=((lc.v4||{}).deficit_reserve||0)+((lc.v6||{}).deficit_reserve||0);
     if(st.running){pill.className="pill run";
-      pill.textContent=(fill?"填充库容":(exp?"值守探索":(mon?"值守监控":"扫描中")))+mname
+      pill.textContent=(fill?"填充库容":(exp?"值守探索":(mon?"值守监控":"扫描中")))
         +(fill?(" · 待补 "+fillLeft):(mon?(" · 到期 "+st.monitor_due):(" · 第"+st.round+"轮 · 本轮达标 "+st.last_ok)));
       $("startBtn").disabled=true;$("stopBtn").disabled=false;}
     else{pill.className=st.msg.startsWith("错误")?"pill stop":"pill idle";
@@ -2728,7 +2728,16 @@ async function poll(){
     barChart("ch_country",s.countries,"#38d3f8");
     histChart("ch_lat",s.lat.labels,s.lat.data,"#fbbf24");
     histChart("ch_bw",s.bw.labels,s.bw.data,"#2fd6a3");
-  }catch(e){console.error('[poll]',e&&e.message)}
+  }catch(e){
+    /* 这一段以前只是 console.error, 页面就静默停更了 —— 表现为"扫描没启动"。
+       现在把错误显示出来, 脚本再坏也不会伪装成"没在扫"。 */
+    console.error('[poll]',e&&e.message);
+    const bar=$("pollErr");
+    if(bar){
+      if(e){bar.style.display="";bar.textContent="⚠ 页面状态刷新出错（扫描器可能仍在跑, 只是界面没更新）: "+(e&&e.message||e);}
+      else bar.style.display="none";
+    }
+  }
   setTimeout(poll,2000);
 }const CNT={};function countTo(id,val,fmtK,sfx){
   const el=$(id); if(!el||val==null)return;

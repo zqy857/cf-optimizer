@@ -1864,14 +1864,15 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
               <div class="fc-head">① 可用IP不足<span class="fc-cond">可用 &lt; 目标可用IP数</span></div>
               <div class="fc-params">
                 <div class="fc-text">每轮抽满 <span class="pn">抽样数/轮</span> 个新 IP 去探测（v4 / v6 各算各的，互不抢）。</div>
-                <div class="fc-text">先用完 reserve 池里分数最高的（快速确认），不够才抽新的。</div>
+                <div class="fc-text">同时<b>并行</b>再带上两批：到期复测的 IP + 从 reserve 池提 <span class="pn">缺口</span> 个最高的（快速确认）。三批<b>相加</b>，不是先用完再抽。</div>
               </div>
             </div>
             <div class="fc-conn"><span>↓ 可用够了</span></div>
             <div class="fc-node p2">
               <div class="fc-head">② 库容不足<span class="fc-cond">总库 &lt; 库上限</span></div>
               <div class="fc-params">
-                <div class="fc-text">抽样量降为 <span class="pn">抽样数 × 30%</span>，温和地把备用池养到上限。</div>
+                <div class="fc-text">抽样量 = <span class="pn">max(50, min(抽样数, 抽样数×30%, 实际库容缺口))</span>。</div>
+                <div class="fc-text"><b>被缺口封顶</b>是重点：缺口常常只剩个位数，若固定按 30% 扫 500 个，会让"补库容↔值守"每轮来回横跳（缺口 1 个却扫 150 个），白费探测。补不满 50 就至少补 50。</div>
                 <div class="fc-text">备胎池目标自动 = <span class="pn">库上限 − 目标可用数</span>，不用另设。</div>
               </div>
             </div>
@@ -1879,7 +1880,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
             <div class="fc-node p3">
               <div class="fc-head">③ 低频探索<span class="fc-cond">不缺了，但该找更优的了</span></div>
               <div class="fc-params">
-                <div class="fc-text">扫 <span class="pn">抽样数 × 探索比例%</span> 个新 IP 去找更快的；<b>只有实测带宽够高才可能顶掉老 IP</b>。</div>
+                <div class="fc-text">扫 <span class="pn">max(20, 抽样数 × 探索比例%)</span> 个新 IP 去找更快的；<b>只有实测带宽够高才可能顶掉老 IP</b>。</div>
               </div>
             </div>
             <div class="fc-conn"><span>↓ 还没到点</span></div>
@@ -1892,10 +1893,13 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
             <div class="fc-node p3">
               <div class="fc-head">⚙️ 所有阶段都在做<span class="fc-cond">不受上面 4 条影响</span></div>
               <div class="fc-params">
-                <div class="fc-text">判定"可用"：TCP 能连 + TLS 握手通过 + 延迟 ≤ <span class="pn">最大延迟</span>。</div>
+                <div class="fc-text"><b>达标</b>（进识别/测速的门槛）：TCP 能连 + TLS 握手通过 + 延迟 ≤ <span class="pn">最大延迟</span>。</div>
+                <div class="fc-text"><b>但"达标"≠"可用"</b>：可用 = 质量分 ≥ 40 <b>且</b> 6 小时内确认存活，再按分数排名硬卡 <span class="pn">目标可用数</span> 个。上面 4 条规则看的全是"可用"这个数。</div>
                 <div class="fc-text">按 <span class="pn">复测批量</span> 处理到期 IP、按 <span class="pn">地区补全/批</span> 补缺地区、按 <span class="pn">测带宽/批</span> 补带宽 —— 这几项在值守期也照跑。</div>
                 <div class="fc-text"><b>不会过冲</b>：可用IP的名次由质量分排名决定、硬卡在 <span class="pn">目标可用IP数</span> 个，所以"不足就扫、够了就歇"是自限开关，不存在扫过头再回调。</div>
                 <div class="fc-text"><b>带宽至上</b>：实测带宽是入榜硬门槛 —— 只测了延迟、没测带宽的 IP 分数上限只有 ~40 分（延迟+可用率满分），刚压线且随时会被真实带宽拉下来，所以实测过带宽的 IP 几乎必然排在前面。</div>
+                <div class="fc-text"><b>两处代码里有、但容易漏掉的边界</b>：① <span class="pn">目标可用IP数</span> 设得比库上限还大时会被压到上限（否则"补满了又裁"来回抖）；② 界面显示的阶段取 v4/v6 里<b>更在干活</b>的那个（优先级 发现 &gt; 补库容 &gt; 探索 &gt; 值守），所以看到"补库容"不代表两边都在补。</div>
+                <div class="fc-text"><b>测速额度</b>：每轮测速量 = min(<span class="pn">测带宽/批</span>, 今日剩余额度)。额度用完本轮<b>只探测不测速</b>，发现量不受影响 —— 额度只管测速。</div>
               </div>
             </div>
             <div class="fc-conn up"><span>↺ 可用IP失效 / 出现缺口 → 自动回到 ①</span></div>

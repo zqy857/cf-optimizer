@@ -1896,6 +1896,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
               </div>
             </div>
             <div class="fc-conn up"><span>↺ 可用IP失效 / 出现缺口 → 自动回到 ①</span></div>
+          </div>
           </details>
       </div>
 
@@ -2155,11 +2156,11 @@ function copyText(txt){
     ta.remove();res(ok);
   });
 }
-function toast(text,cls){
+function toast(text,cls,ms){
   const t=$("toast");if(!t)return;
   t.textContent=text;t.className=cls||"";t.classList.add("show");
   clearTimeout(toast._t);
-  toast._t=setTimeout(()=>{t.classList.remove("show")},2400);
+  toast._t=setTimeout(()=>{t.classList.remove("show")},ms||2400);
 }
 function copySel(){
   const ips=[...SEL].sort();
@@ -2441,13 +2442,35 @@ function svcAct(action){
     .then(r=>r.json()).then(r=>{
       if(!r.ok){toast("操作失败: "+(r.error||"未知错误"),"err");if(btn)btn.disabled=false;return;}
       toast(r.message||(names[action]+"指令已发送"),"ok");
-      if(action==="restart"){setTimeout(()=>location.reload(),7000);return;}
+      if(action==="restart"){watchRestart(btn);return;}
       if(action==="stop"){
         setTimeout(()=>{document.body.innerHTML='<div style="padding:40px;font-family:sans-serif;opacity:.85">后台服务已停止。<br>请在设备上重新启动服务, 或重启设备(需已开启开机自启)。</div>';},1500);
         return;
       }
       setTimeout(loadService,900);
     }).catch(err=>{toast("请求失败: "+err,"err");if(btn)btn.disabled=false;});
+}
+
+/* 重启是异步的: 不再"睡7秒盲目 reload", 而是轮询等真的回来。
+   没回来就明确报错, 免得对着一个死页面干瞪眼。 */
+function watchRestart(btn){
+  let tries=0;
+  const tick=()=>{
+    tries++;
+    fetch("/api/service",{cache:"no-store"}).then(r=>r.json()).then(()=>{
+      if(tries<2){setTimeout(tick,1500);return;}
+      location.reload();
+    }).catch(()=>{
+      if(tries>=24){
+        toast("服务没有恢复(已等约36秒)。请到设备上查看: journalctl -u cf-optimizer -n 50","err",9000);
+        if(btn)btn.disabled=false;
+        return;
+      }
+      setTimeout(tick,1500);
+    });
+  };
+  toast("服务重启中, 正在等待恢复...",  "ok");
+  setTimeout(tick,1500);
 }
 function tableParams(){
   const region=($("f_region").value||"").split(",").map(s=>s.trim()).filter(Boolean);
@@ -3465,7 +3488,10 @@ def service_info():
 
 def _delayed_ctl(verb, unit):
     time.sleep(0.6)
-    _run_ctl(verb, unit, sudo=True, timeout=25)
+    # 必须留下返回码: 之前这里把结果直接丢掉, sudoers 不匹配/systemd 忙时
+    # 界面照样提示"服务重启中"然后刷新到一个死页面, 完全没有错误信息。
+    rc, out, err = _run_ctl(verb, unit, sudo=True, timeout=25)
+    print(f"[svc] systemctl {verb} {unit} -> rc={rc} {err or out}".strip(), flush=True)
 
 
 def _delayed_execv():

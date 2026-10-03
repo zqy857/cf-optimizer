@@ -655,7 +655,9 @@ def scanner_worker(args):
 def start_scan(params, db):
     st = get_state()
     if st["running"]:
-        return {"ok": False, "error": "正在扫描中"}
+        # 幂等: 已经在扫就当成功, 别报"失败"让用户以为要重开服务
+        return {"ok": True, "message": "扫描已在运行中", "running": True,
+                "label": st.get("label", "")}
     args = scan_args(params, db)
     op_name = ({None: "官方全网", "": "官方全网", "cf": "CF官方优选",
                 "ct": "电信优选", "cu": "联通优选", "cmcc": "移动优选"}.get(args.operator, args.operator))
@@ -1971,13 +1973,6 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
       </div>
 
       <div class="card">
-        <div class="h">⚙️ 扫描策略</div>
-        <div class="row">
-          
-        </div>
-      </div>
-
-      <div class="card">
         <div class="row" style="align-items:center">
           <button id="startBtn" onclick="control('start')">开始扫描</button>
           <button id="stopBtn" class="stop" onclick="control('stop')" disabled>停止</button>
@@ -2365,7 +2360,8 @@ function control(act){
       tls_check:$("tls_check").checked?"1":"0",
       ipv6:$("ipv6").checked?"1":"0"})}).then(r=>r.json()).then(r=>{
     $("startBtn").textContent="开始扫描";
-    if(!r.ok&&r.error){$("msg").textContent="启动失败: "+r.error}
+    if(!r.ok&&r.error){$("msg").textContent="启动未成功: "+r.error}
+    else if(r.running){$("msg").textContent="扫描已在运行中, 下方状态与日志是实时的";}
     else if(act==="start"){$("msg").textContent="启动指令已送达, 扫描开始, 请留意下方状态与日志";}
     else{$("msg").textContent="停止指令已送达, 正在结束本轮探测...";}
   }).catch(e=>{ $("startBtn").textContent="开始扫描";

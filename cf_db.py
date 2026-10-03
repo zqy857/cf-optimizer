@@ -5,27 +5,28 @@ CF 优选IP 扫描数据库 (常驻稳定扫描器) - 增强版
 持续扫描, 所有 IP 及其延迟/带宽/机房/国家累积进 SQLite 数据库, 可断点续扫, 按需导出。
 完全自包含, 无第三方依赖, Python 3.8+ 标准库即可。
 
-增强能力:
+核心能力:
   * 多端口探测   --ports 443,2053,2083,8443  自动找到该IP可用端口(部分IP并非全端口开放)
   * TLS握手二次确认  TCP能连≠真CF边缘; 握手探测(SNI=cloudflare.com)通过后才算"存活"
-  * 优秀/24邻域加权采样  --exploit 命中过好IP的C段优先抽, 达标命中率远高于纯随机
   * 冷却期自动复测  --cooldown 失败的IP/旧IP冷却后自动重新探测, 不再永久拉黑
-  * 每轮自动复核  --recheck 复核库内旧IP(存活刷新+失败重试), 名单永新
+  * 带宽实测 + 机房/国家识别  见 --bench-* / --colo-stale-days
+  * 按周期分层复测  每个IP有自己的检查周期(质量分越高测得越勤), 失败指数退避
 
-核心流程(按周期循环):
-  1. 发现: 邻域加权+全池随机抽 --count 个候选, 多端口并发拨号+TLS确认测延迟
-  2. 验证: 对新达标的候选做地区识别(colo/loc), 预算内再实测带宽
-  3. 沉淀: 结果实时写入数据库(可随时 Ctrl+C 安全退出, 下次接着扫)
-  4. 复核: 每轮对库中旧IP重新探测, 剔除失效项, 保证名单时效
+每轮就四步:
+  1. 按缺口抽候选  cf_policy.decide 的 4 条规则决定抽多少(v4/v6 各算各的):
+                   可用IP不足→抽满 --count；库容不足→30%；该探索了→10%；否则不抽
+  2. 探测          多端口并发拨号 + TLS确认, 测延迟
+  3. 深度处理      按延迟挑一批做地区识别, 再挑一批实测带宽(带宽是入榜硬门槛)
+  4. 落库+剔除     结果实时写库; 每轮剔除失效/地区超配额/超库容上限的
 
 用法示例:
   python3 cf_db.py                      # 默认连续扫描, 每轮抽 5000
   python3 cf_db.py --operator ct        # 电信优选段
   python3 cf_db.py --once               # 只跑一轮就退出(便于测试/限量)
+  python3 cf_db.py --target-active 500   # 可用IP目标(每协议各算)
   python3 cf_db.py --cycles 50 --gap 20 # 跑50轮, 轮间歇20秒
   python3 cf_db.py --ports 443,8443     # 只测 443 和 8443
   python3 cf_db.py --no-tls-check       # 关闭TLS二次确认(更快但质量略低)
-  python3 cf_db.py --exploit 0.8        # 更多向优质C段倾斜
   python3 cf_db.py --reverify           # 只复核库内现有优质IP, 不发现新IP
   python3 cf_db.py --stats              # 查看库统计/覆盖率/达标率
   python3 cf_db.py --export top.txt     # 导出当前最优 N 条 (--top N, 可加 --region)
@@ -84,8 +85,6 @@ OPERATOR_URLS = {
 OPERATOR_NAMES = {"cf": "CF官方优选", "ct": "电信优选", "cu": "联通优选", "cmcc": "移动优选"}
 # 单轮抽样里每个前缀最多贡献几个候选: 不加限制时, "优质邻域利用"会把整轮候选
 # 都堆到少数几个前缀上(实测 v6 有 233 个 /48 在反复出票), 库看起来高度雷同。
-PER24_PER_ROUND = 3                # 每个 v4 /24 单轮最多 3 个
-PER48_PER_ROUND = 4                # 每个 v6 /48 单轮最多 4 个
 TRACE_HOST = "cloudflare.com"
 SPEED_HOST = "speed.cloudflare.com"
 PORTS_DEFAULT = [443, 2053, 2083, 8443]
@@ -646,25 +645,6 @@ def net24(ip):
     return ".".join(ip.split(".")[:3])
 
 
-def fetch_hot24(path, limit=80, raw=False, cap=cf_lifecycle.PER24_MAX):
-    """优质 v4 /24 邻域(按历史净成功加权). cap: 已达该前缀配额的 /24 不再返回,
-    避免"发现->超额->剔除"的空转(与生命周期去重联动)。"""
-    try:
-        conn = sqlite3.connect(path)
-        q = (f"SELECT {N24_SQL} AS n, SUM(ok_count) g, SUM(fail_count) f, COUNT(*) c "
-             f"FROM ips WHERE instr(ip, ':')=0 GROUP BY n "
-             f"ORDER BY (SUM(ok_count)-SUM(fail_count)) DESC, g DESC")
-        rows = conn.execute(q).fetchall()
-        conn.close()
-    except Exception:
-        return []
-    hot = [(n, (g or 0), (f or 0), c) for n, g, f, c in rows]
-    if raw:
-        return hot
-    hot = [(n, max(1, g)) for n, g, f, c in hot if g and g >= 1 and c < cap]
-    return hot[:limit]
-
-
 def fetch_due(path, limit, now=None):
     """分层调度: 取已到复测时间(next_check_at<=now)的 IP, 最久到期者优先。
 
@@ -715,128 +695,44 @@ def fetch_backfill(path, limit, cooldown):
         return []
 
 
-def discover(nets, hot24, count, ports, known, cooldown, exploit_frac):
+def discover(nets, count, ports, known, cooldown):
+    """v4 候选抽样: 在官方大段里均匀随机取址, 不限前缀。
+
+    早期版本把 60% 的名额投给"库内已证明优质的 /24 邻域", 命中率高, 但地址会
+    高度雷同(实测 v6 曾集中在仅 233 个 /48 上反复出票)。现按"不做前缀限制,
+    所有前缀一视同仁"抽, 去掉邻域加权。
+    """
     now = time.time()
-
-    def eligible(ip):
-        t = known.get(ip)
-        return t is None or (now - t) >= cooldown
-
-    def take_ip(net_or_pre, tries_cap, skip_known):
-        if isinstance(net_or_pre, str):
-            base = int(ipaddress.ip_address(net_or_pre + ".0"))
-            max_tries = min(tries_cap, 256)
-            for _ in range(max_tries):
-                ip = str(ipaddress.ip_address(base + random.randrange(256)))
-                if ip in known and skip_known:
-                    continue
-                if not eligible(ip):
-                    continue
-                return ip
-            return None
-        max_tries = min(tries_cap, 1 << (32 - net_or_pre.prefixlen))
-        for _ in range(max_tries):
-            ip = str(random_ip_in_net(net_or_pre))
-            if ip in known and skip_known:
-                continue
-            if not eligible(ip):
-                continue
-            return ip
-        return None
-
     cands = []
-    n_exploit = min(count, int(count * exploit_frac)) if hot24 else 0
-    exhausted = set()
-    hot_pre = [p for p, _ in hot24]
-    hot_w = [w for _, w in hot24]
-    hot_total = sum(hot_w)
-
-    from_pre = {}
-    for _ in range(n_exploit):
-        if hot_total <= 0:
-            break
-        pre = random.choices(hot_pre, weights=hot_w)[0]
-        if pre in exhausted or from_pre.get(pre, 0) >= PER24_PER_ROUND:
-            continue
-        ip = take_ip(pre, count, skip_known=False)
-        if ip is None:
-            exhausted.add(pre)
-            continue
-        from_pre[pre] = from_pre.get(pre, 0) + 1
-        known[ip] = now
-        cands.append((ip, tuple(ports)))
-
-    for _ in range(count - n_exploit):
-        if not nets:
-            break
+    for _ in range(int(count)):
         net = random.choice(nets)
-        if net in exhausted:
+        ip = str(random_ip_in_net(net))
+        if ip in known:
             continue
-        ip = take_ip(net, count * 8, skip_known=True)
-        if ip is None:
-            exhausted.add(net)
+        t = known.get(ip)
+        if t is not None and (now - t) < cooldown:
             continue
         known[ip] = now
         cands.append((ip, tuple(ports)))
-
     return cands
 
 
-def v6_prefix(ip, hextets=3):
-    """IPv6 邻域前缀。CF 的 v6 anycast 是按 /48 公告的: 同一 /48 内任意地址几乎都可达,
-    而未公告的 /48 则全灭。故用 /48(前 3 段)作为 v6 的"学习/利用单元"."""
-    try:
-        parts = ipaddress.ip_address(ip).exploded.split(":")
-    except ValueError:
-        return ip
-    return ":".join(parts[:hextets])
-
-
-def fetch_hot_v6(path, limit=60, cap=cf_lifecycle.PER48_MAX):
-    """从库内已存活 v6 聚合出优质 /48 邻域(按成功次数加权), 供发现时优先利用.
-    cap: 已达该 /48 配额的邻域不再返回(与去重联动, 防止同 /48 反复超容/回填 churn)."""
-    try:
-        conn = sqlite3.connect(path)
-        rows = conn.execute("SELECT ip, ok_count FROM ips WHERE instr(ip,':')>0 "
-                            "AND ok_count>0").fetchall()
-        conn.close()
-    except Exception:
-        return []
-    agg = {}
-    cnt = {}
-    for ip, ok in rows:
-        p = v6_prefix(ip)
-        agg[p] = agg.get(p, 0) + (ok or 0)
-        cnt[p] = cnt.get(p, 0) + 1
-    hot = [(p, w) for p, w in agg.items() if cnt.get(p, 0) < cap]
-    hot.sort(key=lambda x: -x[1])
-    return [(p, max(1, w)) for p, w in hot[:limit]]
-
-
-def discover_v6(nets6, count, ports, known, cooldown, hot48=None, exploit_frac=0.7):
-    """IPv6 候选抽样。
-
-    1) 先用尽优选 /128 列表(命中率高)
-    2) 邻域利用: 在已知优质 /48 内随机取址(实测 /48 内命中率接近 100%)
-    3) 余量对官方大段随机抽样, 探索新的 /48 邻域
-    总数不超过 count。
-    """
+def discover_v6(nets6, count, ports, known, cooldown):
+    """v6 候选抽样: 优选 /128 列表优先, 余量在官方大段里均匀随机取址(不限前缀)。"""
     now = time.time()
-
-    def eligible(ip):
-        t = known.get(ip)
-        return t is None or (now - t) >= cooldown
-
-    def add(ip):
-        if ip in seen or ip in known or not eligible(ip):
-            return False
-        known[ip] = now
-        seen.add(ip)
-        cands.append((ip, tuple(ports)))
-        return True
-
     cands = []
     seen = set()
+
+    def add(ip):
+        if ip in seen:
+            return False
+        t = known.get(ip)
+        if t is not None and (now - t) < cooldown:
+            return False
+        seen.add(ip)
+        known[ip] = now
+        cands.append((ip, tuple(ports)))
+        return True
 
     curated = [n for n in nets6 if n.prefixlen >= 64]
     random.shuffle(curated)
@@ -845,30 +741,8 @@ def discover_v6(nets6, count, ports, known, cooldown, hot48=None, exploit_frac=0
             break
         add(str(random_ip_in_net(net)))
 
-    # 邻域利用: 在已知优质 /48 内随机生成本轮新地址
-    hot48 = hot48 or []
-    n_exploit = min(count - len(cands), int(count * exploit_frac))
-    if hot48 and n_exploit > 0:
-        pre = [p for p, _ in hot48]
-        w = [x for _, x in hot48]
-        added = tries = 0
-        from_p48 = {}
-        while added < n_exploit and len(cands) < count and tries < n_exploit * 6:
-            tries += 1
-            p = random.choices(pre, weights=w)[0]
-            if from_p48.get(p, 0) >= PER48_PER_ROUND:
-                continue
-            try:
-                net = ipaddress.ip_network(p + "::/48")
-            except ValueError:
-                continue
-            if add(str(random_ip_in_net(net))):
-                from_p48[p] = from_p48.get(p, 0) + 1
-                added += 1
-
     big = [n for n in nets6 if n.prefixlen < 64]
-    remaining = max(0, count - len(cands))
-    for _ in range(remaining):
+    for _ in range(max(0, count - len(cands))):
         if not big:
             break
         net = random.choice(big)
@@ -1022,19 +896,6 @@ def _load_bench_mem(db_path, now):
                       n=int(m.get("bench_n") or 0), h=int(m.get("bench_h") or 0),
                       fails=int(m.get("bench_fails") or 0),
                       pause=float(m.get("bench_pause") or 0))
-
-
-def bench_left_day(db_path, daily_limit, now=None):
-    """当日剩余额度(不考虑每小时桶)。用于给"发现量"定收敛上限。"""
-    now = now or time.time()
-    if not daily_limit or int(daily_limit) <= 0:
-        return 10 ** 9
-    day, hour = _bench_keys(now)
-    if _BENCH_MEM["day"] != day:
-        _load_bench_mem(db_path, now)
-    if now < _BENCH_MEM["pause"]:
-        return 0
-    return max(0, int(daily_limit) - _BENCH_MEM["n"])
 
 
 def bench_quota(db_path, daily_limit, now=None):
@@ -1249,6 +1110,11 @@ async def run_session(nets, known, q, args, stop, nets6=None):
 
 
     last_explore = {"t": 0.0}
+    explore_interval = float(getattr(args, "explore_interval", 30 * 60) or 1800)
+    explore_fraction = float(getattr(args, "explore_fraction", 0.1) or 0.1)
+    bench_daily = int(getattr(args, "bench_daily", 0) or 0)
+    phase = "monitor"
+    pure_monitor = True
 
     def _take_bench_stat():
         """取出并清零本轮测速计数(交给上层用同一条连接写回 meta)."""
@@ -1257,136 +1123,54 @@ async def run_session(nets, known, q, args, stop, nets6=None):
         return ok, fail
 
     async def discovery_cycle():
-        nonlocal verified
+        """一轮 = 定预算(4条规则) -> 组候选 -> 探测 -> 深度处理+测速。"""
+        nonlocal verified, phase, pure_monitor
         verified = set()
         have_colo = set()
         stale_colo = set()
         bw_info = {}
         active_set = set()
-        deficits = {}
         next_due = None
         due_count = 0
-        active_mode = True
-        explore = True
-        v6_count = getattr(args, "count_v6", args.count)
-        bud = {"count": 0, "count_v6": 0, "verify": args.verify or 10 ** 9,
-               "bench": args.bench, "recheck": args.recheck}
+        v6_count = int(getattr(args, "count_v6", 0) or 0) or int(args.count)
+        bud = {"count": 0, "count_v6": 0, "bench": args.bench, "recheck": args.recheck}
+        dec = {}
         try:
             conn_v = sqlite3.connect(args.db)
-            _maybe_refresh_health(conn_v, getattr(args, "target_active", 0))
-            target_active = getattr(args, "target_active", cf_policy.TARGET_ACTIVE)
-            target_prefixes = getattr(args, "target_prefixes", cf_policy.TARGET_PREFIXES)
-            force = getattr(args, "scan_mode", "auto") or "auto"
-            modes = cf_policy.evaluate_all(
-                conn_v, target_active=target_active,
-                target_prefixes=target_prefixes, force=force,
-                max_v4=int(getattr(args, "max_ips_v4", 0) or 0),
-                max_v6=int(getattr(args, "max_ips_v6", 0) or 0))
-            mi4, mi6 = modes["v4"], modes["v6"]
-            active_mode = any(m["mode"] != "maintenance" for m in (mi4, mi6))
-            deficits = cf_lifecycle.replenish_need(conn_v, target_active,
-                                                   args.max_ips_v4, args.max_ips_v6)
+            target_active = int(getattr(args, "target_active", 0) or 0)
+            # 先按质量分排名把 active 定到目标个数(名次只由它决定)
+            _maybe_refresh_health(conn_v, target_active)
             now = time.time()
-            reserve_need = any(d["deficit_reserve"] > 0 for d in deficits.values())
-            active_need = any(d["deficit"] > 0 for d in deficits.values())
-            explore_full = active_mode or active_need or reserve_need
-            explore_interval = getattr(args, "explore_interval", cf_policy.EXPLORE_INTERVAL)
-            explore_fraction = getattr(args, "explore_fraction", cf_policy.EXPLORE_FRACTION)
-            # 值守期"低频探索": 库已满也每隔设定时间抽一小批找更好的IP(默认30分/10%)
-            explore_light = (not explore_full) and (
-                now - last_explore["t"] >= explore_interval)
-            explore = explore_full or explore_light
-            pure_monitor = (not active_mode) and (not explore)
-            if active_mode or active_need:
-                phase = "discover"
-            elif reserve_need:
-                phase = "fill"
-            elif explore_light:
-                phase = "explore"
-            else:
-                phase = "monitor"
-            sb4 = cf_policy.shared_budget(mi4["mode"], args.verify, args.bench,
-                                          args.recheck, mi4["active"])
-            sb6 = cf_policy.shared_budget(mi6["mode"], args.verify, args.bench,
-                                          args.recheck, mi6["active"])
+            # 值守期"低频探索": 都不缺了也每隔一段时间抽一小批找更优 IP
+            explore_due = (now - last_explore["t"]) >= explore_interval
+            dec = cf_policy.decide(
+                conn_v, target_active=target_active,
+                max_v4=int(getattr(args, "max_ips_v4", 0) or 0),
+                max_v6=int(getattr(args, "max_ips_v6", 0) or 0),
+                count=int(args.count), count_v6=v6_count,
+                explore_due=explore_due, explore_fraction=explore_fraction,
+                now=now)
 
-            # ---- 发现量必须与"今日还测得起多少个"挂钩 ----
-            # 带宽是入榜硬门槛(没测带宽上限 31 分 < 门槛 40), 额度用完后再发现新 IP
-            # 纯属白扫(探测+TLS 全做、永远进不了热榜)。原来两者脱钩: 每 30 分钟
-            # 发现 150 个 vs 每天只测得起 100 个 -> 命中率 1:72。
-            _daily = int(getattr(args, "bench_daily", 0) or 0)
-            _funnel = int(getattr(args, "bench_funnel", 10) or 10)
+            # 测速请求预算: 当日额度 + 每小时桶, 取更紧的; 用完本轮只探测不测速
+            if bench_daily > 0:
+                left = bench_quota(args.db, bench_daily)
+                bud["bench"] = max(0, min(bud["bench"], left))
 
-            def want_count(key, mi, base, enabled, need_active):
-                """本协议本轮想要的抽样量(不考虑测速额度)。
+            bud["count"] = dec["v4"]["count"] if nets else 0
+            bud["count_v6"] = dec["v6"]["count"] if nets6 else 0
+            phase = dec["phase"]
+            pure_monitor = (phase == "monitor")
 
-                注意 need_active 分支: active 有缺口时, 即使模式因 3 轮迟滞还停在
-                maintenance, 也按你设定的抽样量(base)全力发现 —— 否则会出现
-                "界面显示 发现期 / count=0" 的空转(迟滞期内抽样量被吞掉)。
-                """
-                if not enabled:
-                    return 0
-                d = deficits.get(key, {})
-                if mi["mode"] != "maintenance":
-                    return cf_policy.scan_count(mi["mode"], base)   # 发现/恢复: 正常量
-                if need_active:
-                    return base        # 有 active 缺口: 按你设定的抽样量全力发现
-                if d.get("deficit_reserve", 0) > 0:
-                    return max(50, int(base * cf_policy.FILL_FRACTION))  # 填充库容
-                if explore_light:
-                    return max(20, int(base * explore_fraction))         # 值守: 低频探索
-                return 0                                                # 完全静默
-
-            # 收敛: 发现量不超过"当日剩余额度 × 漏斗倍数"。
-            # 倍数 >1 是有意的 —— 探测不花 Worker 配额, 而且每轮是从这批候选里挑
-            # 延迟最低的若干个去测速; 候选池必须远大于测量量, 否则失去筛选意义。
-            # 额度按各自"想要的量"等比缩减(而不是先到先得), v4/v6 互不抢。
-            _w4 = want_count("v4", mi4, args.count, bool(nets),
-                             (deficits.get("v4") or {}).get("deficit", 0) > 0)
-            _w6 = want_count("v6", mi6, v6_count, bool(nets6),
-                             (deficits.get("v6") or {}).get("deficit", 0) > 0)
-            _tot = _w4 + _w6
-            if _daily > 0 and _tot > 0:
-                _cap = bench_left_day(args.db, _daily) * max(1, int(_funnel))
-                if _tot > _cap:
-                    _k = _cap / float(_tot)
-                    _c4, _c6 = int(_w4 * _k), int(_w6 * _k)
-                else:
-                    _c4, _c6 = _w4, _w6
-            else:
-                _c4, _c6 = _w4, _w6
-            bud = {
-                "count": _c4,
-                "count_v6": _c6,
-                "verify": max(sb4["verify"], sb6["verify"]),
-                "bench": max(sb4["bench"], sb6["bench"]) if (nets or nets6) else 0,
-                "recheck": max(sb4["recheck"], sb6["recheck"]),
-            }
             next_due = conn_v.execute("SELECT MIN(next_check_at) FROM ips").fetchone()[0]
             due_count = conn_v.execute(
                 "SELECT COUNT(*) FROM ips WHERE next_check_at<=?", (now,)).fetchone()[0]
-            q.put({"type": "mode", "modes": modes, "budgets": bud, "explore": explore,
-                   "phase": phase, "deficits": deficits,
-                   "active": mi4["active"] + mi6["active"],
-                   "fresh": mi4["fresh"] + mi6["fresh"],
-                   "prefixes": mi4["prefixes"] + mi6["prefixes"],
-                   "yield": max(mi4["yield"], mi6["yield"]),
-                   "mode": mi4["mode"] if mi4["mode"] != "maintenance" else mi6["mode"],
-                   "reason": f"v4 {mi4['mode']} / v6 {mi6['mode']}" + (" +探索" if explore else "")})
-            # 请求预算: 当日测速次数用完/处于失败暂停期 -> 本轮不测带宽(只探测)
-            if _daily > 0 and bud["bench"] > 0:
-                _l2 = bench_quota(args.db, _daily)
-                if _l2 < bud["bench"]:
-                    bud["bench"] = _l2
-            bw_info = {}
-            active_set = set()
+
             # colo 是"当时接入路径"的快照, 会随路由变化漂移(实测 SIN→HKG、
-            # DFW/SYD→LAX、AMS→CDG、TPE→HKG)。已识别过的 IP 若永不重认, 地区
-            # 数据会越来越陈旧, 而地区均衡还在拿它分组 -> 每轮都在按过期信息
-            # 删IP。识别走 cloudflare.com 的 trace(不占 Worker 配额), 代价极低,
-            # 所以按 colo_stale_days 做保鲜重认。
+            # DFW/SYD→LAX、AMS→CDG、TPE→HKG)。不重认的话地区数据越来越陈旧,
+            # 而地区均衡还在拿它分组 -> 每轮都在按过期信息删 IP。识别走
+            # cloudflare.com 的 trace(不占 Worker 配额), 代价极低, 所以按
+            # colo_stale_days 做保鲜重认。
             _id_stale = float(getattr(args, "colo_stale_days", 7) or 0) * 86400
-            _now_id = time.time()
             for ip, okc, bw, bwa, colo, loc, st, vat in conn_v.execute(
                     "SELECT ip, ok_count, bandwidth_mbps, bw_last_at, colo, loc, "
                     "COALESCE(state,''), COALESCE(verified_at,0) FROM ips"):
@@ -1396,17 +1180,19 @@ async def run_session(nets, known, q, args, stop, nets6=None):
                 if st == cf_health.STATE_ACTIVE:
                     active_set.add(ip)
                 if colo and loc:
-                    if _id_stale and (not vat or _now_id - vat > _id_stale):
+                    if _id_stale and (not vat or now - vat > _id_stale):
                         stale_colo.add(ip)      # 数据过期 -> 本轮复测时顺便重认
                     else:
                         have_colo.add(ip)
             conn_v.close()
         except Exception:
-            verified = set()
-            stale_colo = set()
-            bw_info = {}
-            active_set = set()
-            explore = True
+            verified = set(); stale_colo = set()
+            bw_info = {}; active_set = set()
+            pure_monitor = False
+            phase = "monitor"
+
+        q.put({"type": "mode", "dec": dec, "budgets": bud, "phase": phase,
+               "active": dec["active"], "fresh": dec["fresh"]})
 
         cands = []
         seen = set()
@@ -1431,7 +1217,7 @@ async def run_session(nets, known, q, args, stop, nets6=None):
 
         # 2) 补充: 有缺口时优先提升 reserve(快速确认)
         for key, is_v6 in (("v4", False), ("v6", True)):
-            d = (deficits.get(key) or {}).get("deficit", 0)
+            d = (dec.get(key) or {}).get("deficit", 0)
             if d > 0:
                 for ip, p in cf_lifecycle.fetch_promote(args.db, is_v6, d, args.cooldown):
                     if ip in known:
@@ -1440,14 +1226,10 @@ async def run_session(nets, known, q, args, stop, nets6=None):
 
         # 3) 发现: 仅在探索期进行(避免库满后空扫); 邻域名单已排除超额前缀
         if nets and bud["count"] > 0:
-            hot24 = fetch_hot24(args.db) if args.exploit > 0 else []
-            for ip, ps in discover(nets, hot24, bud["count"], ports, known,
-                                   args.cooldown, args.exploit):
+            for ip, ps in discover(nets, bud["count"], ports, known, args.cooldown):
                 add_cand(ip, ps)
         if nets6 and bud["count_v6"] > 0:
-            hot48 = fetch_hot_v6(args.db) if args.exploit > 0 else []
-            for ip, ps in discover_v6(nets6, bud["count_v6"], ports, known,
-                                      args.cooldown, hot48, args.exploit):
+            for ip, ps in discover_v6(nets6, bud["count_v6"], ports, known, args.cooldown):
                 add_cand(ip, ps)
 
         # 4) 地区补全
@@ -1459,9 +1241,9 @@ async def run_session(nets, known, q, args, stop, nets6=None):
                 backfill_ips.add(ip)
                 add_cand(ip, seq_for(p))
 
-        status = {"active_mode": active_mode, "explored": explore,
+        status = {"phase": phase, "explored": phase != "monitor",
                   "pure_monitor": pure_monitor, "next_due": next_due,
-                  "due": due_count, "deficits": deficits}
+                  "due": due_count}
         if not cands:
             return 0, [], bud, status
         if pure_monitor:
@@ -1492,7 +1274,7 @@ async def run_session(nets, known, q, args, stop, nets6=None):
                 alive_list.append((ip, p, lat, ip in backfill_ips, _need_id))
         alive_list.sort(key=lambda r: (0 if r[3] else 1, r[2]))
         pend = [(ip, p, lat, need_id)
-                for ip, p, lat, _bf, need_id in alive_list[: bud["verify"]]]
+                for ip, p, lat, _bf, need_id in alive_list]
         if bud["bench"] > 0:
             # 测速优先级(小=先测):
             #   0 从没测过带宽 / 1 active 且数据已过期 / 2 其他过期 / 3 数据还新鲜
@@ -1584,8 +1366,8 @@ async def run_session(nets, known, q, args, stop, nets6=None):
             cycles += 1
         if st["explored"]:
             last_explore["t"] = time.time()
-        # 节奏: 发现/恢复/探索期短歇; 纯监控期按 tick / 睡到下一个到期, 不空转
-        if st["active_mode"] or st["explored"]:
+        # 节奏: 在扫新 IP 时短歇; 值守期按 tick / 睡到下一个到期, 不空转
+        if st["explored"]:
             await sleep_interruptible(args.gap)
         else:
             nx = st["next_due"]
@@ -1595,7 +1377,8 @@ async def run_session(nets, known, q, args, stop, nets6=None):
                 wait = cf_policy.IDLE_CAP
             else:
                 wait = max(cf_policy.MONITOR_TICK, min(nx - time.time(), cf_policy.IDLE_CAP))
-            wait = min(wait, max(2.0, cf_policy.EXPLORE_INTERVAL
+            # 上限再压一道: 保证能在 explore_interval 内醒来做一次低频探索
+            wait = min(wait, max(2.0, explore_interval
                                  - (time.time() - last_explore["t"])))
             await sleep_interruptible(wait)
 
@@ -1713,7 +1496,7 @@ def seed_db(args):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="CF 优选IP 扫描数据库(增强版): 多端口+TLS确认+邻域加权+冷却复测, 所有IP累积进SQLite, 可导出 ADD.txt")
+        description="CF 优选IP 扫描数据库: 多端口+TLS确认+冷却复测, 所有IP累积进SQLite, 可导出 ADD.txt")
     ap.add_argument("--db", default="cf_ips.db", help="SQLite 数据库路径(默认 cf_ips.db)")
     ap.add_argument("--operator", choices=["cf", "ct", "cu", "cmcc"], default=None,
                     help="地址源: 官方/电信(ct)/联通(cu)/移动(cmcc)")
@@ -1740,8 +1523,6 @@ def main():
                     help="TCP连通后用TLS握手(SNI cloudflare.com)二次确认, 过滤非CF/中间盒(默认开)")
     ap.add_argument("--no-tls-check", dest="tls_check", action="store_false",
                     help="关闭TLS二次确认(更快但可能收录伪CF IP)")
-    ap.add_argument("--exploit", type=float, default=0.6,
-                    help="每轮抽样中偏向优质/24邻域的比例 0~1 (默认0.6, 0=纯随机)")
     ap.add_argument("--cooldown", type=float, default=3600,
                     help="同一IP复测冷却秒数, 冷却期内不再测(默认3600)")
     ap.add_argument("--recheck", type=int, default=30,
@@ -1756,10 +1537,6 @@ def main():
                          "注意: 每流=一个 Worker 请求, 并行越高请求越多")
     ap.add_argument("--bench-daily", type=int, default=400,
                     help="每日测速 IP 数硬上限(请求预算; 失败也算额度; 0=不限)")
-    ap.add_argument("--bench-funnel", type=int, default=10,
-                    help="发现量/测量量 的漏斗倍数: 每轮抽样量最多为当日剩余"
-                         "测速额度的该倍数(默认10)。探测不花配额, 候选池应远大于"
-                         "测量量; 调小=更省库容, 调大=候选更多样")
     ap.add_argument("--bench-pause", type=int, default=1800,
                     help="测速连续失败达阈值后暂停测速的秒数(防空打 Worker)")
     ap.add_argument("--colo-stale-days", type=float, default=7,
@@ -1779,16 +1556,8 @@ def main():
                     help="值守期低频探索间隔(分钟, 默认30): 库满后每隔这么久抽一小批找更优IP")
     ap.add_argument("--explore-fraction", type=float, default=10, dest="explore_fraction",
                     help="值守期低频探索比例(%%命中于抽样数, 默认10); 0=库满后完全不探索")
-    ap.add_argument("--scan-mode", dest="scan_mode", choices=["auto", "discovery", "maintenance", "recovery"],
-                    default="auto", help="扫描策略: auto=达动态平衡后自动转健康维护(默认)")
     ap.add_argument("--target-active", type=int, default=60, dest="target_active",
                     help="动态平衡目标: 期望保有的可用IP数(默认60)")
-    ap.add_argument("--target-prefixes", type=int, default=8, dest="target_prefixes",
-                    help="动态平衡目标: 期望覆盖的独立前缀数(默认8)")
-    ap.add_argument("--per24-max", type=int, default=50, dest="per24_max",
-                    help="每个 v4 /24 最多保留(越小越多样; 默认50; 0=不限)")
-    ap.add_argument("--per48-max", type=int, default=100, dest="per48_max",
-                    help="每个 v6 /48 最多保留(默认100; 0=不限)")
     ap.add_argument("--once", action="store_true", help="只扫描一轮(发现+验证预算)后退出")
     ap.add_argument("--reverify", type=int, metavar="N", default=0,
                     help="复核模式: 重新探测库内现有最优的 N 个IP")
@@ -1810,6 +1579,7 @@ def main():
     args.ports = tuple(base_ports)
     if args.count_v6 is None:
         args.count_v6 = args.count
+    # 界面用百分数(10 = 10%), 内部统一用小数(0.1)。只在这里换算一次。
     args.explore_interval = max(1.0, float(getattr(args, "explore_interval", 30))) * 60
     args.explore_fraction = min(1.0, max(0.0, float(getattr(args, "explore_fraction", 10)) / 100.0))
 
@@ -1868,7 +1638,7 @@ def main():
         print(f"地址源: {label} | 抽样 v4 {args.count}/v6 {args.count_v6} | 验证 {args.verify} | 测带宽 {args.bench} | "
               f"端口 {','.join(map(str, args.ports))} | TLS确认 {'开' if args.tls_check else '关'} | "
               f"IPv6 {'开(' + (args.operator_v6 or '公共') + ')' if args.ipv6 else '关'} | "
-              f"优质邻域 {int(args.exploit*100)}% | 复测冷却 {args.cooldown:.0f}s", flush=True)
+              f"复测冷却 {args.cooldown:.0f}s", flush=True)
     print("Ctrl+C 安全退出(数据已实时落库), 重跑命令即可续扫", flush=True)
     try:
         pend = 0
@@ -1885,14 +1655,14 @@ def main():
                     pend = 0
             elif rec["type"] == "mode":
                 bud = rec.get("budgets", {})
-                modes = rec.get("modes") or {}
+                dec = rec.get("dec") or {}
                 parts = []
                 for _p in ("v4", "v6"):
-                    _mi = modes.get(_p) or {}
-                    parts.append(f"{_p} {cf_policy.MODE_NAMES.get(_mi.get('mode'), '?')}"
-                                 f"(用{_mi.get('active', 0)}/前{_mi.get('prefixes', 0)})")
-                print(f"【模式】{'，'.join(parts)}｜本轮抽样 v4 {bud.get('count')} "
-                      f"v6 {bud.get('count_v6')}｜复测 {bud.get('recheck')}", flush=True)
+                    d = (dec.get(_p) or {})
+                    parts.append(f"{_p} {cf_policy.PHASE_NAMES.get(d.get('phase'), '?')}"
+                                 f"(可用{d.get('active', 0)}/{d.get('target', 0)})")
+                print(f"【状态】{'，'.join(parts)}｜本轮发现 v4 {bud.get('count')} "
+                      f"v6 {bud.get('count_v6')}｜测速 {bud.get('bench')}", flush=True)
             elif rec["type"] == "monitor":
                 print(f"【值守】本批检查 {rec.get('checking', 0)} 个"
                       f"（还有 {rec.get('due', 0)} 个到期）", flush=True)
@@ -1904,22 +1674,14 @@ def main():
                 if rec["type"] == "cycle_end":
                     print(banner(), f"｜本轮可用 {rec['ok']}", flush=True)
                 try:
-                    stats, deficits = cf_lifecycle.lifecycle_pass(
+                    stats = cf_lifecycle.lifecycle_pass(
                         conn, args.max_ips_v4, args.max_ips_v6,
-                        getattr(args, "country_pct", 0),
-                        getattr(args, "target_active", 0),
-                        getattr(args, "per24_max", None),
-                        getattr(args, "per48_max", None))
+                        getattr(args, "country_pct", 0))
                     conn.commit()
                     ev = sum(stats.values())
                     if ev:
-                        print(f"【清理】失效 {stats['dead']}｜重复 {stats['dedup']}｜"
-                              f"地区均衡 {stats['balanced']}｜超容量 {stats['capped']}", flush=True)
-                    d4 = deficits.get("v4", {})
-                    d6 = deficits.get("v6", {})
-                    print(f"【库存】v4 可用 {d4.get('active',0)}｜备用 {d4.get('reserve',0)}｜"
-                          f"待补 {d4.get('deficit_reserve',0)} ∥ v6 可用 {d6.get('active',0)}｜"
-                          f"备用 {d6.get('reserve',0)}｜待补 {d6.get('deficit_reserve',0)}", flush=True)
+                        print(f"【清理】失效 {stats['dead']}｜地区均衡 {stats['balanced']}｜"
+                              f"超容量 {stats['capped']}", flush=True)
                 except Exception as e:
                     print(f"库清理失败: {e}", flush=True)
             elif rec["type"] == "done":

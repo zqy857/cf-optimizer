@@ -3,7 +3,7 @@
 CF 优选IP 扫描管理台 (Web 图形界面)
 
 以 SQLite 数据库为后端的常驻扫描管理台:
-  * 后台持续扫描(多端口+TLS确认+优质邻域加权+冷却复测+地区补全)
+  * 后台持续扫描(多端口+TLS确认+冷却复测+地区补全)
   * 实时看板: 已测/存活/已验证/带宽/平均延迟 + 机房与延迟分布图表
   * 可排序/筛选的结果表, 一键导出 ADD.txt / CSV
   * 扫描参数可随时调整并重启
@@ -31,6 +31,7 @@ import socket
 import sqlite3
 import sys
 import threading
+import traceback
 import time
 import types
 import webbrowser
@@ -57,19 +58,19 @@ import cf_lifecycle
 import cf_policy
 
 COV_TOTAL = sum(1 << (32 - int(r.split("/")[1])) for r in cf_db.FALLBACK_RANGES)
-VERSION = "2.13.12"
+VERSION = "3.0.0"
 
 COLO_COUNTRY = cf_db.COLO_COUNTRY
 
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cf_settings.json")
 SETTINGS_KEYS = ["operator", "ports", "count", "concurrency", "bench",
                  "bench_parallel", "bench_size", "bench_timeout", "bench_daily",
-                 "bench_pause", "bench_funnel", "bw_stale_hours", "colo_stale_days",
-                 "backfill", "recheck", "exploit",
+                 "bench_pause", "bw_stale_hours", "colo_stale_days",
+                 "backfill", "recheck",
                  "max_latency", "tls_check",
                  "bench_host", "v4", "ipv6", "operator_v6", "count_v6", "v6_official",
                  "max_ips_v4", "max_ips_v6", "country_max_pct",
-                 "scan_mode", "target_active", "target_prefixes", "per24_max", "per48_max",
+                 "target_active",
                  "explore_interval", "explore_fraction"]
 
 
@@ -113,14 +114,8 @@ STATE = {
     "probed": 0,
     "total": 0,
     "ok_now": 0,
-    "mode": "discovery",
-    "mode_name": "",
-    "modes": {},
     "active": 0,
     "fresh": 0,
-    "prefixes": 0,
-    "mode_yield": 0.0,
-    "mode_reason": "",
     "phase": "",
     "budgets": {},
     "lifecycle": {},
@@ -484,7 +479,6 @@ def scan_args(params, db):
         port=int(num("port", 443, int)),
         ports=tuple(ports),
         tls_check=str(flat.get("tls_check", "1")) not in ("0", "false", ""),
-        exploit=min(1.0, max(0.0, num("exploit", 0.6))),
         cooldown=max(1, num("cooldown", 3600)),
         max_ips_v4=max(0, int(num("max_ips_v4", 0, int))),
         max_ips_v6=max(0, int(num("max_ips_v6", 0, int))),
@@ -494,18 +488,13 @@ def scan_args(params, db):
         bench_parallel=max(1, int(num("bench_parallel", 8, int))),
         bench_daily=max(0, int(num("bench_daily", 400, int))),
         bench_pause=max(0, int(num("bench_pause", 1800, int))),
-        bench_funnel=max(1, int(num("bench_funnel", 10, int))),
         bw_stale_hours=max(0.0, num("bw_stale_hours", 24, float)),
         colo_stale_days=max(0.0, num("colo_stale_days", 7, float)),
         bench_host=str(flat.get("bench_host", "")).strip() or cf_db.SPEED_HOST,
         v4=str(flat.get("v4", "1")) not in ("0", "false", ""),
         ipv6=str(flat.get("ipv6", "0")) not in ("0", "false", ""),
         v6_official=str(flat.get("v6_official", "1")) not in ("0", "false", ""),
-        scan_mode=str(flat.get("scan_mode", "auto") or "auto"),
         target_active=max(1, int(num("target_active", 60, int))),
-        target_prefixes=max(1, int(num("target_prefixes", 8, int))),
-        per24_max=max(0, int(num("per24_max", 50, int))),
-        per48_max=max(0, int(num("per48_max", 100, int))),
         explore_interval=max(1.0, num("explore_interval", 30)) * 60,
         explore_fraction=min(1.0, max(0.0, num("explore_fraction", 10) / 100.0)),
         cycles=0, gap=max(1, num("gap", 5)), once=False, reverify=0,
@@ -528,6 +517,7 @@ def scanner_worker(args):
     asyncio.set_event_loop(loop)
     stop = STATE["stop"]
     q = queue.Queue()
+    dec_now = {}          # 最近一次 cf_policy.decide 的结果(给剔除日志取库存数)
     try:
         conn = cf_db.open_db(args.db)
         known = cf_db.load_known(conn)
@@ -566,25 +556,19 @@ def scanner_worker(args):
                         STATE["ok_now"] = STATE.get("ok_now", 0) + 1
             elif t == "mode":
                 bud = rec.get("budgets", {})
-                modes = rec.get("modes") or {}
+                dec = rec.get("dec") or {}
                 brief, stock = [], []
                 for _p in ("v4", "v6"):
-                    _mi = modes.get(_p) or {}
-                    _nm = cf_policy.MODE_NAMES.get(_mi.get("mode"), _mi.get("mode", "?"))
-                    brief.append(f"{_p} {_nm}")
-                    stock.append(f"{_p} 可用 {_mi.get('active', 0)}")
-                set_state(mode=rec.get("mode", "discovery"), mode_name=" · ".join(brief),
-                          modes=modes, active=rec.get("active", 0), fresh=rec.get("fresh", 0),
-                          prefixes=rec.get("prefixes", 0), mode_yield=rec.get("yield", 0.0),
-                          mode_reason=rec.get("reason", ""), budgets=bud,
-                          phase=rec.get("phase", ""))
+                    d = dec.get(_p) or {}
+                    brief.append(f"{_p} {cf_policy.PHASE_NAMES.get(d.get('phase'), '?')}")
+                    stock.append(f"{_p} 可用 {d.get('active', 0)}/{d.get('target', 0)}")
+                dec_now.clear()
+                dec_now.update(dec)
+                set_state(active=rec.get("active", 0), fresh=rec.get("fresh", 0),
+                          budgets=bud, phase=rec.get("phase", ""))
                 sig = "|".join(brief) + "|" + str(rec.get("phase", ""))
-                if sig != logstate["mode"]:            # 只在模式/阶段变化时记一条
-                    _ph = rec.get("phase", "")
-                    _tag = {"discover": "发现", "fill": "填充库容",
-                            "explore": "值守探索", "monitor": "值守"}.get(_ph, "")
-                    log_event(f"{_tag} · {'，'.join(brief)}（{'，'.join(stock)}）"
-                              if _tag else f"模式 · {'，'.join(brief)}（{'，'.join(stock)}）")
+                if sig != logstate["mode"]:            # 只在阶段变化时记一条
+                    log_event(f"{'，'.join(brief)}（{'，'.join(stock)}）")
                     logstate["mode"] = sig
             elif t == "cycle_start":
                 set_state(stage="probe", total=rec.get("total", 0), probed=0, ok_now=0)
@@ -601,19 +585,16 @@ def scanner_worker(args):
             elif t in ("cycle_end", "lifecycle"):
                 flush()
                 try:
-                    stats, deficits = cf_lifecycle.lifecycle_pass(
+                    stats = cf_lifecycle.lifecycle_pass(
                         conn, args.max_ips_v4, args.max_ips_v6,
-                        getattr(args, "country_max_pct", 0),
-                        getattr(args, "target_active", 0),
-                        getattr(args, "per24_max", None),
-                        getattr(args, "per48_max", None))
+                        getattr(args, "country_max_pct", 0))
                     conn.commit()
                     ev = sum(stats.values())
                     if ev:                             # 只有真清理了才记
-                        log_event(f"清理库存 · 失效 {stats['dead']}｜重复 {stats['dedup']}｜"
+                        log_event(f"清理库存 · 失效 {stats['dead']}｜"
                                   f"地区均衡 {stats['balanced']}｜超容量 {stats['capped']}")
-                    d4 = deficits.get("v4", {})
-                    d6 = deficits.get("v6", {})
+                    d4 = dec_now.get("v4") or {}
+                    d6 = dec_now.get("v6") or {}
                     set_state(lifecycle={"v4": d4, "v6": d6})
                     dsig = (f"{d4.get('active')}/{d4.get('reserve')}/{d4.get('deficit_reserve')}"
                             f"|{d6.get('active')}/{d6.get('reserve')}/{d6.get('deficit_reserve')}")
@@ -625,7 +606,7 @@ def scanner_worker(args):
                         logstate["stock"] = dsig
                         logstate["stock_at"] = time.time()
                 except Exception as e:
-                    log_event(f"清理库存失败 · {e}")
+                    log_event(f"清理库存失败 · {e}｜{traceback.format_exc(limit=3)}")
                     try:
                         conn.rollback()
                     except Exception:
@@ -655,7 +636,7 @@ def scanner_worker(args):
 
         loop.run_until_complete(drive())
     except Exception as e:
-        log_event(f"扫描异常: {e}")
+        log_event(f"扫描异常: {e}\n{traceback.format_exc()}")
         set_state(msg=f"扫描异常: {e}")
     finally:
         try:
@@ -1870,50 +1851,56 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
 
     </section>
     <section class="view" id="v-scan">
-      <div class="sub page-sub">三阶段：<b>发现</b>(未达目标→找新IP) → <b>填充库容</b>(热够了未到上限→补齐备用池) → <b>值守</b>(库满→<b>停用「扫描范围」，只按每个IP的周期逐一定时复测</b>)。</div>
+      <div class="sub page-sub">没有"模式"，只有 <b>4 条规则</b>，每轮对 v4 / v6 <b>各自独立</b>判断一次。规则从上往下，先命中先算：</div>
 
       <div class="card">
         <details class="flow">
-          <summary>🧭 三阶段流程图（点此折叠 / 展开）</summary>
+          <summary>🧭 判定规则（点此折叠 / 展开）</summary>
           <div class="flowchart">
             <div class="fc-node p1">
-              <div class="fc-head">① 发现期<span class="fc-cond">热IP &lt; 目标可用数</span></div>
+              <div class="fc-head">① 可用IP不足<span class="fc-cond">可用 &lt; 目标可用IP数</span></div>
               <div class="fc-params">
-                <div class="fc-text">每轮随机抽 <span class="pn">抽样数/轮</span> 个新 IP（v4 / v6 各算）去探测；其中由 <span class="pn">优质C段比例</span>（默认 60%）决定多少从历史优质 /24 邻域里选，命中率更高。</div>
-                <div class="fc-text">同时做通用组的活：按 <span class="pn">复测批量</span> 处理到期 IP、按 <span class="pn">地区补全/批</span> 补缺地区、按 <span class="pn">测带宽/批</span> 补带宽。</div>
-                <div class="fc-text">判定"可用"：TCP 能连 + TLS 握手通过 + 延迟 ≤ <span class="pn">最大延迟</span>。本阶段抽样量还会被<span class="pn">当日剩余测速额度</span>收敛。</div>
+                <div class="fc-text">每轮抽满 <span class="pn">抽样数/轮</span> 个新 IP 去探测（v4 / v6 各算各的，互不抢）。</div>
+                <div class="fc-text">先用完 reserve 池里分数最高的（快速确认），不够才抽新的。</div>
               </div>
             </div>
-            <div class="fc-conn"><span>✔ 热IP 达到 <span class="pn">目标可用IP数</span> 且覆盖 <span class="pn">目标前缀数</span></span></div>
+            <div class="fc-conn"><span>↓ 可用够了</span></div>
             <div class="fc-node p2">
-              <div class="fc-head">② 填充期<span class="fc-cond">热够了，但 总库 &lt; 库上限</span></div>
+              <div class="fc-head">② 库容不足<span class="fc-cond">总库 &lt; 库上限</span></div>
               <div class="fc-params">
-                <div class="fc-text">抽样量自动降为 <span class="pn">抽样数 × 30%</span>，继续温和地找新 IP，把备用池补到 <span class="pn">库上限</span>。</div>
-                <div class="fc-text">备胎池目标自动 = <span class="pn">库上限 − 目标可用数</span>；去重上限：每 /24 留 <span class="pn">每/24保留数</span>、每 /48 留 <span class="pn">每/48保留数</span>。</div>
+                <div class="fc-text">抽样量降为 <span class="pn">抽样数 × 30%</span>，温和地把备用池养到上限。</div>
+                <div class="fc-text">备胎池目标自动 = <span class="pn">库上限 − 目标可用数</span>，不用另设。</div>
               </div>
             </div>
-            <div class="fc-conn"><span>✔ 总库填满 <span class="pn">库上限</span></span></div>
+            <div class="fc-conn"><span>↓ 都够了，且距上次探索已满 <span class="pn">探索间隔</span></span></div>
             <div class="fc-node p3">
-              <div class="fc-head">③ 值守期<span class="fc-cond">热够 + 库满</span></div>
+              <div class="fc-head">③ 低频探索<span class="fc-cond">不缺了，但该找更优的了</span></div>
               <div class="fc-params">
-                <div class="fc-text"><b>到期复测</b>：每个 IP 有自己的检查周期（active 30~60min / reserve 6~24h）+ 随机抖动错峰，<b>到点才测</b>。有到期就约每分钟处理一批（每批 ≤ <span class="pn">复测批量</span>）；没到期就睡到下一个到期（最长 15 分钟）。<b>不再整轮扫固定数量。</b></div>
-                <div class="fc-text"><b>低频探索</b>：每 <span class="pn">探索间隔</span>（默认 30 分）扫 <span class="pn">抽样数 × 探索比例%</span> 个新 IP 去找更优的；<b>只有实测带宽够高才可能顶掉老 IP</b>。</div>
-                <div class="fc-text"><b>带宽至上</b>：实测带宽是入榜硬门槛 —— 只测了延迟、没测带宽的 IP 分数上限只有 ~31 分，低于 active 门槛 40，<b>永远进不了热榜</b>。所以"发现"和"测速"必须配对：<span class="pn">每日测速上限</span>既是请求预算也是发现配额，<b>额度用完就不再扫新 IP</b>（测不起等于白扫）。</div>
-                <div class="fc-text">通用组的 <span class="pn">地区补全/批</span>、<span class="pn">测带宽/批</span> 继续跑，把地区、带宽覆盖率逐步补满。</div>
+                <div class="fc-text">扫 <span class="pn">抽样数 × 探索比例%</span> 个新 IP 去找更快的；<b>只有实测带宽够高才可能顶掉老 IP</b>。</div>
               </div>
             </div>
+            <div class="fc-conn"><span>↓ 还没到点</span></div>
             <div class="fc-node p0">
-              <div class="fc-head">⚙️ 通用<span class="fc-cond">所有阶段都在用</span></div>
+              <div class="fc-head">④ 值守<span class="fc-cond">不抽新 IP</span></div>
               <div class="fc-params">
-                <div class="fc-text">并发、端口、最大延迟、TLS 二次确认、地区补全/批、测带宽/批、测速域名等 —— 在下方 <b>📡 探测 · 复测 · 补全</b> 卡片里设置。</div>
+                <div class="fc-text"><b>只做到期复测</b>：每个 IP 有自己的检查周期（可用 30~60min / 备用 6~24h）+ 随机抖动错峰，<b>到点才测</b>。有到期就约每分钟处理一批（每批 ≤ <span class="pn">复测批量</span>）；没到期就睡到下一个到期（最长 15 分钟）。<b>不再整轮空扫。</b></div>
               </div>
             </div>
-            <div class="fc-conn up"><span>↺ 热IP 失效 / 出现缺口 → 自动回到 ① 发现 或 ② 填充</span></div>
+            <div class="fc-node p3">
+              <div class="fc-head">⚙️ 所有阶段都在做<span class="fc-cond">不受上面 4 条影响</span></div>
+              <div class="fc-params">
+                <div class="fc-text">判定"可用"：TCP 能连 + TLS 握手通过 + 延迟 ≤ <span class="pn">最大延迟</span>。</div>
+                <div class="fc-text">按 <span class="pn">复测批量</span> 处理到期 IP、按 <span class="pn">地区补全/批</span> 补缺地区、按 <span class="pn">测带宽/批</span> 补带宽 —— 这几项在值守期也照跑。</div>
+                <div class="fc-text"><b>不会过冲</b>：可用IP的名次由质量分排名决定、硬卡在 <span class="pn">目标可用IP数</span> 个，所以"不足就扫、够了就歇"是自限开关，不存在扫过头再回调。</div>
+                <div class="fc-text"><b>带宽至上</b>：实测带宽是入榜硬门槛 —— 只测了延迟、没测带宽的 IP 分数上限只有 ~40 分（延迟+可用率满分），刚压线且随时会被真实带宽拉下来，所以实测过带宽的 IP 几乎必然排在前面。</div>
+              </div>
+            </div>
+            <div class="fc-conn up"><span>↺ 可用IP失效 / 出现缺口 → 自动回到 ①</span></div>
           </details>
       </div>
 
       <div class="card">
-        <div class="h">🌐 扫描范围 &amp; 值守探索<span class="sub">抽样数在<b>发现期</b>用满、<b>填充期</b>降为 30%、<b>值守期</b>=抽样数×探索比例；三个阶段实际还会被<b>当日剩余测速额度</b>收敛</span></div>
+        <div class="h">🌐 扫描范围 &amp; 值守探索<span class="sub">抽样数在<b>①缺可用IP</b>时用满、<b>②缺库容</b>降为 30%、<b>③低频探索</b>=抽样数×探索比例、<b>④值守</b>不抽新IP</span></div>
         <div class="scan-grid">
           <div class="proto" id="protoV4">
             <label class="switch"><input type="checkbox" id="v4_on" checked><span class="track"><span class="knob"></span></span><b>IPv4 扫描</b></label>
@@ -1923,7 +1910,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
                 <option value="">官方全网</option><option value="cf">CF官方优选</option>
                 <option value="ct">电信优选</option><option value="cu">联通优选</option>
                 <option value="cmcc">移动优选</option></select></div>
-              <div class="f"><label>抽样数/轮<span class="tip">?<span class="pop">本轮探测多少个<b>新</b> IPv4。【发现期】用满该值；【填充期】自动降为 30%；【值守期】= 抽样数 × <b>探索比例%</b>。<br>其中 <b>优质C段比例</b> 那部分来自历史优质 /24 邻域(单轮每个 /24 最多 3 个，防雷同)，其余来自官方大段随机。<br><b>上限是 <span class="pn">发现漏斗倍数</span> × 当日剩余测速额度</b>(按 v4/v6 等比缩减)。探测不花 Worker 配额，所以默认倍数 10，基本不会砍到你的 500。</span></span></label><input id="count" type="number" value="5000"></div>
+              <div class="f"><label>抽样数/轮<span class="tip">?<span class="pop">本轮探测多少个<b>新</b> IPv4。【①可用IP不足】时用满该值；【②库容不足】自动降为 30%；【③低频探索】= 抽样数 × <b>探索比例%</b>；【④值守】不抽新 IP。<br>地址在官方大段里<b>均匀随机</b>抽，<b>不限制前缀</b>（不做邻域加权）。</span></span></label><input id="count" type="number" value="5000"></div>
             </div>
           </div>
           <div class="proto" id="protoV6">
@@ -1932,16 +1919,14 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
               <div class="f"><label>优选列表<span class="tip">?<span class="pop">公开优选 v6 列表(命中率高)；公共列表始终纳入，可选移动优选</span></span></label>
                 <select id="operator_v6">
                 <option value="">公共优选</option><option value="cmcc">移动优选</option></select></div>
-              <div class="f"><label>抽样数/轮<span class="tip">?<span class="pop">本轮探测多少个<b>新</b> IPv6，规则与 IPv4 相同但<b>独立计算</b>。<br>v6 特殊之处：约七成来自已知优质 /48 邻域内的随机地址(单轮每个 /48 最多 4 个)，命中率极高但会让地址高度相似；想更多样就调低「优质C段比例」。</span></span></label><input id="count_v6" type="number" value="5000"></div>
+              <div class="f"><label>抽样数/轮<span class="tip">?<span class="pop">本轮探测多少个<b>新</b> IPv6，规则与 IPv4 相同但<b>独立计算</b>。<br>v6 特殊之处：优选 /128 列表优先用完，余量在 CF 官方大段里随机取址（同样不限制前缀）。</span></span></label><input id="count_v6" type="number" value="5000"></div>
             </div>
             <div class="chk"><input type="checkbox" id="v6_official" checked><label for="v6_official">叠加 CF 官方 v6 大段<span class="tip">?<span class="pop">从 CF 官方 v6 大段随机发现新地址；命中率低于优选列表但覆盖更广</span></span></label></div>
             <div class="proto-note">需本机具备 IPv6 网络</div>
           </div>
         </div>
         <div class="row" style="margin-top:8px">
-          <div class="f"><label>目标可用IP数<span class="tip">?<span class="pop">每协议各算：把健康分最高的前 N 名设为 active(高频巡检)。达到即停止大范围发现；N 越小越省资源</span></span></label><input id="target_active" type="number" value="60"></div>
-          <div class="f"><label>目标前缀数<span class="tip">?<span class="pop">希望覆盖多少个不同前缀(/24、/48)，用于抗单机房/单路由故障</span></span></label><input id="target_prefixes" type="number" value="8"></div>
-          <div class="f"><label>优质C段比例<span class="tip">?<span class="pop">发现时 0~1 比例的 IP 从历史优质C段(/24、/48 邻域)里选；0.6 = 6成优质邻域 + 4成官方大段随机。<br>邻域命中率高但会让地址<b>高度雷同</b>(实测 v6 曾集中在仅 233 个 /48 上反复出票)，所以加了"单轮每前缀配额"兜底：每 /24 最多 3 个、每 /48 最多 4 个。<br>调低它=更多样但命中率下降。</span></span></label><input id="exploit" type="number" step="0.1" value="0.6"></div>
+          <div class="f"><label>目标可用IP数<span class="tip">?<span class="pop">每协议各算：把质量分最高的前 N 名设为 active(高频巡检)。<b>达不到就按抽样数/轮继续抽新 IP</b>，够了就自动转低频巡检。N 越小越省资源</span></span></label><input id="target_active" type="number" value="60"></div>
         </div>
         <div class="row" style="margin-top:8px;align-items:flex-end">
           <div class="chk" style="flex:1 1 100%"><label class="sub" style="font-size:12.5px">值守期低频探索 —— 库满后每隔一段时间抽一小批继续找更优IP；<b>但只有实测带宽超过现有榜单的 IP 才顶得掉</b>(没测带宽的进不了热榜)，且探索量同样受当日测速额度限制；不看就填 0</label></div>
@@ -1965,8 +1950,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
           <div class="f"><label>测速并连数<span class="tip">?<span class="pop">测速同时开的下载连接数。<b>每条流=1个 Worker 请求</b>。单流只有约39Mbps，要测满本机线路得开8条(实测能到188Mbps)；条数翻倍=请求翻倍</span></span></label><input id="bench_parallel" type="number" value="8"></div>
           <div class="f"><label>每流下载量<span class="tip">?<span class="pop">单条流最多下多少字节(默认64MB)。<b>它决定"每条流能拉多少", 总上限 = 该值 × 并连数</b>；实测中它几乎从不生效(是「测速超时」先到), 所以它只影响流量上限、不影响读数。<b>下载量只花流量不花请求</b>——想抬高位数上限就调大它、少加流</span></span></label><input id="bench_size" type="number" value="64000000" step="1000000"></div>
           <div class="f"><label>测速超时秒<span class="tip">?<span class="pop"><b>真正决定流量与读数的一项</b>：每次测速最多跑这么久, 流量 ≈ 实测速率 × 该值。<br>实测 8 条流在 <b>2 秒</b>就能读准(2s 与 15s 读数一致 96~102Mbps, 流量差 7 倍), 所以默认只给 <b>5 秒</b>——190MB 降到 59MB。<br>调小更省流量; 调大对很慢的IP更稳(能在窗口内多拉些字节)。<b>注意: 测速是串行的</b>, 一次只测一个IP, 不会互相压低</span></span></label><input id="bench_timeout" type="number" value="5"></div>
-          <div class="f"><label>每日测速上限<span class="tip">?<span class="pop"><b>请求预算，同时是"发现配额"</b>：一天最多实测多少个IP的带宽(失败也算额度)。<br>① 每小时最多只能用 <b>每日额度 ÷ 24</b>(令牌桶)，避免一小时内烧光然后全天停摆。<br>② <b>发现量自动收敛到这个额度</b>：额度用完就不再扫新IP——因为带宽是入榜硬门槛，测不起就是白扫。<br>③ 流量 ≈ 每次(实测速率 × 测速超时)，按超时5秒算约 <b>60MB/次</b>。<br>参考：400 → 3200请求/天(Worker配额3.2%)、约24GB/天；1000 → 8000请求/天、约60GB/天。填0=不限(会天天爆配额)</span></span></label><input id="bench_daily" type="number" value="400"></div>
-          <div class="f"><label>发现漏斗倍数<span class="tip">?<span class="pop"><b>候选池 = 测速额度的几倍</b>。每轮抽样量最多 = <b>当日剩余额度 × 该倍数</b>(按 v4/v6 各自想要的量等比缩减, 互不抢)。<br>为什么要 &gt;1：<b>探测本身不花 Worker 配额</b>, 而且每轮是从这批候选里挑延迟最低的若干个去测速 —— 候选池必须大于测量量, 否则没有筛选空间。<br>调小=更省库容/更快扫完一轮; 调大=候选更多样。按 400 额度 × 10 = 4000, 你的 500+1000 完全用不满这个上限, 不会被砍。<br>0=不按额度收敛(会发现很多但大部分测不了)</span></span></label><input id="bench_funnel" type="number" value="10"></div>
+          <div class="f"><label>每日测速上限<span class="tip">?<span class="pop">一天最多实测多少个IP的带宽(失败也算额度)。<br>① 每小时最多只能用 <b>每日额度 ÷ 24</b>(令牌桶)，避免一小时内烧光然后全天停摆。<br>② 额度只管<b>测速</b>，不管发现：发现量只由「抽样数/轮」和 4 条规则决定。额度用完时本轮不测带宽，新抽的 IP 排队等下次。<br>③ 流量 ≈ 每次(实测速率 × 测速超时)，按超时5秒算约 <b>60MB/次</b>。<br>参考：400 → 3200请求/天(Worker配额3.2%)、约24GB/天；1000 → 8000请求/天、约60GB/天。填0=不限(会天天爆配额)</span></span></label><input id="bench_daily" type="number" value="400"></div>
           <div class="f"><label>测速失败暂停<span class="tip">?<span class="pop">连续多轮测速颗粒无收时，暂停测速多少秒(默认1800)，避免继续空打被限流的 Worker</span></span></label><input id="bench_pause" type="number" value="1800"></div>
           <div class="f"><label>机房数据保鲜<span class="tip">?<span class="pop">机房/地区识别结果的保鲜天数(默认7天)。colo 是<b>当时接入路径</b>的快照、会漂移(实测 SIN→HKG、DFW/SYD→LAX、AMS→CDG、TPE→HKG), 超期复测时顺便重认一次。识别走 cloudflare.com 的 trace, <b>不占测速 Worker 配额</b></span></span></label><input id="colo_stale_days" type="number" value="7"></div>
           <div class="f"><label>带宽数据保鲜<span class="tip">?<span class="pop">带宽数据超过多少小时就算"过期"，优先重新实测(默认24h)。防止老数据在旧量程下永久霸榜；active 的IP优先级最高</span></span></label><input id="bw_stale_hours" type="number" value="24"></div>
@@ -1980,8 +1964,6 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
         <div class="row">
           <div class="f"><label>IPv4库上限<span class="tip">?<span class="pop">IPv4 总库容(热+备)，也是"填充库容"阶段的目标；0=不限。<br><b>滞回</b>：实际超过 <b>上限 × 1.05</b> 才开始剔除(按健康分低者先剔)，避免顶格时"插一个就删一个"造成剧烈换血。<br>库容低于 <b>上限 × 0.9</b> 时才回到"温和补库"阶段。</span></span></label><input id="max_ips_v4" type="number" value="0"></div>
           <div class="f"><label>IPv6库上限<span class="tip">?<span class="pop">IPv6 总库容，规则同上；0=不限</span></span></label><input id="max_ips_v6" type="number" value="0"></div>
-          <div class="f"><label>每/24保留数<span class="tip">?<span class="pop">每个 v4 /24 最多保留几个IP(多样性去重)。越小越分散、库越小；0=不限</span></span></label><input id="per24_max" type="number" value="50"></div>
-          <div class="f"><label>每/48保留数<span class="tip">?<span class="pop">每个 v6 /48 最多保留几个IP。越小越分散、库越小；0=不限</span></span></label><input id="per48_max" type="number" value="100"></div>
           <div class="f"><label>单国家占比上限%<span class="tip">?<span class="pop">同一国家(按 CF 机房归属映射)存活 IP 最多占库的百分比，让结果覆盖更多地区；0=关闭。<br>为避免一次砍太多，<b>每轮最多裁掉存活数的 0.3%</b>(实测原本一轮能砍 170+ 个，导致整库 5 天换一遍、IP 站不住)。<br>注意 colo 会随路径漂移，所以本项会持续"纠正"地区构成，属正常。</span></span></label><input id="country_max_pct" type="number" value="30"></div>
         </div>
         <div class="proto-note">备胎池目标 = <b>库上限 − 目标可用数</b>（自动）；把库上限设成 ≈ 目标可用数 就是不养备胎、填满即值守。</div>
@@ -1990,8 +1972,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
       <div class="card">
         <div class="h">⚙️ 扫描策略</div>
         <div class="row">
-          <div class="f"><label>策略<span class="tip">?<span class="pop">auto=自动，按<b>每协议独立</b>判定：<br>可用数 &lt; 目标 或 前缀数不足 → <b>发现</b>；可用数够但库容 &lt; 上限×0.9 → <b>温和补库</b>；都达标 → <b>值守</b>；可用数达标但多数已陈旧 → <b>恢复</b>。<br>切换有 3 轮迟滞防抖。注意模式只看"可用数/前缀数"，<b>库容只决定补多少</b>，二者解耦后不会来回抖。也可强制固定。</span></span></label>
-            <select id="scan_mode"><option value="auto">自动(推荐)</option><option value="discovery">强制发现</option><option value="maintenance">强制值守</option><option value="recovery">强制恢复</option></select></div>
+          
         </div>
       </div>
 
@@ -2119,8 +2100,7 @@ html[data-theme="light"] #chartTip .t-row .k.sec{color:var(--dim);border-top-col
     <h3>功能一览</h3>
     <ul>
       <li>多端口并发探测 + TLS 二次确认, 自动发现可用 CF 边缘 IP</li>
-      <li>邻域加权采样(优质 C 段优先), 达标命中率远高于纯随机</li>
-      <li>带宽实测(首字节计时算法, 档位 50MB×15s, 可配自建 Worker 测速域名) + 机房/国家地区识别</li>
+      <li>带宽实测(首字节计时算法, 档位 64MB×5s×8流, 可配自建 Worker 测速域名) + 机房/国家地区识别</li>
       <li>手动测: 延迟返回 TCP/TLS 双口径, 带宽择优重测, 勾选复制最优 N 条</li>
       <li>本地IP列表: 列排序 / 机房等多条件筛选 / 勾选批量操作 / 翻页跳转, 导出 ADD.txt/CSV</li>
       <li>总览分布图: 机房/国家全量显示可滚动, 延迟/带宽直方图</li>
@@ -2371,14 +2351,12 @@ function control(act){
     body:JSON.stringify({action:act,operator:$("operator").value,ports:$("ports").value,
       count:$("count").value,concurrency:$("concurrency").value,
       bench:$("bench").value,backfill:$("backfill").value,recheck:$("recheck").value,
-      exploit:$("exploit").value,max_latency:$("max_latency").value,
       bench_parallel:$("bench_parallel").value,
       bench_size:$("bench_size").value,bench_timeout:$("bench_timeout") ? $("bench_timeout").value : "",
-      bench_daily:$("bench_daily").value,bench_pause:$("bench_pause").value,bench_funnel:$("bench_funnel").value,
+      bench_daily:$("bench_daily").value,bench_pause:$("bench_pause").value,
       bw_stale_hours:$("bw_stale_hours").value,colo_stale_days:$("colo_stale_days").value,
       bench_host:$("bench_host").value,
-      scan_mode:$("scan_mode").value,target_active:$("target_active").value,
-      target_prefixes:$("target_prefixes").value,
+      target_active:$("target_active").value,
       explore_interval:$("explore_interval").value,explore_fraction:$("explore_fraction").value,
       v4:$("v4_on").checked?"1":"0",
       operator_v6:$("operator_v6").value,count_v6:$("count_v6").value,
@@ -2594,20 +2572,17 @@ function testIp(act,ip,port,btn){
 function saveSet(){
   const body={operator:$("operator").value,ports:$("ports").value,count:$("count").value,
     concurrency:$("concurrency").value,bench:$("bench").value,
-    backfill:$("backfill").value,recheck:$("recheck").value,exploit:$("exploit").value,
+    backfill:$("backfill").value,recheck:$("recheck").value,
     max_latency:$("max_latency").value,bench_parallel:$("bench_parallel").value,
     bench_size:$("bench_size") ? $("bench_size").value : "",
     bench_daily:$("bench_daily") ? $("bench_daily").value : "",
-    bench_funnel:$("bench_funnel") ? $("bench_funnel").value : "",
     bench_pause:$("bench_pause") ? $("bench_pause").value : "",
     bw_stale_hours:$("bw_stale_hours") ? $("bw_stale_hours").value : "",
     colo_stale_days:$("colo_stale_days") ? $("colo_stale_days").value : "",
     bench_host:$("bench_host").value,
     max_ips_v4:$("max_ips_v4").value,max_ips_v6:$("max_ips_v6").value,
     country_max_pct:$("country_max_pct").value,
-    per24_max:$("per24_max").value,per48_max:$("per48_max").value,
-    scan_mode:$("scan_mode").value,target_active:$("target_active").value,
-    target_prefixes:$("target_prefixes").value,
+    target_active:$("target_active").value,
     explore_interval:$("explore_interval").value,explore_fraction:$("explore_fraction").value,
     v4:$("v4_on").checked?"1":"0",
     operator_v6:$("operator_v6").value,count_v6:$("count_v6").value,
@@ -2624,9 +2599,9 @@ function loadSet(){
     if(!d||!Object.keys(d).length)return;
     if(d.operator!==undefined)$("operator").value=d.operator||"";
     ["ports","count","concurrency","bench","bench_parallel","bench_host",
-     "bench_size","bench_timeout","bench_daily","bench_pause","bench_funnel","bw_stale_hours","colo_stale_days",
-     "backfill","recheck","exploit","max_latency","max_ips_v4","max_ips_v6","country_max_pct","per24_max","per48_max",
-     "scan_mode","target_active","target_prefixes","explore_interval","explore_fraction","operator_v6","count_v6"].forEach(k=>{
+     "bench_size","bench_timeout","bench_daily","bench_pause","bw_stale_hours","colo_stale_days",
+     "backfill","recheck","max_latency","max_ips_v4","max_ips_v6","country_max_pct",
+     "target_active","explore_interval","explore_fraction","operator_v6","count_v6"].forEach(k=>{
        const v=d[k];
        if(v!==undefined&&v!==null&&v!=="")$(k).value=v;
     });
@@ -2673,7 +2648,7 @@ function renderLog(entries){
     const pad=("0"+dt.getHours()).slice(-2)+":"+("0"+dt.getMinutes()).slice(-2)+":"+("0"+dt.getSeconds()).slice(-2);
     let cls="";
     if(msg.startsWith("错误")||msg.includes("失败")||msg.includes("异常"))cls="err";
-    else if(msg.startsWith("开始")||msg.startsWith("模式")||msg.startsWith("库存")||msg.startsWith("本轮完成"))cls="ok";
+    else if(msg.startsWith("开始")||msg.startsWith("状态")||msg.startsWith("库存")||msg.startsWith("本轮完成")||msg.startsWith("清理"))cls="ok";
     else if(msg.startsWith("清理")||msg.startsWith("补位"))cls="warn";
     const d=document.createElement("div"); d.className="logline "+(cls||"m");
     d.innerHTML='<span class="t">'+pad+'</span><span class="m">'+esc(msg)+'</span>';
@@ -2688,7 +2663,6 @@ async function poll(){
     const st=await (await fetch("/api/status")).json();
     $("dbpath").textContent=st.db||""; $("ver").textContent=st.version||"?";
     const pill=$("pill");
-    const mname=st.mode_name?" · "+st.mode_name:"";
     const mon=st.running&&st.stage==="monitor";
     const fill=st.running&&st.phase==="fill";
     const exp=st.running&&st.phase==="explore";
@@ -2701,7 +2675,7 @@ async function poll(){
     else{pill.className=st.msg.startsWith("错误")?"pill stop":"pill idle";
       pill.textContent=st.msg;$("startBtn").disabled=false;$("stopBtn").disabled=true;}
     const pf=$("progFill"), pl=$("progLabel");
-    const mstat=" · 可用"+st.active+"/新鲜"+st.fresh+"/前缀"+st.prefixes;
+    const mstat=" · 可用"+st.active+"/新鲜"+st.fresh;
     if(fill){
       pf.style.width="100%";pf.style.opacity=".35";
       pl.textContent="填充库容中 · 正在把备用池养到库上限 · 还差约 "+fillLeft+" 个"+mstat;

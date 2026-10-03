@@ -1,41 +1,34 @@
 #!/usr/bin/env python3
 """
-IP 生命周期: 剔除 与 补充 (闭环)
+IP 剔除(eviction): 纯按"超了就裁"的三件事。
 
-与健康度模型(cf_health)、调度策略(cf_policy)联动, 三者共用同一套"状态"口径:
-  active / reserve / probation / dead   (cf_health.classify)
+与健康度模型(cf_health)、调度策略(cf_policy)共用同一套"状态"口径
+(active / reserve / probation / dead, 见 cf_health.classify), 保证三边不各算各的。
 
-剔除(eviction):
-  * 失效(dead)清退 —— 一律写墓碑 + 冷却, 避免同址被反复重测;
-  * 前缀去重 —— 每个 v4 /24、v6 /48 最多保留 M 个(保护 pin/active/高分),
-    防止同一路由邻居堆一堆、单点故障;
-  * 国家均衡 —— 超额国家按质量低者先裁(保护 pin);
-  * 库容上限 —— 超限按"保留价值"低者先裁(保护 pin, 其次保 active)。
+  1. 失效清退 —— 一律写墓碑 + 冷却, 避免同址被反复重测
+  2. 地区均衡 —— 单个国家占比超上限时, 按质量低者先裁(保护 pin)
+  3. 库容上限 —— 超限按"保留价值"低者先裁(保护 pin, 其次保 active)
 
-补充(replenishment) —— 需求驱动:
-  * 计算每协议 active 缺口 deficit 与可用 reserve 池;
-  * 缺口 > 0 时优先从 reserve 提升(快速确认), 不足才触发有界探索;
-  * 发现侧通过 fetch_hot24/fetch_hot_v6 的"前缀配额"避开已超额前缀 -> 不churn。
+被裁掉的 IP 写进 graveyard 表, 在墓碑静默期内不会被重新发现/抽到
+(见 cf_db 的 known 冷却判断)。墓碑按 buried_at 自行过期回收。
 
-剔除与补充通过"缺口(deficit)"联动: 每轮先剔除, 再据缺口决定补位。
+换血节流: 观测到不加限制时每轮能裁掉 170+ 个、整轮换血 300+, 而一轮只测
+20 个带宽, 库 5 天就整体换一遍 -> IP 站不住、榜单一直翻新。所以地区均衡和
+库容上限都加了每轮上限与滞回。
+
+"补充"不在这里: 发现量完全由 cf_policy.decide 的 4 条规则按缺口决定,
+不需要独立的补位流程。
 """
 import sqlite3
 import time
 
 import cf_health
-import cf_policy
 
 EVICT_COOLDOWN = 24 * 3600      # 被裁 IP 的墓碑静默
 DEAD_SILENCE = 7 * 86400        # 失效 IP 静默
-# 每个前缀的保留上限(多样性 vs 库容的平衡; 越小越"去重/多样", 库也越小).
-# 默认较宽松: 只压掉病态集中(如单个 /24 堆 200+), 不破坏 1w+ 的储备规模;
-# 想要严格多样(每 /24 仅留 3、每 /48 仅留 8)可在设置里调小。
-PER24_MAX = 50                  # 每个 v4 /24 最多保留
-PER48_MAX = 100                 # 每个 v6 /48 最多保留
-# 换血节流: 观测到每轮"地区均衡"能裁掉 170+ 个、整轮换血 300+, 而一轮只测 20 个带宽,
-# 库 5 天就整体换一遍 -> IP 站不住、榜单一直翻新。给裁剪加每轮上限与库容滞回。
-BALANCE_TRIM_PCT = 0.3          # 地区均衡每轮最多裁掉存活数的千分之三(0.3%)
-CAP_SLACK = 1.05                # 库容滞回: 超过 上限*1.05 才裁, 避免顶格时"插一个删一个"
+# 换血节流: 每轮"地区均衡"最多裁掉存活数的千分之三; 库容超 上限*1.05 才裁
+BALANCE_TRIM_PCT = 0.3
+CAP_SLACK = 1.05
 GRAVE_EXPIRE_DAYS = 30
 GRAVE_MAX_ROWS = 200000
 
@@ -51,10 +44,6 @@ def _tombstone(conn, ips, now, silence):
     ts = _grave_ts(now, silence)
     conn.executemany("INSERT OR REPLACE INTO graveyard(ip,buried_at) VALUES(?,?)",
                      [(ip, ts) for ip in ips])
-
-
-def _prefix(ip):
-    return cf_policy.prefix_of(ip)
 
 
 def _purge_graveyard(conn, now):
@@ -77,16 +66,13 @@ def _select_victims(conn, cond, limit, extra_order=""):
         (int(limit),)).fetchall()]
 
 
-def lifecycle_pass(conn, max_v4, max_v6, country_pct, target_active=0,
-                   per24=None, per48=None, now=None,
+def lifecycle_pass(conn, max_v4, max_v6, country_pct=0, now=None,
                    balance_trim_pct=None, cap_slack=None):
-    """一轮生命周期维护(剔除 + 计算补充缺口). 返回 (stats, deficits)."""
-    per24 = int(per24) if per24 else PER24_MAX
-    per48 = int(per48) if per48 else PER48_MAX
+    """一轮剔除。返回 stats(各步各删了多少条)。"""
     trim_pct = float(balance_trim_pct) if balance_trim_pct is not None else BALANCE_TRIM_PCT
     slack = float(cap_slack) if cap_slack else CAP_SLACK
     now = now or time.time()
-    stats = {"dead": 0, "dedup": 0, "balanced": 0, "capped": 0}
+    stats = {"dead": 0, "balanced": 0, "capped": 0}
     _purge_graveyard(conn, now)
 
     # 1) 失效清退: 无有效成功记录, 或状态判为 dead
@@ -98,31 +84,7 @@ def lifecycle_pass(conn, max_v4, max_v6, country_pct, target_active=0,
         conn.executemany("DELETE FROM ips WHERE ip=?", [(ip,) for ip in dead])
         stats["dead"] = len(dead)
 
-    # 2) 前缀去重: 每个 /24、/48 保留质量最高的 M 个
-    for proto, cap in (("ip NOT LIKE '%:%'", per24), ("ip LIKE '%:%'", per48)):
-        rows = conn.execute(
-            f"SELECT ip, pin, COALESCE(state,''), COALESCE(score,0) FROM ips "
-            f"WHERE {proto}").fetchall()
-        groups = {}
-        for ip, pin, st, sc in rows:
-            groups.setdefault(_prefix(ip), []).append((ip, pin, st, sc))
-        victims = []
-        for items in groups.values():
-            if not cap or cap <= 0 or len(items) <= cap:
-                continue
-            items.sort(key=lambda x: ((x[1] or 0),
-                                     1 if x[2] == cf_health.STATE_ACTIVE else 0,
-                                     x[3]), reverse=True)
-            for ip, pin, _st, _sc in items[cap:]:
-                if pin:
-                    continue
-                victims.append(ip)
-        if victims:
-            _tombstone(conn, victims, now, EVICT_COOLDOWN)
-            conn.executemany("DELETE FROM ips WHERE ip=?", [(ip,) for ip in victims])
-            stats["dedup"] += len(victims)
-
-    # 3) 国家均衡(按 colo->国家聚合), 超额低分先裁, 保护 pin
+    # 2) 地区均衡(按 colo->国家聚合), 超额的低分先裁, 保护 pin
     if country_pct and int(country_pct) > 0:
         try:
             import cf_db  # 延迟导入: 复用 COLO_COUNTRY 映射
@@ -147,8 +109,7 @@ def lifecycle_pass(conn, max_v4, max_v6, country_pct, target_active=0,
                     or any(not colo for colo, _ in rows)
                 if not overs or not has_gap:
                     continue
-                # 每轮裁剪上限: 一次最多裁掉存活数的 trim_pct%, 其余留到后面的轮次,
-                # 避免"一轮砍掉 170+ 个"造成剧烈换血
+                # 每轮裁剪上限: 其余超额留到后面的轮次, 避免"一轮砍掉 170+ 个"
                 budget = max(1, int(alive * trim_pct / 100.0))
                 overs = [(c, min(n, budget)) for c, n in overs]
                 for ctry, n_del in overs:
@@ -171,16 +132,15 @@ def lifecycle_pass(conn, max_v4, max_v6, country_pct, target_active=0,
         except Exception:
             pass
 
-    # 4) 库容上限: 超限按保留价值低者先裁
+    # 3) 库容上限: 超限按保留价值低者先裁
     for proto, limit in (("ip NOT LIKE '%:%'", max_v4), ("ip LIKE '%:%'", max_v6)):
         if not limit or int(limit) <= 0:
             continue
         alive = conn.execute(
             f"SELECT COUNT(*) FROM ips WHERE {proto}").fetchone()[0] or 0
-        # 滞回: 顶格时每插一个就裁一个, 等于每轮强制换血。留出slack 带,
+        # 滞回: 顶格时每插一个就裁一个, 等于每轮强制换血。留出 slack 带,
         # 只在明显超限时才裁(用户也可以直接把上限调大)。
-        soft = int(int(limit) * slack)
-        excess = alive - max(int(limit), soft)
+        excess = alive - max(int(limit), int(int(limit) * slack))
         if excess <= 0:
             continue
         victims = _select_victims(conn, proto, excess)
@@ -189,43 +149,11 @@ def lifecycle_pass(conn, max_v4, max_v6, country_pct, target_active=0,
             conn.executemany("DELETE FROM ips WHERE ip=?", [(ip,) for ip in victims])
             stats["capped"] += len(victims)
 
-    deficits = replenish_need(conn, target_active, max_v4, max_v6)
-    return stats, deficits
-
-
-def replenish_need(conn, target_active=0, max_v4=0, max_v6=0):
-    """每协议的补充需求. 语义: 只设"热目标"和"库上限", 备胎目标自动 = 上限 − 热目标.
-
-    deficit          热缺口(active 不足): 需要发现/提升补 hot
-    deficit_reserve  库容缺口(总库 < 上限): 维护期低频补备胎, 直到养到上限
-    cap=0(不限) 时 reserve_goal=0, 行为退化为"到热目标即停"(不养备胎)
-    """
-    out = {}
-    for key, proto, maxip in (("v4", "ip NOT LIKE '%:%'", max_v4),
-                              ("v6", "ip LIKE '%:%'", max_v6)):
-        active = conn.execute(
-            f"SELECT COUNT(*) FROM ips WHERE {proto} AND state=?",
-            (cf_health.STATE_ACTIVE,)).fetchone()[0] or 0
-        reserve = conn.execute(
-            f"SELECT COUNT(*) FROM ips WHERE {proto} AND state=?",
-            (cf_health.STATE_RESERVE,)).fetchone()[0] or 0
-        total = conn.execute(
-            f"SELECT COUNT(*) FROM ips WHERE {proto}").fetchone()[0] or 0
-        cap = int(maxip) if maxip and int(maxip) > 0 else 0
-        tgt = int(target_active)
-        if cap and tgt > cap:
-            tgt = cap                       # 热目标不能超过库上限, 否则"补了又裁"抖动
-        deficit = max(0, tgt - active)
-        reserve_goal = max(0, cap - tgt) if cap else 0
-        deficit_reserve = max(0, min(reserve_goal - reserve, cap - total)) if cap else 0
-        out[key] = {"active": active, "reserve": reserve, "total": total,
-                    "cap": cap, "target": tgt, "deficit": deficit,
-                    "reserve_goal": reserve_goal, "deficit_reserve": deficit_reserve}
-    return out
+    return stats
 
 
 def fetch_promote(path, is_v6, limit, cooldown, now=None):
-    """从 reserve 池取分数最高的若干 IP 用于"提升确认". 返回 [(ip, port)]."""
+    """从 reserve 池取分数最高的若干 IP 用于"提升确认"。返回 [(ip, port)]。"""
     proto = "ip LIKE '%:%'" if is_v6 else "ip NOT LIKE '%:%'"
     now = now or time.time()
     try:

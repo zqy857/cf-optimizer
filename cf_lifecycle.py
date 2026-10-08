@@ -26,8 +26,11 @@ import cf_health
 
 EVICT_COOLDOWN = 24 * 3600      # 被裁 IP 的墓碑静默
 DEAD_SILENCE = 7 * 86400        # 失效 IP 静默
-# 换血节流: 每轮"地区均衡"最多裁掉存活数的千分之三; 库容超 上限*1.05 才裁
+# 换血节流: 每轮"地区均衡"基础预算 = 存活数的千分之三; 库容超 上限*1.05 才裁
 BALANCE_TRIM_PCT = 0.3
+# 但基础预算(v4 约 31 个/轮)追不上填充速度, 超额会永远挂着, 所以实际预算
+# 还要跟"总超额"走, 并以存活数的这个百分比封顶, 避免一轮暴删。
+BALANCE_MAX_PCT = 2.0
 CAP_SLACK = 1.05
 GRAVE_EXPIRE_DAYS = 30
 GRAVE_MAX_ROWS = 200000
@@ -109,8 +112,14 @@ def lifecycle_pass(conn, max_v4, max_v6, country_pct=0, now=None,
                     or any(not colo for colo, _ in rows)
                 if not overs or not has_gap:
                     continue
-                # 每轮裁剪上限: 其余超额留到后面的轮次, 避免"一轮砍掉 170+ 个"
-                budget = max(1, int(alive * trim_pct / 100.0))
+                # 每轮裁剪预算: 固定千分之三(v4 约 31 个/轮)追不上填充速度 ——
+                # 实测美国超额 1.3 万个, 按 31/轮要几百轮才追平, 期间一直空转。
+                # 改为随总超额放大, 但以存活数 2% 硬封顶; 外层 min(n, budget)
+                # 还会按各国超额再夹一次, 所以接近达标时仍然只删差的那几个。
+                need = sum(n for _, n in overs)
+                budget = max(int(alive * trim_pct / 100.0),
+                             min(int(need / 4), int(alive * BALANCE_MAX_PCT / 100.0)))
+                budget = max(1, budget)
                 overs = [(c, min(n, budget)) for c, n in overs]
                 for ctry, n_del in overs:
                     colos = [colo for colo, _ in rows

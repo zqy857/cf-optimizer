@@ -354,10 +354,22 @@ def upsert(conn, rec, country_pct=0):
     row = conn.execute(f"SELECT {_EXISTING_COLS} FROM ips WHERE ip=? LIMIT 1",
                        (ip,)).fetchone()
     is_new = row is None
-    if is_new:
-        if ok and rec.get("colo") and country_pct and country_pct > 0:
-            if not _quota_ok(conn, _country(rec["colo"]), country_pct):
+    # 「这个 IP 算不算新入库」: 没有行, 或者有行但从未识别过 colo —— 后者是探测
+    # 阶段先落库、colo 要等识别后才补上的那种。两种都还没真正进过库。
+    pending = is_new or (not row[11])
+    if ok and country_pct and country_pct > 0 and pending:
+        ctry = _country(rec.get("colo") or "")
+        # colo 还没拿到就放过: 这时无法判断国家, 不能误杀(探测记录就没 colo)。
+        # 等识别记录回来时下面会再判一次 —— 那时才是真正能拒的时刻。
+        if ctry and not _quota_ok(conn, ctry, country_pct):
+            if is_new:
                 return "refused"
+            # 探测阶段已落库、识别后才发现自己属于超配额国家 -> 撤掉刚建的这行。
+            # 库容和活跃数几乎没受影响, 比事后留给裁剪慢慢放血干净得多。
+            conn.execute("DELETE FROM ips WHERE ip=?", (ip,))
+            _QUOTA_AGG["at"] = 0
+            return "refused"
+    if is_new:
         (p_ok, p_fail, p_fs, p_lok, p_lfail, p_lat, p_latw, p_bw, p_bwlast,
          p_bwlastat, p_bww, p_colo, p_loc, p_ver, p_first, p_port, p_state) = (
             0, 0, 0, None, None, None, None, None, None, None, None, None, None,

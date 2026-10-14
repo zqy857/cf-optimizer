@@ -546,6 +546,10 @@ def fetch_networks(operator, port):
         except Exception:
             nets = []
     if not nets:
+        # 回落官方大段时必须把 label 一起改掉, 否则界面/日志会顶着"电信优选"的名
+        # 却实际在扫官方网段 —— 实测这 4 个源(cmliu 的 CF-CIDR, 托管在
+        # raw.githubusercontent.com)在国内会被 reset, 回落是常态而不是意外。
+        label = "官方地址池" + ("(运营商源不可用)" if operator else "")
         try:
             raw = asyncio.run(fetch(urllib.parse.urlparse(OFFICIAL_V4_URL)))
             for l in raw.decode().splitlines():
@@ -553,6 +557,7 @@ def fetch_networks(operator, port):
                 if "/" in l:
                     nets.append(ipaddress.ip_network(l, strict=False))
         except Exception:
+            label = "内置兜底网段" + ("(运营商源不可用)" if operator else "")
             for r in FALLBACK_RANGES:
                 nets.append(ipaddress.ip_network(r))
     return nets, label
